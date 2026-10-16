@@ -23,28 +23,40 @@ you know of one is what you know of the other. This page is only what runs here 
 ## RUN
 
 `nextcuda models pull <id>`, then ask the front door (:8000) for a picture - or `nextcuda image gen "<prompt>"`.
-Measured on an RTX 5070 (12 GB; the box also has an RTX 3060), in process, weights offloaded to host memory:
+Measured by `nextcuda image bench` (8 steps, true guidance: two passes a step; warm pictures, the first after a load in
+brackets in the full tables of `docs/benchy/`), weights offloaded to host memory, in process:
 
-| id | model | picture | speed |
-|---|---|---|---|
-| `qwen-image-2.1-q8` | **Qwen-Image 2.1** Q8_0 (7.3 GB), text to image | 768x768, 12 steps | 1.27 s/step, VAE 2.4 s, 19.6 s in all |
-| `qwen-image-2.1-rrq4` | Qwen-Image 2.1 Q4 (realrebelai, 5.7 GB) | 768x768, 12 steps | the same 1.27 s/step, 21 s in all |
-| `qwen-image-2512-q4km` | **Qwen-Image 2512** Q4_K_M (13.2 GB), 4 steps with the Lightning LoRA | 1024x1024 | 2.8 s/step, 63 s cold (first graph streams the weights in) |
-| `qwen-image-2512-q4km` | the same, a full guided run | 1024x1024, 24 steps | 4.5 s/step, 121 s |
+**RTX 5070, 12 GB, PCIe gen4 x16**
 
-GPU memory (the model's own, peak over a picture; `docs/benchy/image-v1-2026-10-16-first.md`):
+| id | engine | picture | text encode | per step | VAE | total | peak GPU memory |
+|---|---|---|---:|---:|---:|---:|---:|
+| `qwen-image-2.1-q8` | stable-diffusion.cpp | 768x768 | 0.7 s | 0.95 s | 1.6 s | 13.4 s | 8.2 GB |
+| `qwen-image-2.1-q8` | stable-diffusion.cpp | 1024x1024 | 0.3 s | 1.42 s | 3.5 s | 26.3 s | 8.6 GB |
+| `qwen-image-2.1-q8` | **Rust + CUDA** | 768x768 | 2.7 s | 1.62 s | 0.5 s | 16.3 s | 10.6 GB |
+| `qwen-image-2.1-q8` | **Rust + CUDA** | 1024x1024 | 2.8 s | 3.26 s | 0.9 s | 29.9 s | 11.6 GB |
+| `qwen-image-2.1-rrq4` | stable-diffusion.cpp | 768x768 | 0.4 s | 1.03 s | 1.6 s | 13.8 s | 6.4 GB |
+| `qwen-image-2.1-rrq4` | stable-diffusion.cpp | 1024x1024 | 0.3 s | 1.52 s | 3.5 s | 28.0 s | 6.8 GB |
+| `qwen-image-2512-q4km` (Lightning, 8 steps) | stable-diffusion.cpp | 768x768 | 0.6 s | 0.42 s | 2.2 s | 16.6 s | 11.0 GB |
+| `qwen-image-2512-q4km` (Lightning, 8 steps) | stable-diffusion.cpp | 1024x1024 | 0.3 s | 0.44 s | 4.4 s | 28.5 s | 11.0 GB |
 
-| id | 768x768 | 1024x1024 | weights resident on the card |
-|---|---:|---:|---:|
-| `qwen-image-2.1-q8` | 8.2 GB | 8.6 GB | 10.6 GB (768²) |
-| `qwen-image-2.1-rrq4` | 6.4 GB | 6.8 GB | - |
-| `qwen-image-2512-q4km` | 11.0 GB | 11.0 GB | - |
+**RTX 3060, 12 GB, PCIe gen4 x1** (the card sits on a x1 link: about 2 GB/s to the host, where the 5070 has about 25)
 
-2512 leaves under 1 GB of a 12 GB card at 1024²; the same model with a larger canvas needs `NC_SD_MAX_VRAM`.
+| id | engine | picture | text encode | per step | VAE | total | peak GPU memory |
+|---|---|---|---:|---:|---:|---:|---:|
+| `qwen-image-2.1-q8` | stable-diffusion.cpp | 768x768 | 3.0 s | 2.35 s | 4.2 s | 36.9 s | 8.1 GB |
+| `qwen-image-2.1-q8` | stable-diffusion.cpp | 1024x1024 | 2.9 s | 3.18 s | 9.0 s | 64.7 s | 8.5 GB |
+| `qwen-image-2.1-q8` | **Rust + CUDA** | 768x768 | 7.8 s | 3.81 s | 1.3 s | 39.8 s | 10.6 GB |
+| `qwen-image-2.1-rrq4` | stable-diffusion.cpp | 768x768 | 3.0 s | 2.48 s | 4.2 s | 37.5 s | 6.5 GB |
+| `qwen-image-2512-q4km` (Lightning, 4 steps) | stable-diffusion.cpp | 768x768 | 4.3 s | 0.75 s | 6.0 s | 37.6 s | 11.3 GB |
 
-The text encoder takes 0.8-1.2 s. With the 2.1 transformer resident on the card the step is the same 1.27 s, so the
-step is compute and not the PCIe link: the quantized matmuls and attention are what the silo is for
-(`docs/PHASES.md` has the clocks and where nextsycl's B70 is for comparison).
+The first picture after a load is slower (the weights page in: the 2512 takes 70-85 s on either card). Energy and
+average power are in the full tables: the 5070 draws about 220 W while sampling, the 3060 about 140 W.
+
+What the clocks say: the step is compute, not PCIe (a resident transformer gave the same 1.27 s/step); the Rust
+engine's VAE is 3x faster than ggml's and its steps are 1.7-2.3x slower, which is where the silo goes (attention at
+4,000 tokens is cuBLAS and a score table today, a fused kernel in the silo); its text encoder streams the layers
+over PCIe on every prompt, so it costs 2.7 s on the 5070 and 7.8 s on the 3060's x1 link (a host-resident cache of
+the encoder is the fix). `docs/PHASES.md` has the history of the numbers.
 
 ## Supported models
 
@@ -69,7 +81,9 @@ checks it and registers the model.
 - **A model server a model, on demand:** the first request for a registered model starts `nextcuda image serve` for
   it on the first card with room, swaps it when a request names another, and lets it go after the idle time.
 - **Qwen-Image 2.1:** text to image (RGBA with `rgba`), img2img with a `strength`, edits and compositions from up to
-  8 reference pictures with an optional mask, the effort ladder below.
+  8 reference pictures with an optional mask, the effort ladder below. `NC_IMAGE_BACKEND=rust` runs it on the Rust
+  engine instead (text to image so far): the pipeline is Rust, the kernels CUDA (cuBLAS and our own), the
+  transformer kept on the card in its stored GGUF type, no ggml.
 - **Qwen-Image 2512:** text to image and img2img. Under 20 steps the Lightning LoRA runs (4 steps, guidance 1); at 20
   or more it is bypassed for a full guided run - the platform's effort ladder, so an engine behind it behaves as
   the one it replaces.
@@ -124,7 +138,7 @@ in `docs/environment.md`.
 | `--opt-offload 0\|1` | `NC_SD_OFFLOAD` | weights in host memory, staged per graph (default 1) |
 | `--opt-max-vram GiB` | `NC_SD_MAX_VRAM` | the card memory the weights and buffers may take |
 | `--opt-sd-args k=v;...` | `NC_SD_ARGS` | `threads=N`, `flash_attn=0\|1`, `vae_tiling=0\|1` |
-| `--opt-backend native\|python` | `NC_IMAGE_BACKEND` | in process (default) or the phase 1 sd-cli worker |
+| `--opt-backend native\|rust\|python` | `NC_IMAGE_BACKEND` | stable-diffusion.cpp in process (default), the Rust engine on the shared CUDA kernels, or the phase 1 sd-cli worker |
 
 ## How it is built
 

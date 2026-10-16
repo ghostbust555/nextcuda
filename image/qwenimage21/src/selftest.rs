@@ -185,6 +185,24 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<Vec<f32>> {
         }
         out.push(within("up2", &got, &want, 1e-6)?);
     }
+    // cfg_rescale: neg + s (pos - neg), the norm of pos kept, per row
+    {
+        let (rows, ch, sc) = (37usize, 64usize, 4.0f32);
+        let (pos, neg) = (data(rows * ch, 12), data(rows * ch, 13));
+        let (dp, dn, o) = (DevBuf::from_f32(gpu, &pos)?, DevBuf::from_f32(gpu, &neg)?, DevBuf::f32(gpu, rows * ch)?);
+        // SAFETY: rows x ch floats each.
+        check(unsafe { (k.cfg_rescale)(g, dp.fp(), dn.fp(), rows as i64, ch as i64, sc, o.fp()) }, "cfg_rescale")?;
+        let mut want = vec![0f32; rows * ch];
+        for r in 0..rows {
+            let comb: Vec<f32> = (0..ch).map(|i| neg[r * ch + i] + sc * (pos[r * ch + i] - neg[r * ch + i])).collect();
+            let np = pos[r * ch..(r + 1) * ch].iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nc = comb.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for i in 0..ch {
+                want[r * ch + i] = comb[i] * np / nc;
+            }
+        }
+        out.push(within("cfg_rescale", &o.to_f32()?, &want, 1e-5)?);
+    }
     // to_rgba8
     {
         let (h, w) = (2usize, 3usize);

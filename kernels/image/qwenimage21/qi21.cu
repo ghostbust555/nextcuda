@@ -170,6 +170,23 @@ __global__ void avg_down_add_k(const __half* xi, __half* o, int64_t H, int64_t W
     o[i] = f2h(h2f(o[i]) + s / (float) G);
 }
 
+__global__ void cfg_rescale_k(const float* pos, const float* neg, int64_t rows, int64_t ch, float scale, float* out) {
+    const int64_t r = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float np = 0.0f, nc = 0.0f;
+    for (int64_t i = 0; i < ch; ++i) {
+        const float p = pos[r * ch + i], n = neg[r * ch + i];
+        const float c = n + scale * (p - n);
+        np += p * p;
+        nc += c * c;
+    }
+    const float k = sqrtf(np) / fmaxf(sqrtf(nc), 1e-12f);
+    for (int64_t i = 0; i < ch; ++i) {
+        const float p = pos[r * ch + i], n = neg[r * ch + i];
+        out[r * ch + i] = (n + scale * (p - n)) * k;
+    }
+}
+
 inline unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
@@ -271,6 +288,13 @@ int ns_image_qi21_avg_down_add(ns_gpu* g, const void* x, int64_t H, int64_t W, i
     const int64_t G = Ci * F / Co;
     NS_CU(cudaSetDevice(g->dev));
     avg_down_add_k<<<blocks((H / 2) * (W / 2) * Co), 256, 0, g->q>>>((const __half*) x, (__half*) out, H, W, Ci, Co, ft, F, G);
+    NS_LAUNCH_CHECK();
+    return 0;
+}
+
+int ns_image_qi21_cfg_rescale(ns_gpu* g, const float* pos, const float* neg, int64_t rows, int64_t ch, float scale, float* out) {
+    NS_CU(cudaSetDevice(g->dev));
+    cfg_rescale_k<<<blocks(rows), 256, 0, g->q>>>(pos, neg, rows, ch, scale, out);
     NS_LAUNCH_CHECK();
     return 0;
 }

@@ -191,9 +191,11 @@ impl ImageEngine for RustQwenImage21 {
         let k = ffi::api()?;
         let gpu = &self.nsd.gpu;
         progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() })?;
+        let t_text = Instant::now();
         let (embeds, tokens) = self.encode(if req.prompt.trim().is_empty() { " " } else { req.prompt.trim() })?;
         // true guidance: a negative prompt (" " when none was given) and a second pass a step
         let negative = if cfg > 1.0 { Some(self.encode(req.negative.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(" "))?) } else { None };
+        crate::sd::record(format!("get_learned_condition completed, taking {:.2}s", t_text.elapsed().as_secs_f64()));
         let pre = self.dit.prefix(&self.nsd, &embeds, tokens, self.te.hidden)?;
         let npre = negative.as_ref().map(|(e, t)| self.dit.prefix(&self.nsd, e, *t, self.te.hidden)).transpose()?;
         let n = hw.0 * hw.1 * dit::LATENT;
@@ -201,23 +203,26 @@ impl ImageEngine for RustQwenImage21 {
         for p in 0..req.n.max(1) {
             let nz = noise(req.seed + p as u64, n);
             let lat = DevBuf::from_f32(gpu, &nz)?;
+            let t_sample = Instant::now();
             for i in 0..sig.len() - 1 {
                 prof::reset_clock(&self.nsd)?;
                 let mut v = self.dit.velocity(&self.nsd, &pre, &lat, hw, sig[i], None)?;
                 if let Some(np) = &npre {
                     let vn = self.dit.velocity(&self.nsd, np, &lat, hw, sig[i], None)?;
-                    // v_neg + scale (v - v_neg)
-                    // SAFETY: n floats each.
-                    ffi::check(unsafe { (k.axpy)(gpu.raw(), v.fp(), vn.fp(), n as i64, -1.0) }, "guidance")?;
-                    ffi::check(unsafe { (k.axpy)(gpu.raw(), vn.fp(), v.fp(), n as i64, cfg) }, "guidance")?;
-                    v = vn;
+                    // v_neg + scale (v - v_neg), each token's norm put back to v's (the pipeline's true guidance)
+                    // SAFETY: n floats each, rows of LATENT values.
+                    ffi::check(unsafe { (k.cfg_rescale)(gpu.raw(), v.fp(), vn.fp(), (n / dit::LATENT) as i64, dit::LATENT as i64, cfg, v.fp()) },
+                               "guidance")?;
                 }
                 // SAFETY: n floats each.
                 ffi::check(unsafe { (k.axpy)(gpu.raw(), lat.fp(), v.fp(), n as i64, sig[i + 1] - sig[i]) }, "euler step")?;
                 gpu.sync()?;
                 progress(Step { picture: p, at: i as u32 + 1, of: steps as u32, seconds: t0.elapsed().as_secs_f64() })?;
             }
+            crate::sd::record(format!("generating 1 latent images completed, taking {:.2}s", t_sample.elapsed().as_secs_f64()));
+            let t_vae = Instant::now();
             let (rgba, pw, ph) = self.vae.decode(&self.nsd, &lat.to_f32()?, hw.0, hw.1)?;
+            crate::sd::record(format!("decode_first_stage completed, taking {:.2}s", t_vae.elapsed().as_secs_f64()));
             if prof::on() {
                 prof::report(&mut |l| eprintln!("{l}"));
             }

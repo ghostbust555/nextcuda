@@ -21,6 +21,7 @@ pub struct Api {
     pub to_rgba8: unsafe extern "C" fn(G, P, i64, i64, *mut u8) -> c_int,
     pub pad_br: unsafe extern "C" fn(G, P, i64, i64, i64, M) -> c_int,
     pub avg_down_add: unsafe extern "C" fn(G, P, i64, i64, i64, i64, c_int, M) -> c_int,
+    pub cfg_rescale: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, f32, *mut f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -58,6 +59,7 @@ pub fn api() -> nextcuda_core::Result<&'static Api> {
             to_rgba8: sym!("ns_image_qi21_to_rgba8"),
             pad_br: sym!("ns_image_qi21_pad_br"),
             avg_down_add: sym!("ns_image_qi21_avg_down_add"),
+            cfg_rescale: sym!("ns_image_qi21_cfg_rescale"),
         })
     })
     .as_ref()

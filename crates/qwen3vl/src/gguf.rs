@@ -104,7 +104,7 @@ impl GgufTextEncoder {
         let raw = self.file.read(t).map_err(ge)?;
         let buf = DevBuf::new(&self.gpu, raw.len())?;
         buf.write(0, &raw)?;
-        Ok(W { buf, qtype: code, rows: t.shape[1] as usize })
+        Ok(W { buf, qtype: code, rows: t.shape[0] as usize })
     }
 
     /// A float32 vector of the file (a norm's weight) on the card
@@ -126,7 +126,7 @@ impl GgufTextEncoder {
         let t = self.tensor("token_embd.weight")?;
         let d = self.hidden;
         let rb = t.ty.bytes(d as u64).ok_or_else(|| Error("token_embd.weight: a type with no row size".into()))? as usize;
-        let vocab = t.shape[1] as usize;
+        let vocab = t.shape[0] as usize;
         let mut raw = vec![0u8; ids.len() * rb];
         for (i, id) in ids.iter().enumerate() {
             if *id as usize >= vocab {

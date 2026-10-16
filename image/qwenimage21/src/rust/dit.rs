@@ -125,7 +125,7 @@ impl Dit {
             if ![0, 1, 8, 12, 13, 14, 30].contains(&code) {
                 return Err(Error(format!("{name}: {} weights are not read yet", t.ty.name())));
             }
-            let rows = t.shape[1] as usize;
+            let rows = t.shape[0] as usize;
             let mut bytes = f.read(t).map_err(ge)?;
             if perm {
                 let rb = bytes.len() / rows;

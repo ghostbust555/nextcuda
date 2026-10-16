@@ -130,6 +130,11 @@ pub struct Gen<'a> {
 /// The library's log, kept (last 4,000 lines) so a bench can read the stage times it prints
 static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// A line into the same log (the Rust engine writes its stage times as the library does, so one bench reads both)
+pub fn record(line: String) {
+    LOG.lock().unwrap().push(line);
+}
+
 /// The log lines since the last call
 pub fn take_log() -> Vec<String> {
     std::mem::take(&mut *LOG.lock().unwrap())

@@ -44,6 +44,11 @@ int ns_image_qi21_avg_down_add(ns_gpu* g, const void* x, int64_t H, int64_t W, i
 /* rgba [H, W, 4] uint8 from x [H, W, 4] half in [-1, 1]: clamped, (x / 2 + 0.5) * 255 rounded */
 int ns_image_qi21_to_rgba8(ns_gpu* g, const void* x, int64_t H, int64_t W, uint8_t* rgba);
 
+/* true guidance with the pipeline's norm rescale (diffusers' QwenImagePipeline): per row of `ch` values,
+ *   comb = neg + scale * (pos - neg);  out = comb * |pos| / |comb|
+ * pos, neg, out float32 [rows, ch] (out may be pos or neg) */
+int ns_image_qi21_cfg_rescale(ns_gpu* g, const float* pos, const float* neg, int64_t rows, int64_t ch, float scale, float* out);
+
 #ifdef __cplusplus
 }
 #endif
