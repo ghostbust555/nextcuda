@@ -204,6 +204,29 @@ impl Dit {
         Ok(dit)
     }
 
+    /// Attention of `sq` query rows (q at `q`, `qs`-element rows) over `skv` keys of every head (32 x 128): the silo's
+    /// fused kernel when it is built and `NS_SILO` allows, else the shared one. `causal`: row r reads keys 0..=row0 + r.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(&self, nsd: &Nsd, q: *const std::ffi::c_void, k: *const std::ffi::c_void, v: *const std::ffi::c_void, sq: usize, skv: usize, qs: usize,
+              kvs: usize, causal: bool, row0: usize, out: *mut std::ffi::c_void) -> Result<()> {
+        if let Some(si) = ffi::silo() {
+            // SAFETY: a pure check of the shape.
+            if unsafe { (si.attention_supported)(HEAD as i64, qs as i64, kvs as i64) } == 1 {
+                // SAFETY: q, k, v, out are the sizes named, on this GPU.
+                let rc = unsafe { (si.attention)(self.gpu.raw(), q, k, v, sq as i64, skv as i64, HEADS as i64, HEADS as i64, qs as i64, kvs as i64,
+                                                 causal as i32, row0 as i64, out) };
+                return ffi::check(rc, "attention (silo)");
+            }
+        }
+        if causal {
+            // q addresses row `row0` already: the shared kernel takes the base and the first row
+            let base = q.cast::<u16>().wrapping_sub(row0 * qs).cast();
+            nsd.attention_causal_rows(base, k, v, Dt::F16, row0, sq, HEADS, HEADS, HEAD, qs, kvs, out)
+        } else {
+            nsd.attention_qk(q, sq, qs, k, v, skv, kvs, Dt::F16, HEADS, HEAD, out, Dt::F16)
+        }
+    }
+
     /// The modulation for timestep `t` (a sigma in [0, 1]) and for t = 0: per row (0: t, 1: zero) scale1, tanh(gate1),
     /// scale2, tanh(gate2), the output norm's scale - each [2, 4096] float32 on the GPU
     fn modulation(&self, nsd: &Nsd, t: f32) -> Result<[DevBuf; 5]> {
@@ -374,15 +397,14 @@ impl Dit {
             nsd.rms_rope(qkv.ptr(), Dt::F16, p, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
             nsd.rms_rope(half_at(&qkv, DIM), Dt::F16, p, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
             if text_only {
-                nsd.attention_causal(qkv.ptr(), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), Dt::F16, p, HEADS, HEADS, HEAD, 3 * DIM, 3 * DIM, att.ptr())?;
+                self.attend(nsd, qkv.ptr(), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), p, p, 3 * DIM, 3 * DIM, true, 0, att.ptr())?;
             } else {
                 for (st, n, text) in &segs {
                     let out = half_at(&att, st * DIM);
                     if *text {
-                        nsd.attention_causal_rows(qkv.ptr(), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), Dt::F16, *st, *n, HEADS, HEADS, HEAD, 3 * DIM, 3 * DIM, out)?;
+                        self.attend(nsd, half_at(&qkv, st * 3 * DIM), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), *n, st + n, 3 * DIM, 3 * DIM, true, *st, out)?;
                     } else {
-                        nsd.attention_qk(half_at(&qkv, st * 3 * DIM), *n, 3 * DIM, half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), st + n, 3 * DIM, Dt::F16, HEADS, HEAD, out,
-                                         Dt::F16)?;
+                        self.attend(nsd, half_at(&qkv, st * 3 * DIM), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), *n, st + n, 3 * DIM, 3 * DIM, false, 0, out)?;
                     }
                 }
             }
@@ -435,8 +457,7 @@ impl Dit {
             nsd.rms_rope(half_at(&all, img), Dt::F16, n, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
             nsd.rms_rope(half_at(&all, img + DIM), Dt::F16, n, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
             prof::mark(nsd, "rms + rope")?;
-            nsd.attention_qk(half_at(&all, img), n, 3 * DIM, half_at(&all, DIM), half_at(&all, 2 * DIM), tt + n, 3 * DIM, Dt::F16, HEADS, HEAD,
-                             att.ptr(), Dt::F16)?;
+            self.attend(nsd, half_at(&all, img), half_at(&all, DIM), half_at(&all, 2 * DIM), n, tt + n, 3 * DIM, 3 * DIM, false, 0, att.ptr())?;
             prof::mark(nsd, "attention")?;
             b.out.apply(nsd, att.ptr(), n, DIM, o.ptr(), Dt::F16)?;
             prof::mark(nsd, "out linear")?;

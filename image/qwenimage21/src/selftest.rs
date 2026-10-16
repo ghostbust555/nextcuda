@@ -247,6 +247,36 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<Vec<f32>> {
         }
         out.push(within("pad_br", &got, &want, 1e-6)?);
     }
+    // the silo's fused attention against the shared kernels' (themselves checked against the host), odd sizes, both masks
+    if let Some(si) = crate::ffi::silo() {
+        use nextcuda_diffusion::kernels::{Dt, Nsd};
+        let nsd = Nsd::new(gpu)?;
+        let (sq, skv, hh, d) = (100usize, 150usize, 4usize, 128usize);
+        let qs = hh * d;
+        let mk = |n: usize, seed: u32| -> Result<DevBuf> {
+            let v = data(n, seed);
+            let b = DevBuf::new(gpu, n * 2)?;
+            b.write(0, &v.iter().flat_map(|x| f32_to_half(*x).to_le_bytes()).collect::<Vec<u8>>())?;
+            Ok(b)
+        };
+        let (q, kk, vv) = (mk(skv * qs, 31)?, mk(skv * qs, 32)?, mk(skv * qs, 33)?);
+        for (name, causal, row0) in [("silo attention (no mask)", 0, 0usize), ("silo attention (causal rows 40..140)", 1, 40)] {
+            let rows = if causal == 1 { 100 } else { sq };
+            let keys = if causal == 1 { row0 + rows } else { skv };
+            let mine = DevBuf::new(gpu, rows * qs * 2)?;
+            let want = DevBuf::new(gpu, rows * qs * 2)?;
+            let qp: *const std::ffi::c_void = q.ptr().cast::<u16>().wrapping_add(row0 * qs).cast();
+            // SAFETY: the buffers hold rows x qs halves, keys x qs for k and v.
+            check(unsafe { (si.attention)(gpu.raw(), qp, kk.ptr(), vv.ptr(), rows as i64, keys as i64, hh as i64, hh as i64, qs as i64, qs as i64, causal, row0 as i64, mine.ptr()) }, name)?;
+            if causal == 1 {
+                nsd.attention_causal_rows(q.ptr(), kk.ptr(), vv.ptr(), Dt::F16, row0, rows, hh, hh, d, qs, qs, want.ptr())?;
+            } else {
+                nsd.attention_qk(q.ptr(), rows, qs, kk.ptr(), vv.ptr(), keys, qs, Dt::F16, hh, d, want.ptr(), Dt::F16)?;
+            }
+            nsd.wait()?;
+            out.push(within(name, &read_half(&mine, rows * qs)?, &read_half(&want, rows * qs)?, 4e-3)?);
+        }
+    }
     Ok(out)
 }
 

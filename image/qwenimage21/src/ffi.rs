@@ -74,3 +74,32 @@ pub fn check(rc: c_int, what: &str) -> nextcuda_core::Result<()> {
     let why = nextcuda_core::api().map(|a| a.error()).unwrap_or_default();
     Err(nextcuda_core::Error(format!("{what}: {why}")))
 }
+
+/// The model's silo (`dist/silo/libnextcuda-qwenimage21.so`: kernels/image/qwenimage21/silo), when it is built: the
+/// ops it covers, each used where its `_supported` check says it takes the shape - the shared kernels otherwise
+pub struct Silo {
+    /// attention(gpu, q, k, v, Sq, Skv, Hq, Hkv, qs, kvs, causal, row0, out)
+    #[allow(clippy::type_complexity)]
+    pub attention: unsafe extern "C" fn(G, P, P, P, i64, i64, i64, i64, i64, i64, c_int, i64, M) -> c_int,
+    pub attention_supported: unsafe extern "C" fn(i64, i64, i64) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+pub fn silo() -> Option<&'static Silo> {
+    static S: OnceLock<Option<Silo>> = OnceLock::new();
+    S.get_or_init(|| {
+        let lib = nextcuda_core::silo("qwenimage21").ok().flatten()?;
+        let a = lib.symbol("ns_image_qi21_silo_attention");
+        let s = lib.symbol("ns_image_qi21_silo_attention_supported");
+        if a.is_null() || s.is_null() {
+            return None;
+        }
+        // SAFETY: declared in the silo's attn.cu with these signatures.
+        #[allow(clippy::missing_transmute_annotations)]
+        Some(unsafe { Silo { attention: std::mem::transmute(a), attention_supported: std::mem::transmute(s) } })
+    })
+    .as_ref()
+}
