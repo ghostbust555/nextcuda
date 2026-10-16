@@ -197,9 +197,46 @@ __global__ void combine_k(float* out, const float* dn, const int32_t* tp, const 
     }
 }
 
+// out row j = x row rows[j] (rows of `rb` bytes, copied as 4-byte words)
+__global__ void gather_rows_k(const uint32_t* x, const int32_t* rows, uint32_t* out, int64_t rw, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * rw) return;
+    out[i] = x[(int64_t) rows[i / rw] * rw + i % rw];
+}
+
+// out [t] = sum over the token's entries e in [tp[t], tp[t+1]) of w[ids[e]] * dn[ids[e]] (entries in any order, ids their places)
+__global__ void combine_ids_k(float* out, const float* dn, const int32_t* tp, const int32_t* ids, const float* w, int64_t L) {
+    const int64_t t = blockIdx.x;
+    for (int64_t i = threadIdx.x; i < L; i += blockDim.x) {
+        float s = 0.0f;
+        for (int e = tp[t]; e < tp[t + 1]; ++e) s += w[ids[e]] * dn[(int64_t) ids[e] * L + i];
+        out[t * L + i] = s;
+    }
+}
+
 }  // namespace
 
 extern "C" {
+
+int ns_nh_gather_rows(ns_gpu* g, const void* x, const int32_t* rows, void* out, int64_t row_bytes, int64_t n) {
+    NS_TRY
+    if (n <= 0) return 0;
+    if (row_bytes % 4 != 0) return ns_fail("ns_nh_gather_rows: rows of whole words");
+    const int64_t rw = row_bytes / 4;
+    gather_rows_k<<<(unsigned) ((n * rw + 255) / 256), 256, 0, g->q>>>((const uint32_t*) x, rows, (uint32_t*) out, rw, n);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+int ns_nh_moe_combine_ids(ns_gpu* g, float* out, const float* dn, const int32_t* tp, const int32_t* ids, const float* w, int64_t T, int64_t L) {
+    NS_TRY
+    if (T <= 0) return 0;
+    combine_ids_k<<<(unsigned) T, 256, 0, g->q>>>(out, dn, tp, ids, w, L);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
 
 int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float* w, const float* b, float* out, int64_t T, int64_t C, int k) {
     NS_TRY

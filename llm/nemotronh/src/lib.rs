@@ -28,6 +28,9 @@ use nextcuda_gguf::{GType, Gguf, Tensor};
 
 /// Rows a pass takes
 pub const DEC: usize = 8;
+/// Rows a pass of the grouped MoE path takes (prompts); passes up to SMALL rows run each expert entry on its own
+pub const CHUNK: usize = 1024;
+const SMALL: usize = 4;
 
 fn e(x: impl std::fmt::Display) -> Error {
     Error(x.to_string())
@@ -249,6 +252,9 @@ pub struct Times {
     pub moe_fetch: f64,
     pub head: f64,
     pub passes: usize,
+    /// seconds in the reader threads and the bytes they read
+    pub io_s: f64,
+    pub io_bytes: u64,
     /// NS_NH_PROFILE=1: a MoE layer's parts (seconds, each waited for)
     pub parts: std::collections::BTreeMap<&'static str, f64>,
 }
@@ -270,6 +276,10 @@ pub struct Options {
     /// a profile (`save_profile`'s file): the VRAM left after the dense weights then holds the experts it says are wanted
     /// most, of any layer, instead of the first layers' whole
     pub profile: Option<std::path::PathBuf>,
+    /// rows of a prompt pass (an expert read once for all of them)
+    pub chunk: usize,
+    /// MiB of pinned memory for a prompt pass's misses (part of the pinned budget)
+    pub scratch_mib: usize,
 }
 
 impl Default for Options {
@@ -281,6 +291,8 @@ impl Default for Options {
             pinned_gib: env("NS_NH_PINNED_GIB").and_then(|v| v.parse().ok()).unwrap_or(14.0),
             reserve_mib: env("NS_NH_RESERVE_MIB").and_then(|v| v.parse().ok()).unwrap_or(1800),
             profile: None,
+            scratch_mib: env("NS_NH_SCRATCH_MIB").and_then(|v| v.parse().ok()).unwrap_or(1024),
+            chunk: env("NS_NH_CHUNK").and_then(|v| v.parse().ok()).unwrap_or(512).clamp(1, CHUNK),
         }
     }
 }
@@ -297,6 +309,8 @@ pub struct NemotronH {
     arena: Arena,
     /// the experts of the layers not in VRAM: slots of pinned host memory, the recently used kept (LRU)
     cache: Option<std::sync::Mutex<ExpertCache>>,
+    direct: Option<Direct>,
+    chunk: usize,
     pub times: std::sync::Mutex<Times>,
     pub load_s: f64,
 }
@@ -325,6 +339,11 @@ struct ExpertCache {
     hot: std::collections::HashMap<Key, usize>,
     hot_buf: Option<DevBuf>,
     hot_hits: u64,
+    /// pinned room for the misses of a prompt pass, used and dropped (a sweep over every layer's experts would only push
+    /// out what the profile put in the pools)
+    scratch: Option<(HostBuf, DevBuf)>,
+    scratch_used: usize,
+    scratch_map: std::collections::HashMap<Key, usize>,
 }
 
 impl NemotronH {
@@ -409,7 +428,7 @@ impl NemotronH {
         }
         std::thread::scope(|sc| {
             for part in &by_layer {
-                let (file, err, layers, bases, strides) = (&self.file, &err, &self.layers, &bases, &strides);
+                let (file, err, layers, bases, strides, direct) = (&self.file, &err, &self.layers, &bases, &strides, &self.direct);
                 sc.spawn(move || {
                     for &&(l, x, p, down, sl) in part {
                         let Mix::Moe(m) = &layers[l].mix else { continue };
@@ -417,8 +436,12 @@ impl NemotronH {
                         let Some(t) = file.tensor(&ex.name) else { continue };
                         // SAFETY: the slot is inside its pool and owned by this job.
                         let dst = unsafe { std::slice::from_raw_parts_mut((bases[p] + sl * strides[p]) as *mut u8, ex.stride) };
-                        if let Err(y) = file.read_into(t, (x * ex.stride) as u64, dst) {
-                            *err.lock().unwrap() = Some(y.0);
+                        let r = match direct {
+                            Some(d) => d.read(t, (x * ex.stride) as u64, dst).map_err(|y| y.to_string()),
+                            None => file.read_into(t, (x * ex.stride) as u64, dst).map_err(|y| y.0),
+                        };
+                        if let Err(y) = r {
+                            *err.lock().unwrap() = Some(y);
                         }
                     }
                 });
@@ -448,7 +471,7 @@ impl NemotronH {
                 let err2 = std::sync::Mutex::new(None);
                 std::thread::scope(|sc| {
                     for q in part.chunks(part.len().div_ceil(nt).max(1)) {
-                        let (file, layers, err2) = (&self.file, &self.layers, &err2);
+                        let (file, layers, err2, direct) = (&self.file, &self.layers, &err2, &self.direct);
                         sc.spawn(move || {
                             for &((l, x, down), st, off) in q {
                                 let Mix::Moe(m) = &layers[l].mix else { continue };
@@ -456,8 +479,12 @@ impl NemotronH {
                                 let Some(t) = file.tensor(&ex.name) else { continue };
                                 // SAFETY: each job owns its [off - start, +st) of the staging buffer.
                                 let dst = unsafe { std::slice::from_raw_parts_mut((sbase + off - start) as *mut u8, st) };
-                                if let Err(y) = file.read_into(t, (x * st) as u64, dst) {
-                                    *err2.lock().unwrap() = Some(y.0);
+                                let r = match direct {
+                                    Some(d) => d.read(t, (x * st) as u64, dst).map_err(|y| y.to_string()),
+                                    None => file.read_into(t, (x * st) as u64, dst).map_err(|y| y.0),
+                                };
+                                if let Err(y) = r {
+                                    *err2.lock().unwrap() = Some(y);
                                 }
                             }
                         });
@@ -513,6 +540,68 @@ impl NemotronH {
             let c = c.lock().unwrap();
             (c.hits + c.hot_hits, c.misses)
         })
+    }
+}
+
+/// The model's files opened for direct reads (O_DIRECT: past the page cache, which holds the same bytes the cache pools do
+/// and slows the reads; many in flight, an NVMe's speed)
+struct Direct {
+    files: Vec<std::fs::File>,
+}
+
+impl Direct {
+    fn open(f: &Gguf) -> Option<Direct> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if std::env::var("NS_NH_DIRECT").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let files: std::io::Result<Vec<_>> = f.paths.iter().map(|p| std::fs::OpenOptions::new().read(true).custom_flags(0x4000).open(p)).collect();
+        files.ok().map(|files| Direct { files })
+    }
+
+    /// bytes [at, at + dst.len()) of tensor `t`
+    fn read(&self, t: &Tensor, at: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let abs = t.offset + at;
+        let start = abs & !4095;
+        let end = (abs + dst.len() as u64 + 4095) & !4095;
+        let n = (end - start) as usize;
+        let layout = std::alloc::Layout::from_size_align(n, 4096).unwrap();
+        // SAFETY: a non-zero layout; freed below.
+        let p = unsafe { std::alloc::alloc(layout) };
+        if p.is_null() {
+            return Err(std::io::Error::other("no memory for a direct read"));
+        }
+        // SAFETY: n bytes were allocated.
+        let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
+        // the file may end inside the last block: read what is there
+        let mut got = 0usize;
+        let r = loop {
+            match self.files[t.shard].read_at(&mut buf[got..], start + got as u64) {
+                Ok(0) => break Ok(()),
+                Ok(k) => {
+                    got += k;
+                    if got >= n {
+                        break Ok(());
+                    }
+                }
+                Err(x) if x.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(x) => break Err(x),
+            }
+        };
+        let skip = (abs - start) as usize;
+        let ok = r.is_ok() && got >= skip + dst.len();
+        if ok {
+            dst.copy_from_slice(&buf[skip..skip + dst.len()]);
+        }
+        // SAFETY: allocated above with this layout.
+        unsafe { std::alloc::dealloc(p, layout) };
+        r?;
+        if ok {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("a direct read came up short"))
+        }
     }
 }
 
@@ -632,24 +721,32 @@ impl NemotronH {
             }
         }
         let total: u64 = by_stride.values().sum();
-        let budget = (o.pinned_gib * (1u64 << 30) as f64) as u64;
+        let budget = ((o.pinned_gib * (1u64 << 30) as f64) as u64).saturating_sub((o.scratch_mib as u64) << 20);
         let mut pools = Vec::new();
         for (&stride, &bytes) in &by_stride {
-            let n = ((budget as f64 * bytes as f64 / total as f64) as usize / stride).clamp(DEC * g.used, (bytes as usize) / stride);
+            let n = ((budget as f64 * bytes as f64 / total as f64) as usize / stride).clamp(g.experts.min(o.chunk.min(CHUNK) * g.used), (bytes as usize) / stride);
             let mut hb = HostBuf::new(&gpu, n * stride)?;
             let view = hb.device_view(0, n * stride)?;
             log(format!("nemotronh: expert cache: {n} slots of {:.2} MiB ({:.1} GiB of {:.1} GiB)", stride as f64 / 1048576.0, gib((n * stride) as u64), gib(bytes)));
             pools.push(Pool { _host: hb, view, stride, owner: vec![None; n], used: vec![0; n] });
         }
+        let scratch = if o.scratch_mib > 0 && !pools.is_empty() {
+            let mut hb = HostBuf::new(&gpu, o.scratch_mib << 20)?;
+            let view = hb.device_view(0, o.scratch_mib << 20)?;
+            Some((hb, view))
+        } else {
+            None
+        };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0 })) };
-        let arena = Arena::new(&gpu, 160 << 20)?;
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default() })) };
+        let direct = Direct::open(&f);
+        let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 19_000))?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, times: Default::default(), load_s })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, direct, chunk: o.chunk, times: Default::default(), load_s })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -797,6 +894,9 @@ impl NemotronH {
                     if let Some(&off) = c.hot.get(&(l, x, down)) {
                         return c.hot_buf.as_ref().unwrap().ptr().cast::<u8>().add(off).cast();
                     }
+                    if let Some(&off) = c.scratch_map.get(&(l, x, down)) {
+                        return c.scratch.as_ref().unwrap().1.ptr().cast::<u8>().add(off).cast();
+                    }
                     let (p, sl) = c.map[&(l, x, down)];
                     c.pools[p].view.ptr().cast::<u8>().add(sl * ex.stride).cast()
                 }
@@ -852,6 +952,9 @@ impl NemotronH {
             let mut c = self.cache.as_ref().unwrap().lock().unwrap();
             c.clock += 1;
             let clock = c.clock;
+            c.scratch_map.clear();
+            c.scratch_used = 0;
+            let bypass = t > SMALL && c.scratch.is_some();
             // (matrix is down, expert, the pool's host base + slot)
             let mut jobs: Vec<(bool, usize, usize)> = Vec::new();
             let mut seen = std::collections::HashSet::new();
@@ -871,6 +974,14 @@ impl NemotronH {
                         c.hits += 1;
                         continue;
                     }
+                    if bypass && c.scratch_used + ex.stride <= c.scratch.as_ref().unwrap().0.len {
+                        let off = c.scratch_used;
+                        c.scratch_used += (ex.stride + 255) & !255;
+                        c.scratch_map.insert(key, off);
+                        c.misses += 1;
+                        jobs.push((down, *x, c.scratch.as_ref().unwrap().0.as_slice().as_ptr() as usize + off));
+                        continue;
+                    }
                     let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
                     let sl = (0..c.pools[p].used.len()).min_by_key(|i| c.pools[p].used[*i]).unwrap();
                     if let Some(old) = c.pools[p].owner[sl].take() {
@@ -884,20 +995,26 @@ impl NemotronH {
                 }
             }
             if !jobs.is_empty() {
+                let tio = Instant::now();
+                let nbytes: usize = jobs.iter().map(|j| if j.0 { m.down.stride } else { m.up.stride }).sum();
                 let (tu, td) = (self.file.tensor(&m.up.name).unwrap(), self.file.tensor(&m.down.name).unwrap());
                 let (us, ds) = (m.up.stride, m.down.stride);
                 let nt = jobs.len().clamp(1, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
                 let err = std::sync::Mutex::new(None);
                 std::thread::scope(|sc| {
                     for part in jobs.chunks(jobs.len().div_ceil(nt)) {
-                        let (file, err) = (&self.file, &err);
+                        let (file, err, direct) = (&self.file, &err, &self.direct);
                         sc.spawn(move || {
                             for &(down, x, at) in part {
                                 let (t, st) = if down { (td, ds) } else { (tu, us) };
                                 // SAFETY: the slot is inside its pool; each job owns its slot while the pass runs.
                                 let dst = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, st) };
-                                if let Err(y) = file.read_into(t, (x * st) as u64, dst) {
-                                    *err.lock().unwrap() = Some(y.0);
+                                let r = match direct {
+                                    Some(d) => d.read(t, (x * st) as u64, dst).map_err(|y| y.to_string()),
+                                    None => file.read_into(t, (x * st) as u64, dst).map_err(|y| y.0),
+                                };
+                                if let Err(y) = r {
+                                    *err.lock().unwrap() = Some(y);
                                 }
                             }
                         });
@@ -906,12 +1023,16 @@ impl NemotronH {
                 if let Some(y) = err.into_inner().unwrap() {
                     return Err(e(y));
                 }
+                let mut tm = self.times.lock().unwrap();
+                tm.io_s += tio.elapsed().as_secs_f64();
+                tm.io_bytes += nbytes as u64;
             }
         }
         lap("route+fetch");
         self.times.lock().unwrap().moe_fetch += tf.elapsed().as_secs_f64();
         let latq = self.quantize(lat.fp(), g.latent, t)?;
         // SAFETY: arithmetic only.
+        let mo = if t <= SMALL { {
         let u = self.arena.f32(n_e * g.n_ff_exp)?;
         // the experts' addresses and the activation rows, in one upload: up's pointers | down's | the tokens' rows | 0..n_e
         let mut ptrs: Vec<u8> = Vec::with_capacity(n_e * 24);
@@ -960,6 +1081,73 @@ impl NemotronH {
         let mo = self.arena.f32(t * g.latent)?;
         // SAFETY: mo [t, latent], dn [entries, latent], the token pointers and weights as named in nh.h.
         self.op("moe combine", || unsafe { (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), tpb.ptr().cast(), wb.fp(), t as i64, g.latent as i64) })?;
+        mo
+        } } else {
+            // a prompt pass: the entries by expert; an expert's rows (the tokens that chose it) in one product
+            let mut order: Vec<usize> = (0..n_e).collect();
+            order.sort_by_key(|&j| (ent[j].1, ent[j].0));
+            let (mut rows, mut ws, mut place) = (vec![0i32; n_e], vec![0f32; n_e], vec![0i32; n_e]);
+            let mut groups: Vec<(usize, usize, usize)> = Vec::new(); // (expert, first, count)
+            for (gi, &j) in order.iter().enumerate() {
+                rows[gi] = ent[j].0 as i32;
+                ws[gi] = ent[j].2;
+                place[j] = gi as i32;
+                match groups.last_mut() {
+                    Some(l) if l.0 == ent[j].1 => l.2 += 1,
+                    _ => groups.push((ent[j].1, gi, 1)),
+                }
+            }
+            // each token's entries' places, in token order
+            let mut tp = vec![0i32; t + 1];
+            for (r, _, _) in &ent {
+                tp[r + 1] += 1;
+            }
+            for r in 0..t {
+                tp[r + 1] += tp[r];
+            }
+            let mut ids = vec![0i32; n_e];
+            let mut fill = tp.clone();
+            for (j, (r, _, _)) in ent.iter().enumerate() {
+                ids[fill[*r] as usize] = place[j];
+                fill[*r] += 1;
+            }
+            let bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let (rb, tb, ib, wb) = (self.arena.bytes(n_e * 4)?, self.arena.bytes((t + 1) * 4)?, self.arena.bytes(n_e * 4)?, self.arena.bytes(n_e * 4)?);
+            rb.write(0, &bytes(&rows))?;
+            tb.write(0, &bytes(&tp))?;
+            ib.write(0, &bytes(&ids))?;
+            wb.write(0, &ws.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+            // SAFETY: arithmetic only.
+            let (lq, uq) = unsafe { ((k.q8_1_bytes)(g.latent as i64, 1), (k.q8_1_bytes)(g.n_ff_exp as i64, 1)) };
+            let xg = self.arena.bytes(n_e * lq)?;
+            // SAFETY: n_e rows of the latent's Q8_1 gathered in expert order.
+            self.op("gather", || unsafe { (k.gather_rows)(self.raw(), latq.buf.ptr(), rb.ptr().cast(), xg.ptr(), lq as i64, n_e as i64) })?;
+            let u = self.arena.f32(n_e * g.n_ff_exp)?;
+            for &(x, first, n) in &groups {
+                let w = self.expert_at(&m.up, m.layer, false, x);
+                // SAFETY: expert x's up against its n rows of xg, into rows of u.
+                self.op("expert up", || unsafe {
+                    (k.mmvq)(self.raw(), m.up.ty.code() as i32, w, xg.ptr().cast::<u8>().add(first * lq).cast(), u.fp().add(first * g.n_ff_exp), g.latent as i64, g.n_ff_exp as i64, n as i64)
+                })?;
+            }
+            lap("expert up");
+            // SAFETY: n floats.
+            self.op("relu2", || unsafe { (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64) })?;
+            let uq8 = self.quantize(u.fp(), g.n_ff_exp, n_e)?;
+            let dn = self.arena.f32(n_e * g.latent)?;
+            for &(x, first, n) in &groups {
+                let w = self.expert_at(&m.down, m.layer, true, x);
+                // SAFETY: expert x's down against its n rows of uq8, into rows of dn.
+                self.op("expert down", || unsafe {
+                    (k.mmvq)(self.raw(), m.down.ty.code() as i32, w, uq8.buf.ptr().cast::<u8>().add(first * uq).cast(), dn.fp().add(first * g.latent), g.n_ff_exp as i64, g.latent as i64, n as i64)
+                })?;
+            }
+            lap("expert down");
+            let mo = self.arena.f32(t * g.latent)?;
+            // SAFETY: mo [t, latent], dn [entries, latent], the token pointers, places and weights as named in nh.h.
+            self.op("moe combine", || unsafe { (k.moe_combine_ids)(self.raw(), mo.fp(), dn.fp(), tb.ptr().cast(), ib.ptr().cast(), wb.fp(), t as i64, g.latent as i64) })?;
+            mo
+        };
         let out = self.arena.f32(t * g.n_embd)?;
         self.matmul(&m.from_latent, &mo, None, t, &out)?;
         lap("combine+latent up");
@@ -978,8 +1166,8 @@ impl NemotronH {
     /// One pass of at most DEC rows: the last `n_out` rows' logits (0: none - a prompt chunk before the last)
     pub fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize) -> Result<Vec<Vec<f32>>> {
         let t = tokens.len();
-        if t == 0 || t > DEC {
-            return Err(e(format!("a pass of {t} rows; it takes 1 to {DEC}")));
+        if t == 0 || t > self.chunk {
+            return Err(e(format!("a pass of {t} rows; it takes 1 to {}", self.chunk)));
         }
         if s.pos + t > s.max_ctx {
             return Err(e(format!("the context is full ({} of {})", s.pos + t, s.max_ctx)));
@@ -1036,7 +1224,7 @@ impl NemotronH {
     /// Rows of any length: the passes of DEC rows, the logits of the last `n_out`
     pub fn forward(&self, s: &mut Session, tokens: &[u32], n_out: usize) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::new();
-        let chunks: Vec<&[u32]> = tokens.chunks(DEC).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.chunk).collect();
         let last = chunks.len() - 1;
         for (i, c) in chunks.iter().enumerate() {
             out = self.pass(s, c, if i == last { n_out } else { 0 })?;

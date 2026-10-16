@@ -44,6 +44,11 @@ int ns_nh_gemv_f32(ns_gpu* g, const float* W, const float* x, float* y, int64_t 
 /* out [T][L] = sum over the token's entries e in [tp[t], tp[t+1]) of w[e] * dn[e][L] (entries in token order) */
 int ns_nh_moe_combine(ns_gpu* g, float* out, const float* dn, const int32_t* tp, const float* w, int64_t T, int64_t L);
 
+/* out row j = x row rows[j] (rows of row_bytes, a multiple of 4) */
+int ns_nh_gather_rows(ns_gpu* g, const void* x, const int32_t* rows, void* out, int64_t row_bytes, int64_t n);
+/* out [T][L] = sum over the token's entries e in [tp[t], tp[t+1]) of w[ids[e]] * dn[ids[e]][L] */
+int ns_nh_moe_combine_ids(ns_gpu* g, float* out, const float* dn, const int32_t* tp, const int32_t* ids, const float* w, int64_t T, int64_t L);
+
 /* a GGUF type's row bytes for n values (0: not one the products take) */
 size_t ns_nh_row_bytes(int type, int64_t n);
 int ns_nh_mmvq_supported(int type);
