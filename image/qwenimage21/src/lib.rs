@@ -45,6 +45,11 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "sdcpp-bin", env: "NC_SDCPP_BIN", value: "PATH", help: "the stable-diffusion.cpp sd-cli binary (CUDA build)", at: At::Load },
     EngineOption { name: "sdcpp-extra-args", env: "NC_SDCPP_EXTRA_ARGS", value: "ARGS", help: "more arguments for every sd-cli run", at: At::Load },
     EngineOption { name: "alpha", env: "NC_QWEN21_ALPHA", value: "auto|native|rembg", help: "where a transparent picture's alpha comes from", at: At::Load },
+    // the Rust engine's (backend=rust); the same entries as rust::OPTIONS, so the command line and the bench accept them
+    EngineOption { name: "step-profile", env: "NS_QI_PROFILE", value: "0|1", help: "wait after each named step and report where the time goes", at: At::Load },
+    EngineOption { name: "int8", env: "NS_QI_INT8", value: "0|1", help: "the DiT's block matrices in int8 ConvRot: the card's int8 tensor cores (about 3x the half rate on a GeForce)", at: At::Load },
+    EngineOption { name: "sigmas", env: "NS_QI_SIGMAS", value: "1,X,...", help: "the noise levels from 1 down (a few-step model's own; its step count)", at: At::Both },
+    EngineOption { name: "sigma-shift", env: "NS_QI_SIGMA_SHIFT", value: "dynamic|none", help: "the size's shift on those levels, or as given", at: At::Both },
 ];
 
 pub fn kind() -> ImageKind {

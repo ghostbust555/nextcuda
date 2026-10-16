@@ -37,11 +37,29 @@ NVIDIA behind it instead of SYCL. The platform talks to it with the same `/rpc/<
   weights in their stored type and makes a slice of rows half at a time, RMS norm + modulation, RoPE, SwiGLU, gated
   add, attention for grouped heads, im2col convolutions); `nextcuda image selftest` runs each against host
   arithmetic (dequant of Q8_0 / Q4_K / Q5_K / Q6_K exact; the rest within 1e-3).
-- **Ported, not yet run:** nextsycl's engine as `image/qwenimage21/src/rust/` - the DiT with its blocks in the type
-  the GGUF stores (mixed-quant files included), the VAE, the sampler's schedule, a text encoder read from a
-  llama.cpp GGUF a layer at a time (`crates/qwen3vl/src/gguf.rs`). Selected with `NC_IMAGE_BACKEND=rust`.
-- **Next:** run it, compare its pictures with the stable-diffusion.cpp engine's for the same prompt, then clock it
-  with `nextcuda image bench` and move the hot kernels into the silo.
+- **Running, checked on the 5070 (2026-10-16):** nextsycl's engine as `image/qwenimage21/src/rust/` - the DiT with
+  its blocks in the type the GGUF stores (mixed-quant files included), the VAE, every ComfyUI sampler and schedule,
+  sigma presets, img2img with strength, edits with up to 8 references through the vision tower, LoRAs as side
+  paths, RGBA, progress and cancel; a text encoder read from a llama.cpp GGUF a layer at a time with a host cache
+  and an embedding cache (`crates/qwen3vl/src/gguf.rs`). Selected with `NC_IMAGE_BACKEND=rust`.
+- **nextsycl's documented optimizations, done:** fused flash attention in the silo (18.3 -> 5.5 ms a call at 4k
+  tokens), layer norm + modulation fused, ConvRot int8 W8A8 (`NS_QI_INT8=1`; cuBLASLt int8 tensor cores, about 2x a
+  step here against 1.4x on the B70), AOT per-card builds, the kernels checked against host arithmetic.
+- **Not done:** `image check` stage dumps (no reference dumps exist for CUDA), the Rust engine for Qwen-Image-2512
+  (still stable-diffusion.cpp), int8 at the quality nextsycl documents (30.4 dB PSNR against half here, about 39 dB
+  there; the picture looks right, the cause is not found), attention at nextsycl's ~110 TFLOPS (ldmatrix and
+  cp.async not used yet, about 50 now), the Rust engine as the default.
+
+### Rust engine clocks (RTX 5070, 8 steps guided, `nextcuda image bench`, 3 seeds, warm median)
+
+| model | picture | stable-diffusion.cpp | Rust, half | Rust, int8 |
+|---|---|---:|---:|---:|
+| qwen-image-2.1 Q8_0 | 768x768 | 13.4 s | 11.2 s | 5.4 s |
+| qwen-image-2.1 Q8_0 | 1024x1024 | 26.3 s | 20.2 s | 10.9 s |
+| qwen-image-2.1 Q4 (rrq4) | 1024x1024 | - | - | 10.9 s |
+
+Peak GPU memory with int8: 9.5 GB (768) and 10.6-11.1 GB (1024): close to the 12 GB limit. Edit with references:
+45 s (sd.cpp 89 s); turbo LoRA at 4 steps 5.4 s. Matrices: `benchy-results/image-v1-5070-rust2` and `-rust-int8`.
 
 ## Clocks (RTX 5070 12 GB, in process through stable-diffusion.cpp, 2026-10-15)
 
