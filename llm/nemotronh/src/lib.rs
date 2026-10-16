@@ -353,6 +353,9 @@ pub struct NemotronH {
     /// at KL 0.0037 (top token the same 98.8 %); from rank 4 KL 0.0048 and no faster; vram from 12: KL 0.017
     tail_skip: usize,
     tail_vram: bool,
+    /// decode's staging copies on copy lane 1 (NS_NH_COPY_LANE=0: on the GPU's stream), so the experts already in VRAM are
+    /// multiplied while the others are copied up (three batches: in VRAM, staged, read from disk)
+    copy_lane: bool,
     pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
     /// MoE layers ahead whose misses a guess reads, and how many of each guess's top experts
     pred_ahead: usize,
@@ -423,6 +426,8 @@ struct ExpertCache {
     /// by buffer: a ticket after the kernels that last read it (the next copies into it wait for that)
     pre_done: [i64; 2],
     pre_ring: usize,
+    /// a ticket after the kernels that last read the staging buffer (copies into it on the copy lane wait for that)
+    stage_done: i64,
     /// matrices whose slot a guess's read is still filling (not copied toward VRAM, nor their slot given up, until it is done)
     reading: std::collections::HashSet<Key>,
     /// a guess's reads of experts their layer did not choose, left to finish meanwhile: (layer, expert, the read)
@@ -703,9 +708,10 @@ impl NemotronH {
     }
 
     /// A decode pass's experts `xs` of layer m (those not in VRAM already) copied from their pinned slots into the
-    /// staging buffer, on the GPU's stream: the products then read VRAM
-    fn stage(&self, c: &mut ExpertCache, m: &Moe, xs: &[usize]) -> Result<()> {
-        let Some(cap) = c.stage.as_ref().map(|b| b.len) else { return Ok(()) };
+    /// staging buffer, on the GPU's stream or the copy lane (then the ticket the products wait for): they then read VRAM
+    fn stage(&self, c: &mut ExpertCache, m: &Moe, xs: &[usize]) -> Result<Option<i64>> {
+        let Some(cap) = c.stage.as_ref().map(|b| b.len) else { return Ok(None) };
+        let mut last: Option<i64> = None;
         let mut done = std::collections::HashSet::new();
         for x in xs {
             if !done.insert(*x) {
@@ -753,13 +759,21 @@ impl NemotronH {
                 self.times.lock().unwrap().stage_copy += 1;
                 let off = c.stage_used;
                 c.stage_used += (ex.stride + 255) & !255;
-                // SAFETY: a pinned slot of ex.stride bytes to the staging buffer's [off, off + stride), on the GPU's stream.
+                // SAFETY: a pinned slot of ex.stride bytes to the staging buffer's [off, off + stride), on the GPU's stream
+                // or on copy lane 1 after the kernels that last read the buffer.
                 let dst = unsafe { c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off) };
-                ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "staging an expert")?;
+                if self.copy_lane {
+                    let after: Vec<i64> = if c.stage_done >= 0 { vec![c.stage_done] } else { Vec::new() };
+                    let mut tk = 0i64;
+                    ffi::check(unsafe { (nextcuda_core::api()?.stream_copy)(self.raw(), dst.cast(), src as *const c_void, ex.stride, after.as_ptr(), after.len() as i32, 1, &mut tk) }, "staging an expert")?;
+                    last = Some(tk);
+                } else {
+                    ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "staging an expert")?;
+                }
                 c.stage_map.insert(key, off);
             }
         }
-        Ok(())
+        Ok(last)
     }
 
     /// The read of expert `x`'s matrix of `ex` into `dst`
@@ -1149,7 +1163,7 @@ impl NemotronH {
         let pre_bytes = if stage_bytes > 0 { stage_bytes / SMALL } else { 0 };
         let pre: Vec<DevBuf> = if pre_bytes > 0 && std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0") { (0..2).map(|_| DevBuf::new(&gpu, pre_bytes)).collect::<Result<_>>()? } else { Vec::new() };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, vslots: Vec::new(), hot_at: Default::default(), vram_ins: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default(), stale: Vec::new() })) };
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, vslots: Vec::new(), hot_at: Default::default(), vram_ins: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default(), stale: Vec::new(), stage_done: -1 })) };
         // the CPU's share: when ggml-cpu is there and takes every cached layer's expert types
         let cpu = cpu::Ggml::get().filter(|gg| layers.iter().all(|ly| match &ly.mix {
             Mix::Moe(m) if matches!(m.up.home, Home::Cached) => gg.supports(m.up.ty.code() as i32) && gg.supports(m.down.ty.code() as i32),
@@ -1170,7 +1184,7 @@ impl NemotronH {
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram") })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram"), copy_lane: std::env::var("NS_NH_COPY_LANE").map_or(true, |v| v != "0") })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -1457,6 +1471,9 @@ impl NemotronH {
         let mut late: std::collections::HashSet<usize> = Default::default();
         let mut late_io: Option<(Arc<Pending>, Instant)> = None;
         let mut late_wait: Vec<(usize, Arc<Pending>)> = Vec::new();
+        // decode's experts already in VRAM, and the copy lane's ticket after the others' staging
+        let mut in_vram: std::collections::HashSet<usize> = Default::default();
+        let mut stage_tk: Option<i64> = None;
         if matches!(m.up.home, Home::Cached) {
             // reads started for this layer from a guess at its routing, and those of earlier tokens' guesses not done yet:
             // decode waits only for the experts it chose (those still reading join the second batch when it overlaps), the
@@ -1574,7 +1591,8 @@ impl NemotronH {
             // a decode pass: the experts not in VRAM already copied into the staging buffer, then the products read that
             if t <= SMALL {
                 let xs: Vec<usize> = ent.iter().map(|x| x.1).filter(|x| !cpu_x.contains(x) && !late.contains(x)).collect();
-                self.stage(&mut c, m, &xs)?;
+                in_vram = xs.iter().copied().filter(|&x| [false, true].iter().all(|&d| c.hot.contains_key(&(m.layer, x, d)) || c.pre_map.contains_key(&(m.layer, x, d)))).collect();
+                stage_tk = self.stage(&mut c, m, &xs)?;
             }
             // the copies of the guessed experts, if any: the kernels wait for them (on the device)
             if t <= SMALL {
@@ -1598,15 +1616,24 @@ impl NemotronH {
         } else if t <= SMALL { {
         // the entries the GPU has the bytes of first, the missed ones (reads still in flight) after
         let mut ent = ent;
-        ent.sort_by_key(|x| late.contains(&x.1));
-        let n_a = ent.iter().filter(|x| !late.contains(&x.1)).count();
+        let class = |x: usize| if late.contains(&x) { 2 } else if in_vram.contains(&x) { 0 } else { 1 };
+        ent.sort_by_key(|x| class(x.1));
+        let n_v = ent.iter().filter(|x| class(x.1) == 0).count();
+        let n_a = ent.iter().filter(|x| class(x.1) < 2).count();
         let u = self.arena.f32(n_e * g.n_ff_exp)?;
         let dn = self.arena.f32(n_e * g.latent)?;
-        for (bi, (b0, b1)) in [(0, n_a), (n_a, n_e)].into_iter().enumerate() {
+        let api = nextcuda_core::api()?;
+        for (bi, (b0, b1)) in [(0, n_v), (n_v, n_a), (n_a, n_e)].into_iter().enumerate() {
             if b0 == b1 {
                 continue;
             }
             if bi == 1 {
+                // the staged experts' copies landed
+                if let Some(tk) = stage_tk.take() {
+                    ffi::check(unsafe { (api.await_)(self.raw(), tk) }, "waiting for the staged experts")?;
+                }
+            }
+            if bi == 2 {
                 // the second batch: its reads waited for, then staged as the first was
                 if let Some((p, tio)) = late_io.take() {
                     p.wait().map_err(e)?;
@@ -1621,7 +1648,9 @@ impl NemotronH {
                 }
                 self.times.lock().unwrap().pred_wait += tw.elapsed().as_secs_f64();
                 let xs: Vec<usize> = ent[b0..b1].iter().map(|x| x.1).collect();
-                self.stage(&mut c, m, &xs)?;
+                if let Some(tk) = self.stage(&mut c, m, &xs)? {
+                    ffi::check(unsafe { (api.await_)(self.raw(), tk) }, "waiting for the staged experts")?;
+                }
             }
             let bt = &ent[b0..b1];
             let nb = bt.len();
@@ -1656,6 +1685,12 @@ impl NemotronH {
             self.op("expert down", || unsafe {
                 (k.mmvq_ptrs)(self.raw(), m.down.ty.code() as i32, down_p.cast(), seq_p, uq8.buf.ptr(), dnb, g.n_ff_exp as i64, g.latent as i64, nb as i64)
             })?;
+        }
+        if let (true, Some(c)) = (self.copy_lane && matches!(m.up.home, Home::Cached), &self.cache) {
+            // the staging buffer is free for the next layer's copies once these kernels are done with it
+            let mut tk = 0i64;
+            ffi::check(unsafe { (api.mark)(self.raw(), &mut tk) }, "marking the stream")?;
+            c.lock().unwrap().stage_done = tk;
         }
         lap("expert up+down");
         // the weighted sum per token (entries in token order)
