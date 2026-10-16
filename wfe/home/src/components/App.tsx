@@ -36,7 +36,7 @@ function Alloc(mb: number, headroom: number, kind: string, given: boolean, unit 
 }
 
 function procName(p: Proc): string {
-  if (p.program !== "nextsycl") return p.program;
+  if (p.program !== "nextcuda") return p.program;
   return [p.kind, p.command, p.model].filter((x) => x).join(" ");
 }
 

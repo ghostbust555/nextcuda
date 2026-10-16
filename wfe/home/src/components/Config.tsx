@@ -1,4 +1,4 @@
-/** The Config tab: nextsycl.conf as settings (grouped, each with what it does, its default and what reads it) or as
+/** The Config tab: nextcuda.conf as settings (grouped, each with what it does, its default and what reads it) or as
  *  the file itself; a save copies the file first and lists what has to restart to see the change. */
 import { jsx } from "../jsx.js";
 import { render, restartService, saveConfig, ui } from "../main.js";
