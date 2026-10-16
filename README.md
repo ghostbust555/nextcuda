@@ -78,6 +78,13 @@ checks it and registers the model.
   and `image.edit` run as jobs (`wait: false`, `label`, `reentrant_id`), asked for with `image.status` /
   `image.jobs`, stopped with `image.cancel`; `image.upload`, `image.queue.*`, `system.busy`, `system.cards`,
   `system.models` and `system.version` (which lists its features) are there as they are on nextsycl.
+- **Maintenance mode** (the page's Maintenance button, `system.maintenance {on, message, eta_s, unload}`): the box set
+  aside for development while callers are told. What would start work - chat, generation, edits, speech,
+  `system.load` / `enable`, the OpenAI POST routes - is refused with error code `maintenance` (503, retryable,
+  `retry_after_s`; `/v1` answers HTTP 503 with `Retry-After`); status, listings and cancels answer as always. Queued
+  image and audio jobs wait, the video queue pauses, running work finishes; the switcher answers Open WebUI's chats
+  with the notice (`maintenance.json` beside the registry). Requests with `X-Maintenance-Bypass: <key>` (the key turning
+  it on answers) go through.
 - **A model server a model, on demand:** the first request for a registered model starts `nextcuda image serve` for
   it on the first card with room, swaps it when a request names another, and lets it go after the idle time.
 - **Qwen-Image 2.1:** text to image (RGBA with `rgba`), img2img with a `strength`, edits and compositions from up to
