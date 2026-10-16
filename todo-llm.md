@@ -108,3 +108,11 @@ old ones halved). What is left per token at 10 tok/s (~100 ms): expert up/down 4
 pinned memory, 15-17 GB/s), cache misses read from disk 30 ms, Mamba 10 ms.
 Load: 20 s + 15 s preload. Next: promote on a miss into VRAM (dynamic hot set), prefetch the next layers' likely experts
 (overlap the disk reads), GPU routing, the Mamba chunked scan for prompts, MTP drafts, and the check against llama.cpp.
+
+## Status (2026-10-16, end of day): numbers in docs/benchy/nemotron-3.5-super-iq1m.md
+
+5070 alone: 2,000-token prompt 19 s (103 tok/s; 121 tok/s at 8,000), decode 8-9 tok/s (10-15 on a matched topic) with 25 GiB pinned;
+22 GiB: 88 / 6-7.5. Done since the last status: grouped prompt MoE on tensor cores, dense GEMMs for prompts, tiled Mamba scan, O_DIRECT
+reader threads, scratch for a prompt's misses, DMA staging for decode, routing guessed a layer ahead. Left: logit cosine against llama.cpp,
+reading further ahead (two MoE layers), dynamic promotion into VRAM, wiring the engine to the `Engine` contract and `nextcuda llm serve`,
+a model card, MTP (probably not worth it: a verify pass reads the union of its rows' experts).
