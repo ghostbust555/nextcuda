@@ -50,6 +50,17 @@ nextsycl, UD-IQ1_M: both cards 702 / 41.6 tok/s at 2K (MTP), 31.8 without drafts
 347 / 21.4. On 24 GB with ~25 GiB off-card and only x1 for the second card, a first honest target is 5-10 tok/s decode
 without drafts and a few hundred tok/s prompt; the miss rate decides it, which is why step 2 comes first.
 
+## Decisions (2026-10-16)
+
+- **5070 only.** The 3060 is not used: one card, 12 GB, everything else streamed (pinned RAM, then page cache/NVMe).
+  Goal first: make it work at all, then fast.
+- **Borrow CUDA kernels, do not port SYCL.** Strata_B70 (`brainiac:~/Dev/Strata_B70/src/kernels/cuda/`) has them for
+  NVIDIA already: `iq_kernels.cu` (1,583 lines: IQ1_S/IQ2_XXS/XS/S/IQ3_XXS/Q2_0 dequant + mmvq-style dots, grouped
+  experts), `native_mmvq.cu`, `native_moe.cu`, `native_router.cu`, `native_flash_attn.cu`, `quantize_act.cu`. What
+  Strata lacks is Mamba-2: take `ssm-conv.cu` / `ssm-scan.cu` (516 lines, MIT) from llama.cpp's ggml-cuda
+  (`~/llama.cpp` on brainiac-nvidia, which also knows `NEMOTRON_H_MOE`: the reference for step 4 and a fallback).
+  Check each borrowed file's licence before it goes into the repo.
+
 ## Plan (each step checked before the next)
 
 - [ ] 0. Fetch the two shards (46 GB) to `~/nextcuda/models/nemotron35-super-iq1m/`, verify sha256. Raise memlock for
