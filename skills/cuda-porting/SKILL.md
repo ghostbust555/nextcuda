@@ -19,6 +19,8 @@ each step leaves a measurement behind.
   and find out why before the next run.
 - **Never kill an engine mid-kernel;** stop it through its own exit path (`nextcuda image stop`, or the service).
 - **Test through the real server** after any change to memory: it holds more than a one-shot run.
+- **Never write over a library a process has mapped.** Build to a temporary name and rename over it (a rename keeps
+  the old file for whoever mapped it); `kernels/build.sh` does, and a copy in place once killed a bench mid-run.
 - **Pause the neighbours:** a clock taken while another job uses the card is not a clock. Hold the queues that share
   it (and release them after: a bench script puts the release in a `finally`).
 

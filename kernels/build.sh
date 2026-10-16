@@ -61,7 +61,9 @@ for k in $KINDS; do
   extra=()
   sdso=$(ls "$SDLIB"/bin/libstable-diffusion.so "$SDLIB"/libstable-diffusion.so 2>/dev/null | head -1 || true)
   if [ "$k" = image ] && [ -n "$sdso" ]; then
-    cp -L "$sdso" "$OUT/libstable-diffusion.so"
+    # beside the old one, then renamed over it: a running server keeps the library it mapped (writing over it in place
+    # changes the code under it - it cost a running bench its process)
+    cp -L "$sdso" "$OUT/.libstable-diffusion.so.new" && mv -f "$OUT/.libstable-diffusion.so.new" "$OUT/libstable-diffusion.so"
     extra=(-L"$OUT" -lstable-diffusion -Xlinker -rpath -Xlinker '$ORIGIN')
   fi
   echo "==> linking libnextcuda-$k.so"
