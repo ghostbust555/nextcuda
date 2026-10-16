@@ -697,6 +697,7 @@ impl NemotronH {
             let after: Vec<i64> = if c.pre_done[b] >= 0 { vec![c.pre_done[b]] } else { Vec::new() };
             let api = nextcuda_core::api()?;
             let mut last = -1i64;
+            let (mut dsts, mut srcs, mut sizes): (Vec<*mut c_void>, Vec<*const c_void>, Vec<usize>) = Default::default();
             for x in self.pred.lock().unwrap().get(&l2).cloned().unwrap_or_default().into_iter().take(self.pre_k) {
                 for (down, ex) in [(false, &m2.up), (true, &m2.down)] {
                     let key = (l2, x, down);
@@ -713,10 +714,20 @@ impl NemotronH {
                     let mut ticket = 0i64;
                     // SAFETY: a pinned slot of ex.stride bytes into the buffer's [off, off + stride), on the copy lane after the ticket.
                     let dst = unsafe { c.pre[b].ptr().cast::<u8>().add(off) };
-                    ffi::check(unsafe { (api.stream_copy)(self.raw(), dst.cast(), src as *const c_void, ex.stride, after.as_ptr(), after.len() as i32, 0, &mut ticket) }, "copying a guessed expert")?;
-                    last = ticket;
+                    if self.copy_batch.is_some() {
+                        dsts.push(dst.cast());
+                        srcs.push(src as *const c_void);
+                        sizes.push(ex.stride);
+                    } else {
+                        ffi::check(unsafe { (api.stream_copy)(self.raw(), dst.cast(), src as *const c_void, ex.stride, after.as_ptr(), after.len() as i32, 0, &mut ticket) }, "copying a guessed expert")?;
+                        last = ticket;
+                    }
                     c.pre_map.insert(key, (b, off));
                 }
+            }
+            if let (Some(f), false) = (self.copy_batch, dsts.is_empty()) {
+                // SAFETY: as the copies above: each into its [off, off + stride) of the buffer, on the copy lane after the ticket.
+                ffi::check(unsafe { f(self.raw(), dsts.as_ptr(), srcs.as_ptr(), sizes.as_ptr(), dsts.len(), after.as_ptr(), after.len() as i32, 0, &mut last) }, "copying the guessed experts")?;
             }
             if last >= 0 {
                 c.pre_ticket.insert(l2, (last, b));

@@ -144,3 +144,50 @@ GPU wait a MoE layer (the guess read back with the router); prompts borrow the h
 22 GiB pinned (decode 6-8 tok/s). Open WebUI (tooling/open-webui.sh, user unit) chats through the front door's /v1.
 Next: GPU-side routing and cache lookup (the last wait a layer), Q6_K mmvq at full bandwidth (Mamba 10 ms a token at ~350 of
 672 GB/s), write-back from VRAM to pinned for an LRU tier that does not lose experts, MTP.
+
+## Status (2026-10-17): Strata v0.1.44.1's ideas, one at a time; decode 7.2 -> 11.9 tok/s at 22 GiB (paused here)
+
+All at 22 GiB pinned, `nh --bench 20,2000 --new 128`, each change kept only after two runs. Quality is checked with
+`NS_NH_KL=FILE`: the first run writes a reference, later runs feed its tokens and print KL and top-1 agreement. The
+baseline is deterministic (KL 0).
+
+| change | decode tok/s, 20 / 2,000-token prompt | KL |
+|---|---:|---:|
+| baseline | 7.1-7.5 / 5.4 | 0 |
+| 1. tail skip: a chosen expert past rank 8 that would be a disk read is dropped (`NS_NH_TAIL_SKIP` 8, `NS_NH_TAIL_TIER` pinned) | 9.7 / 7.2 | 0.0037 (768 steps) |
+| 2a. a guess's reads per expert; a layer waits only for what it chose | 10.1 / 7.8 | same |
+| 2b. staging copies on copy lane 1; VRAM experts multiplied first (three batches) | 10.6 / 7.8 | same |
+| 2c. a layer's staging copies in one `cudaMemcpyBatchAsync` (`ns_stream_copy_batch`, new in kernels/ns) | +6 % short prompts | same |
+| 3a. pinned LRU ordered (BTreeSet; a victim was a ~15K-slot scan); small uploads through a pinned ring, no sync each | 11.6-12.3 / 8.2 | same |
+| 3b. guessed copies batched too | 11.9 / 8.25 (neutral, kept) | same |
+
+Lost or not done: skipping everything not in VRAM (KL 0.017 from rank 12); skipping from rank 4 (no faster, more KL);
+repacking experts as one blob each (the 34 GiB repack doesn't fit the 32 GB free; up+down are already read together).
+
+**Not yet deployed:** the front door (:8000, ~/nextcuda/dist) still runs the engine from before these changes. Run
+`./build.sh` plus the deploy, then `nextcuda models pull nemotron-3.5-super-iq1m --again`. The new ns_stream_copy_batch
+symbol is optional: an older libnextcuda-*.so still loads.
+
+### To do (in order)
+
+- [ ] **Deploy** the above to the front door; check a chat through :8000 and Open WebUI.
+- [ ] **3. Finish GPU routing** (nsys, 48 decode tokens, after 3a: 83 ms a token, the GPU busy 46 of them; compute 19,
+  copy lanes 9 + 20). What's left:
+  - [ ] Host gap after the logits read: ~220 us a MoE layer, 18 ms a token. Find what is still slow on the host (no
+    `perf` on the box: time `cpu route` / `predict_finish` / `stage` with Instant, no syncs). Suspects: the two sorts of
+    512, HashMap lookups per matrix, `Vec` allocations per layer.
+  - [ ] Logits read back through pageable memory (blocks; 29 ms a token in D2H waits, mostly the GPU's real work). Read
+    them into pinned memory instead, then a top-22 kernel (sigmoid + bias), so only 22 ids + weights come back.
+  - [ ] Strata's full design: a device residency table (layer x expert -> VRAM slot), hot experts multiplied straight
+    after the router with no host round trip, and the host told only about misses (mapped-memory doorbell). Worth it once
+    the host gap is small; it then hides the remaining wait behind the hot experts' products.
+  - [ ] GPU idle that isn't host gaps (~19 ms): disk-read waits for chosen misses (`pred_wait`, ~17 ms a token after 2a).
+- [ ] **4. Adaptive VRAM tier** (Strata `generate.cpp` `adapt()`): every 4 windows, at most 96 swaps, a candidate needs
+  count >= 2 and 1.5x the victim's, counts x0.7 each round, copies on their own stream, a layer gated until its copies
+  land. Source: the pinned tier (no disk). This is the fix for why our LRU VRAM tier lost (churn). Prize: a matched topic
+  decodes 13-15 vs 8-10.
+- [ ] **5. Thread placement** (Strata `--aux-cpus`): pin the decode thread to a core, the 24 reader threads off it. Cheap;
+  steadier host gaps.
+- [ ] Then: prompt prefetch (the next MoE layer's missing experts read during the Mamba/attention layers in between;
+  prompt reads were 7 of 19 s), MTP, the 3060 as a helper card (Strata `remote_experts.cpp`), Q6_K mmvq at full
+  bandwidth (Mamba ~10 ms a token).
