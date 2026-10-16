@@ -34,7 +34,8 @@ fn main() {
     }
     let prompt = opt("--prompt").unwrap_or_else(|| "What is the capital of France?".into());
     let n: usize = opt("--n").and_then(|v| v.parse().ok()).unwrap_or(32);
-    let o = Options::default();
+    let mut o = Options::default();
+    o.profile = Some(std::path::PathBuf::from(path).with_file_name("expert-profile.txt"));
     let m = NemotronH::load(std::path::Path::new(path), &o, &mut |s| eprintln!("{s}")).unwrap_or_else(|x| {
         eprintln!("load: {}", x.0);
         std::process::exit(1)

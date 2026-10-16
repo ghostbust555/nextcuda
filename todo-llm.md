@@ -90,3 +90,21 @@ conv/scan, gated norm, attention to 12K keys, RMS norm, combine). Not yet checke
 Next: check against llama.cpp (cosine of logits); the expert cache (hot experts by profile; pinned tier chosen per
 expert, not per layer); bigger prompt chunks (group by expert, read each once); `FREE_MISSES` bound; GPU routing;
 Mamba chunked scan; MTP.
+
+## Status (2026-10-16, later): 10 tok/s
+
+On the 5070 alone, UD-IQ1_M, greedy, the right answer ("Paris") and fluent 160-token stories:
+
+| step | decode | 30-token prompt |
+|---|---|---|
+| first working (experts of 5 layers in VRAM, 16 pinned, 19 read from disk per pass) | 1.9 tok/s | 25 s |
+| expert cache in pinned memory (LRU, one pool per matrix size, 22 GiB, 16 reader threads) | 4.5-5.3 | 13 s (cold) |
+| experts' products in one launch (pointer arrays) | 5.3 | |
+| cache preloaded at start (profile saved by the last run: most wanted first) | 7.3 | 3.6 s |
+| VRAM = the hot experts of any layer by the profile (4.2 GiB), not the first layers' whole | 10.2 (same topic) | 3.0 s |
+
+A different topic than the profile's: about 5 tok/s until the hot set follows it (profiles merge: this run's counts plus the
+old ones halved). What is left per token at 10 tok/s (~100 ms): expert up/down 47 ms (the matrices read over PCIe from
+pinned memory, 15-17 GB/s), cache misses read from disk 30 ms, Mamba 10 ms.
+Load: 20 s + 15 s preload. Next: promote on a miss into VRAM (dynamic hot set), prefetch the next layers' likely experts
+(overlap the disk reads), GPU routing, the Mamba chunked scan for prompts, MTP drafts, and the check against llama.cpp.
