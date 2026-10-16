@@ -17,6 +17,7 @@
 //! VRAM; the other layers' through a cache of pinned host memory (which the kernels read in place over PCIe) of the
 //! experts used lately, the misses read from the file.
 
+pub mod engine;
 pub mod ffi;
 
 use std::ffi::c_void;
@@ -321,10 +322,13 @@ pub struct NemotronH {
     cache: Option<std::sync::Mutex<ExpertCache>>,
     io: Io,
     /// reads started for the next MoE layer from a guess at its routing, by layer
-    inflight: std::sync::Mutex<std::collections::HashMap<usize, Arc<Pending>>>,
+    inflight: std::sync::Mutex<std::collections::HashMap<usize, Vec<Arc<Pending>>>>,
     chunk: usize,
     predict: bool,
     pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
+    /// MoE layers ahead whose misses a guess reads, and how many of each guess's top experts
+    pred_ahead: usize,
+    pred_k: usize,
     /// the largest dense matrix as half (the prompt passes' GEMMs), and the rows from which they are used
     w16: Option<DevBuf>,
     dense_gemm_min: usize,
@@ -375,6 +379,8 @@ struct ExpertCache {
     /// by buffer: a ticket after the kernels that last read it (the next copies into it wait for that)
     pre_done: [i64; 2],
     pre_ring: usize,
+    /// matrices whose slot a guess's read is still filling (not copied toward VRAM before their layer waits for it)
+    reading: std::collections::HashSet<Key>,
 }
 
 impl NemotronH {
@@ -496,27 +502,57 @@ impl NemotronH {
     /// started now, to be waited for when it runs
     fn predict_next(&self, l: usize, x: &DevBuf) -> Result<()> {
         let g = &self.g;
-        let Some(l2) = (l + 1..g.layers).find(|i| g.kinds[*i] == Kind::Moe) else { return Ok(()) };
-        let Mix::Moe(m2) = &self.layers[l2].mix else { return Ok(()) };
-        if !matches!(m2.up.home, Home::Cached) {
+        // the next MoE layers (NS_NH_PRED_AHEAD, 1 by default: further guesses read wrong experts that push right ones out of the pools, measured slower): each one's router on the residual stream as it is now; the
+        // reads of the misses among each guess's top NS_NH_PRED_K (more than the 22 it will choose: a wrong guess costs a read the
+        // disk has time for, a right one saves a wait), the copies toward VRAM for the first only
+        let targets: Vec<usize> = (l + 1..g.layers).filter(|i| g.kinds[*i] == Kind::Moe).take(self.pred_ahead).collect();
+        let targets: Vec<usize> = targets.into_iter().filter(|t| matches!(&self.layers[*t].mix, Mix::Moe(m) if matches!(m.up.home, Home::Cached))).collect();
+        if targets.is_empty() {
             return Ok(());
         }
         let mark = self.arena.mark();
         let hh = self.arena.f32(g.n_embd)?;
-        self.rms(x, &self.layers[l2].norm, &hh, 1, g.n_embd)?;
-        let lg2 = self.arena.f32(g.experts)?;
-        self.matmul(&m2.router, &hh, None, 1, &lg2)?;
-        let v = lg2.to_f32()?;
+        let lg = self.arena.f32(g.experts * targets.len())?;
+        for (i, &lt) in targets.iter().enumerate() {
+            let Mix::Moe(mt) = &self.layers[lt].mix else { continue };
+            self.rms(x, &self.layers[lt].norm, &hh, 1, g.n_embd)?;
+            self.matmul(&mt.router, &hh, None, 1, &lg.view(i * g.experts * 4, g.experts * 4)?)?;
+        }
+        let all = lg.to_f32()?;
         self.arena.rewind(mark);
-        let mut idx: Vec<usize> = (0..g.experts).collect();
-        let sc = |i: usize| 1.0 / (1.0 + (-v[i]).exp()) + m2.bias[i];
-        idx.sort_by(|a, b| sc(*b).total_cmp(&sc(*a)).then(a.cmp(b)));
-        idx.truncate(g.used);
-        self.pred.lock().unwrap().insert(l2, idx.clone());
+        let mut reqs: Vec<IoReq> = Vec::new();
         let mut c = self.cache.as_ref().unwrap().lock().unwrap();
         let clock = c.clock;
-        let mut reqs: Vec<IoReq> = Vec::new();
-        for x in idx {
+        for (i, &lt) in targets.iter().enumerate() {
+            let Mix::Moe(mt) = &self.layers[lt].mix else { continue };
+            let v = &all[i * g.experts..(i + 1) * g.experts];
+            let mut idx: Vec<usize> = (0..g.experts).collect();
+            let sc = |i: usize| 1.0 / (1.0 + (-v[i]).exp()) + mt.bias[i];
+            idx.sort_by(|a, b| sc(*b).total_cmp(&sc(*a)).then(a.cmp(b)));
+            idx.truncate(self.pred_k.max(g.used));
+            if i == 0 {
+                self.pred.lock().unwrap().insert(lt, idx[..g.used].to_vec());
+            }
+            self.claim_reads(&mut c, mt, lt, &idx, clock, &mut reqs);
+        }
+        let l2 = targets[0];
+        let Mix::Moe(m2) = &self.layers[l2].mix else { return Ok(()) };
+        self.copy_guessed(&mut c, m2, l2, &reqs)?;
+        drop(c);
+        if !reqs.is_empty() {
+            let p = self.io.submit(&reqs);
+            // by the layer of the slots: every batch that writes them is waited for before that layer reads them
+            let mut fl = self.inflight.lock().unwrap();
+            for &lt in &targets {
+                fl.entry(lt).or_default().push(p.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Slots for the experts of `idx` (of MoE layer `lt`) the cache lacks, their reads appended to `reqs`
+    fn claim_reads(&self, c: &mut ExpertCache, m2: &Moe, l2: usize, idx: &[usize], clock: u64, reqs: &mut Vec<IoReq>) {
+        for &x in idx {
             for (down, ex) in [(false, &m2.up), (true, &m2.down)] {
                 let key = (l2, x, down);
                 if c.hot.contains_key(&key) {
@@ -538,11 +574,15 @@ impl NemotronH {
                 c.pools[p].used[sl] = clock;
                 c.map.insert(key, (p, sl));
                 c.misses += 1;
+                c.reading.insert(key);
                 reqs.push(self.req(ex, x, c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride));
             }
         }
-        // the guessed experts already in pinned memory (not those just queued to be read) copied toward VRAM now, on the copy lane,
-        // after the kernels that last read the buffer
+    }
+
+    /// The guessed experts of `l2` already in pinned memory (not those just queued to be read) copied toward VRAM now, on the
+    /// copy lane, after the kernels that last read the buffer
+    fn copy_guessed(&self, c: &mut ExpertCache, m2: &Moe, l2: usize, reqs: &[IoReq]) -> Result<()> {
         if !c.pre.is_empty() {
             let b = c.pre_ring;
             c.pre_ring = 1 - b;
@@ -560,7 +600,7 @@ impl NemotronH {
                     }
                     let Some(&(p, sl)) = c.map.get(&key) else { continue };
                     let src = c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride;
-                    if fresh.contains(&src) {
+                    if fresh.contains(&src) || c.reading.contains(&key) {
                         continue;
                     }
                     let off = c.pre_used[b];
@@ -576,11 +616,6 @@ impl NemotronH {
             if last >= 0 {
                 c.pre_ticket.insert(l2, (last, b));
             }
-        }
-        drop(c);
-        if !reqs.is_empty() {
-            let p = self.io.submit(&reqs);
-            self.inflight.lock().unwrap().insert(l2, p);
         }
         Ok(())
     }
@@ -931,7 +966,7 @@ impl NemotronH {
         let pre_bytes = if stage_bytes > 0 { stage_bytes / SMALL } else { 0 };
         let pre: Vec<DevBuf> = if pre_bytes > 0 && std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0") { (0..2).map(|_| DevBuf::new(&gpu, pre_bytes)).collect::<Result<_>>()? } else { Vec::new() };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0 })) };
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default() })) };
         let io = Io::new(&f, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
         let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 28_000))?;
         gpu.sync()?;
@@ -939,7 +974,7 @@ impl NemotronH {
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk: o.chunk, predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk: o.chunk, predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -1192,13 +1227,14 @@ impl NemotronH {
         let mut pre_b: Option<usize> = None;
         if matches!(m.up.home, Home::Cached) {
             // reads started for this layer from a guess at its routing
-            let pend = self.inflight.lock().unwrap().remove(&m.layer);
-            if let Some(p) = pend {
-                let tw = Instant::now();
+            let pend = self.inflight.lock().unwrap().remove(&m.layer).unwrap_or_default();
+            let tw = Instant::now();
+            for p in pend {
                 p.wait().map_err(e)?;
-                self.times.lock().unwrap().pred_wait += tw.elapsed().as_secs_f64();
             }
+            self.times.lock().unwrap().pred_wait += tw.elapsed().as_secs_f64();
             let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+            c.reading.retain(|k| k.0 != m.layer);
             c.clock += 1;
             let clock = c.clock;
             c.scratch_map.clear();

@@ -552,6 +552,7 @@ dependencies = [
  "nextcuda-image",
  "nextcuda-image-qwenimage21",
  "nextcuda-llm",
+ "nextcuda-llm-nemotronh",
  "nextcuda-models",
  "nextcuda-serve",
  "nextcuda-tok",
@@ -627,6 +628,7 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-core",
  "nextcuda-gguf",
+ "nextcuda-llm",
  "nextcuda-tok",
 ]
 

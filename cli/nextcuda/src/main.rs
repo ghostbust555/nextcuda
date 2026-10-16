@@ -141,7 +141,7 @@ fn gib(b: u64) -> f64 {
 
 /// The llm engines this program has, one a model architecture (llm/<arch>)
 pub(crate) fn engines() -> Vec<EngineKind> {
-    Vec::new() // nextcuda has no llm engine yet
+    vec![nextcuda_llm_nemotronh::engine::kind()]
 }
 
 /// The engine for `f`'s architecture, loaded on `gpus`
@@ -776,6 +776,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
 
 /// `nextcuda llm <command>`: the language-model commands (the old top-level names still work)
 fn llm(cfg: &nextcuda_models::Config, args: &[String]) -> Result<(), String> {
+    // this process's kernels are the llm library's (set before the first GPU call)
+    nextcuda_core::use_kind("llm");
     let rest = args.get(1..).unwrap_or(&[]);
     match args.first().map(String::as_str) {
         Some("start") => service::start(cfg, rest),

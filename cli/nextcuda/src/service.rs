@@ -76,6 +76,9 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
         entry_arch = get("arch");
     }
     let raw = &raw[..];
+    if crate::native::native(cfg) {
+        return run_native(cfg, raw, &entry_env, foreground);
+    }
     let ce = Ce::new(cfg)?;
     if ce.running(SERVER) {
         println!("the server is already running");
@@ -206,9 +209,92 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
     client::status(&["--no-stream".into()])
 }
 
+/// The chat server as a process of this program (no container program asked for: nextcuda on an NVIDIA box): `llm
+/// serve FILE ...` detached, its log in the socket directory, ready when its control socket answers. The entry's own
+/// settings are this process's environment, which the server inherits (and the flags below read).
+fn run_native(cfg: &Config, raw: &[String], entry_env: &[(String, String)], foreground: bool) -> Result<(), String> {
+    if crate::native::running(cfg, SERVER) {
+        println!("the server is already running");
+        return client::status(&["--no-stream".into()]);
+    }
+    for (k, v) in entry_env {
+        std::env::set_var(k, v);
+    }
+    let model = arg(raw, "--model", cfg, "NS_MODEL", "");
+    if model.is_empty() {
+        return Err("llm start <id> (a registry entry) or --model FILE".into());
+    }
+    need_dist(cfg, "libnextcuda-llm.so")?;
+    let mut gpus: Vec<String> = Vec::new();
+    let mut it = raw.iter();
+    while let Some(a) = it.next() {
+        if a == "--gpu" {
+            gpus.push(it.next().ok_or("--gpu N")?.clone());
+        }
+    }
+    if gpus.is_empty() {
+        gpus = cfg.or("NS_GPUS", "0").split([' ', ',']).filter(|s| !s.is_empty() && *s != "all").map(String::from).collect();
+    }
+    let sock_dir = cfg.socket_dir();
+    std::fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(cfg.socket());
+    let mut args: Vec<String> = vec!["llm".into(), "serve".into(), model, "--gpu".into(), if gpus.is_empty() { "0".into() } else { gpus.join(",") }];
+    for (flag, setting, default) in [("--host", "NS_HOST", "127.0.0.1"), ("--port", "NS_PORT", "8085"), ("--ctx", "NS_CTX", "8192"),
+                                     ("--name", "NS_NAME", "model"), ("--effort", "NS_EFFORT", "low"),
+                                     ("--prompt-cache-mib", "NS_PROMPT_CACHE_MIB", "4096"), ("--keep-requests", "NS_KEEP_REQUESTS", "100"),
+                                     ("--parallel", "NS_PARALLEL", "1")] {
+        args.extend([flag.into(), arg(raw, flag, cfg, setting, default)]);
+    }
+    if let Some(m) = cfg.get("NS_MAX_TOKENS") {
+        args.extend(["--max-tokens".into(), m]);
+    }
+    if let Some(c) = cfg.get("NS_CORS") {
+        args.extend(["--cors".into(), c]);
+    }
+    // the prompt cache's disk tier, as in the container
+    let disk_gib = cfg.or("NS_CACHE_DISK_GIB", "32");
+    if disk_gib.trim() != "0" {
+        let d = PathBuf::from(cfg.get("NS_CACHE_DIR").unwrap_or_else(|| format!("{}/.cache/nextcuda/prompts", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))));
+        std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+        args.extend(["--cache-dir".into(), d.to_string_lossy().into_owned(), "--cache-disk-gib".into(), disk_gib, "--cache-ttl-hours".into(), cfg.or("NS_CACHE_TTL_HOURS", "24")]);
+    }
+    args.extend(["--socket".into(), cfg.socket().to_string_lossy().into_owned()]);
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let port = arg(raw, "--port", cfg, "NS_PORT", "8085");
+    crate::native::launch(cfg, SERVER, &port, &exe, &args, foreground)?;
+    if foreground {
+        return Ok(());
+    }
+    let t0 = Instant::now();
+    while !socket_ready(cfg) {
+        if !crate::native::running(cfg, SERVER) {
+            return Err(format!("the server ended while loading ({})", crate::native::log_path(cfg, SERVER).display()));
+        }
+        if t0.elapsed() > Duration::from_secs(900) {
+            return Err("the server did not come up in 900 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    client::status(&["--no-stream".into()])
+}
+
 /// `nextcuda stop`: the server ends once no request runs (never inside a GPU kernel); SIGTERM after 300 s means the
 /// same to it.
 pub fn stop(cfg: &Config) -> Result<(), String> {
+    if crate::native::native(cfg) {
+        if !crate::native::running(cfg, SERVER) {
+            println!("server: not running");
+            return Ok(());
+        }
+        let _ = client::post("/server/shutdown", None);
+        let t0 = Instant::now();
+        while crate::native::running(cfg, SERVER) && t0.elapsed() < Duration::from_secs(300) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        crate::native::stop(cfg, SERVER, 30);
+        println!("server: stopped");
+        return Ok(());
+    }
     let ce = Ce::new(cfg)?;
     if !ce.running(SERVER) {
         ce.remove(SERVER);
@@ -230,6 +316,14 @@ pub fn stop(cfg: &Config) -> Result<(), String> {
 
 /// `nextcuda logs [--no-follow]`
 pub fn logs(cfg: &Config, raw: &[String]) -> Result<(), String> {
+    if crate::native::native(cfg) {
+        let mut c = std::process::Command::new("tail");
+        c.args(["-n", "200"]);
+        if !raw.iter().any(|x| x == "--no-follow") {
+            c.arg("-F");
+        }
+        return c.arg(crate::native::log_path(cfg, SERVER)).status().map_err(|e| e.to_string()).map(|_| ());
+    }
     let ce = Ce::new(cfg)?;
     let mut a = vec!["logs".to_string()];
     if !raw.iter().any(|x| x == "--no-follow") {
