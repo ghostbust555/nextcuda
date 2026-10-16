@@ -1,0 +1,67 @@
+# todo: llm - Nemotron 3.5 Super UD-IQ1_M (nextsycl's `nemotron-3.5-super-iq1m`) on the 5070 + 3060
+
+Study of nextsycl's `llm/nemotronh` (engine.rs 1,982 lines, ffi.rs, lib.rs) and `kernels/llm/nemotronh` (nh.cpp 598,
+silo/{attn,dense,nhs}.cpp ~2,000 lines), 2026-10-16. Nothing is ported yet.
+
+## The model
+
+NVIDIA-Nemotron-3.5-Super-VL-120B-A12B, unsloth UD-IQ1_M, 2 GGUF shards, 43 GiB (46.1 GB). 88 layers: 40 Mamba-2
+mixers (conv 4, 128 heads of 64, 8 groups, state 128), 40 latent-MoE layers (float32 sigmoid router + selection bias,
+22 of 512 experts, experts in a 1,024-wide latent, ReLU-squared, a shared expert on the full width), 8 attention layers
+without positions (32/2 heads of 128), plus an MTP draft block. Quant types: IQ1_S / IQ2_* / IQ3_XXS ups, Q2_0 downs,
+Q6_K Mamba projections, K-quant shared experts. Text only (vision tower not ported in nextsycl either).
+
+## What this box has (the constraint)
+
+| | |
+|---|---|
+| VRAM | 12 GB 5070 (gen4 x16) + 12 GB 3060 (gen4 **x1**, about 1.5 GB/s) = 24 GB, minus KV / Mamba state / scratch |
+| host RAM | 31 GB, 8 cores; pinned memory limit to be checked (`ulimit -l` is 8 MB; needs a raised limit or cudaHostAlloc via the driver) |
+| disk | 76 GB free of 1.3 TB (94 % full): the 46 GB file fits once |
+| model | not on the box; 46 GB to fetch (nextsycl's card has url + sha256 per shard) |
+
+So about 43 - 18 = 25 GiB of experts cannot live on the cards. nextsycl's one-card mode (`NS_NH_HOST`, B70 32 GB
+with the rest in pinned RAM) is the nearest case; here it is three tiers: VRAM, pinned RAM (about 18-20 GB), and the
+page cache / NVMe for the remainder (nextsycl does this for DeepSeek-R1: "experts in VRAM, pinned RAM and the NVMe").
+
+## Tricks to take from nextsycl, in order of value
+
+1. **Expert store with three tiers and an expert profile.** At load VRAM takes the experts earlier runs asked for most
+   (profile saved beside the prompt cache: first answer of a new topic ~10 % fewer swaps); a missed expert is swapped in
+   at decode on two copy streams while resident experts compute; the next layer's likely experts are prefetched.
+   (`reference/expert-cache` has the trace simulations: pinning hot experts lost - the hot set follows the topic;
+   admission/prefetch policies.)
+2. **Bound the prize first** (`NS_FREE_MISSES=1`, "a measurement, wrong output"): with every miss free decode was only
+   13 % faster in nextsycl, so the copies matter less than the kernels. Do this before building a clever cache.
+3. **Never stream onto the x1 card.** The 3060 holds whole layers only (its experts resident); the 5070, on x16, takes
+   the layers that stream. Worst case 22 experts x 40 layers is ~1.8 GB a token: 70 ms at 25 GB/s (x16), 1.2 s at x1.
+4. **One launch per projection for all chosen experts** at decode (routing on the GPU), downs repacked into aligned rows.
+5. **Prompts**: chunks of 2,048 rows, dense matrices expanded to half for the GEMM (cuBLAS here, XMX there), experts
+   grouped by expert after a GPU routing pass; layers split over the cards by measured speed (`NS_NH_SPEED`), the cards
+   pipelined over chunks.
+6. **MTP drafts** (2 a step, Mamba states snapshotted for the verify's rollback): 32 -> 48 tok/s in nextsycl. Last.
+7. **Mamba chunked scan** for prompt rows (64-row chunks).
+8. Method: `NS_NH_PROFILE=1` times every kernel; check against llama.cpp CPU on the same files (`llm check`,
+   cosine 0.99999; `spec-check` for verify rows); microbenchmarks rotate many experts (one reused sits in L2).
+
+## What to expect
+
+nextsycl, UD-IQ1_M: both cards 702 / 41.6 tok/s at 2K (MTP), 31.8 without drafts; one B70 alone with host experts
+347 / 21.4. On 24 GB with ~25 GiB off-card and only x1 for the second card, a first honest target is 5-10 tok/s decode
+without drafts and a few hundred tok/s prompt; the miss rate decides it, which is why step 2 comes first.
+
+## Plan (each step checked before the next)
+
+- [ ] 0. Fetch the two shards (46 GB) to `~/nextcuda/models/nemotron35-super-iq1m/`, verify sha256. Raise memlock for
+      the service (`LimitMEMLOCK=infinity` in the unit). Needs the user's go-ahead (disk to 30 GB free).
+- [ ] 1. GGUF reader: multi-shard, the IQ1_S / IQ2_XXS/XS/S / IQ3_XXS / Q2_0 / Q6_K / Q2_K..Q5_K tensor types (the
+      grid tables) in `nextcuda_gguf` + dequant on the card in `kernels/llm/nemotronh/nh.cu` (exact against host).
+- [ ] 2. Kernels in CUDA (from nh.cpp / silo): Mamba-2 conv + selective scan (decode and chunked), group-norm gate,
+      latent MoE (router, top-22, ReLU^2), attention without RoPE, dense mmvq for each quant (decode), expanded GEMM
+      (prompt). Selftests against host arithmetic, as the diffusion kernels have.
+- [ ] 3. `llm/nemotronh` engine on the `LlmEngine` contract (`llm/contract`): load by tiers, one card first (5070,
+      all experts through the store), then the layer split with the 3060.
+- [ ] 4. Check against llama.cpp (build it with CUDA on the host, CPU run for reference): same next token, logits cosine.
+- [ ] 5. Expert store: profile, miss swap on two streams, prefetch; measure `FREE_MISSES` first.
+- [ ] 6. Bench with `nextcuda llm bench` (benchy methodology as the image kind: cold/warm, peak MiB, PCIe, energy).
+- [ ] 7. MTP drafts; model card `model-cards/llm/nemotron-3.5-super-iq1m.yml`; serve behind the same RPC.
