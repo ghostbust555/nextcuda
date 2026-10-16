@@ -336,7 +336,7 @@ pub struct NemotronH {
     cache: Option<std::sync::Mutex<ExpertCache>>,
     io: Io,
     /// reads started for the next MoE layer from a guess at its routing, by layer
-    inflight: std::sync::Mutex<std::collections::HashMap<usize, Vec<Arc<Pending>>>>,
+    inflight: std::sync::Mutex<std::collections::HashMap<usize, Vec<(usize, Arc<Pending>)>>>,
     chunk: usize,
     predict: bool,
     /// decode multiplies the experts it has while the misses are read, the missed ones in a second batch (NS_NH_OVERLAP=0: all after the reads)
@@ -423,8 +423,31 @@ struct ExpertCache {
     /// by buffer: a ticket after the kernels that last read it (the next copies into it wait for that)
     pre_done: [i64; 2],
     pre_ring: usize,
-    /// matrices whose slot a guess's read is still filling (not copied toward VRAM before their layer waits for it)
+    /// matrices whose slot a guess's read is still filling (not copied toward VRAM, nor their slot given up, until it is done)
     reading: std::collections::HashSet<Key>,
+    /// a guess's reads of experts their layer did not choose, left to finish meanwhile: (layer, expert, the read)
+    stale: Vec<(usize, usize, Arc<Pending>)>,
+}
+
+impl ExpertCache {
+    /// Expert x of layer l's read is done: its slots usable (or, if it failed, empty again)
+    fn settle(&mut self, l: usize, x: usize, failed: bool) {
+        for down in [false, true] {
+            let key = (l, x, down);
+            if self.reading.remove(&key) && failed {
+                if let Some((p, sl)) = self.map.remove(&key) {
+                    self.pools[p].owner[sl] = None;
+                    self.pools[p].used[sl] = 0;
+                }
+            }
+        }
+    }
+
+    /// The least recently used slot of pool p not being read into
+    fn victim(&self, p: usize) -> Option<usize> {
+        let q = &self.pools[p];
+        (0..q.used.len()).filter(|i| !q.owner[*i].is_some_and(|k| self.reading.contains(&k))).min_by_key(|i| q.used[*i])
+    }
 }
 
 impl NemotronH {
@@ -576,7 +599,7 @@ impl NemotronH {
     /// The guesses' choices from their logits: the reads of the misses started, the first guess's pinned experts copied up
     fn predict_finish(&self, targets: &[usize], all: &[f32]) -> Result<()> {
         let g = &self.g;
-        let mut reqs: Vec<IoReq> = Vec::new();
+        let mut reqs: Vec<(usize, usize, IoReq)> = Vec::new();
         let mut c = self.cache.as_ref().unwrap().lock().unwrap();
         let clock = c.clock;
         for (i, &lt) in targets.iter().enumerate() {
@@ -596,18 +619,21 @@ impl NemotronH {
         self.copy_guessed(&mut c, m2, l2, &reqs)?;
         drop(c);
         if !reqs.is_empty() {
-            let p = self.io.submit(&reqs);
-            // by the layer of the slots: every batch that writes them is waited for before that layer reads them
+            // one batch per expert (its matrices), by the layer of its slots: that layer waits for the experts it chose only
+            let mut by: std::collections::BTreeMap<(usize, usize), Vec<IoReq>> = Default::default();
+            for (l, x, r) in reqs {
+                by.entry((l, x)).or_default().push(r);
+            }
             let mut fl = self.inflight.lock().unwrap();
-            for &lt in targets {
-                fl.entry(lt).or_default().push(p.clone());
+            for ((l, x), rs) in by {
+                fl.entry(l).or_default().push((x, self.io.submit(&rs)));
             }
         }
         Ok(())
     }
 
     /// Slots for the experts of `idx` (of MoE layer `lt`) the cache lacks, their reads appended to `reqs`
-    fn claim_reads(&self, c: &mut ExpertCache, m2: &Moe, l2: usize, idx: &[usize], clock: u64, reqs: &mut Vec<IoReq>) {
+    fn claim_reads(&self, c: &mut ExpertCache, m2: &Moe, l2: usize, idx: &[usize], clock: u64, reqs: &mut Vec<(usize, usize, IoReq)>) {
         for &x in idx {
             for (down, ex) in [(false, &m2.up), (true, &m2.down)] {
                 let key = (l2, x, down);
@@ -619,7 +645,7 @@ impl NemotronH {
                     continue;
                 }
                 let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
-                let sl = (0..c.pools[p].used.len()).min_by_key(|i| c.pools[p].used[*i]).unwrap();
+                let Some(sl) = c.victim(p) else { continue };
                 if c.pools[p].used[sl] >= clock {
                     continue; // nothing older to give up
                 }
@@ -631,20 +657,20 @@ impl NemotronH {
                 c.map.insert(key, (p, sl));
                 c.misses += 1;
                 c.reading.insert(key);
-                reqs.push(self.req(ex, x, c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride));
+                reqs.push((l2, x, self.req(ex, x, c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride)));
             }
         }
     }
 
     /// The guessed experts of `l2` already in pinned memory (not those just queued to be read) copied toward VRAM now, on the
     /// copy lane, after the kernels that last read the buffer
-    fn copy_guessed(&self, c: &mut ExpertCache, m2: &Moe, l2: usize, reqs: &[IoReq]) -> Result<()> {
+    fn copy_guessed(&self, c: &mut ExpertCache, m2: &Moe, l2: usize, reqs: &[(usize, usize, IoReq)]) -> Result<()> {
         if !c.pre.is_empty() {
             let b = c.pre_ring;
             c.pre_ring = 1 - b;
             c.pre_used[b] = 0;
             let cap = c.pre[b].len;
-            let fresh: std::collections::HashSet<usize> = reqs.iter().map(|r| r.3).collect();
+            let fresh: std::collections::HashSet<usize> = reqs.iter().map(|r| r.2 .3).collect();
             let after: Vec<i64> = if c.pre_done[b] >= 0 { vec![c.pre_done[b]] } else { Vec::new() };
             let api = nextcuda_core::api()?;
             let mut last = -1i64;
@@ -772,6 +798,22 @@ impl NemotronH {
     }
 }
 
+impl Drop for NemotronH {
+    /// reads still filling the pools finish before the pools go
+    fn drop(&mut self) {
+        for (_, v) in self.inflight.lock().unwrap().drain() {
+            for (_, p) in v {
+                let _ = p.wait();
+            }
+        }
+        if let Some(c) = &self.cache {
+            for (_, _, p) in c.lock().unwrap().stale.drain(..) {
+                let _ = p.wait();
+            }
+        }
+    }
+}
+
 /// (hits, misses) of the expert cache
 impl NemotronH {
     /// (VRAM hits, pinned hits, misses, matrices decode copied into VRAM slots)
@@ -801,6 +843,10 @@ struct Pending {
 }
 
 impl Pending {
+    fn ready(&self) -> bool {
+        *self.left.lock().unwrap() == 0
+    }
+
     fn wait(&self) -> std::result::Result<(), String> {
         let mut l = self.left.lock().unwrap();
         while *l > 0 {
@@ -1103,7 +1149,7 @@ impl NemotronH {
         let pre_bytes = if stage_bytes > 0 { stage_bytes / SMALL } else { 0 };
         let pre: Vec<DevBuf> = if pre_bytes > 0 && std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0") { (0..2).map(|_| DevBuf::new(&gpu, pre_bytes)).collect::<Result<_>>()? } else { Vec::new() };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, vslots: Vec::new(), hot_at: Default::default(), vram_ins: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default() })) };
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, vslots: Vec::new(), hot_at: Default::default(), vram_ins: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default(), stale: Vec::new() })) };
         // the CPU's share: when ggml-cpu is there and takes every cached layer's expert types
         let cpu = cpu::Ggml::get().filter(|gg| layers.iter().all(|ly| match &ly.mix {
             Mix::Moe(m) if matches!(m.up.home, Home::Cached) => gg.supports(m.up.ty.code() as i32) && gg.supports(m.down.ty.code() as i32),
@@ -1410,16 +1456,38 @@ impl NemotronH {
         // decode's missed experts, read while the first batch runs, and their reads
         let mut late: std::collections::HashSet<usize> = Default::default();
         let mut late_io: Option<(Arc<Pending>, Instant)> = None;
+        let mut late_wait: Vec<(usize, Arc<Pending>)> = Vec::new();
         if matches!(m.up.home, Home::Cached) {
-            // reads started for this layer from a guess at its routing
-            let pend = self.inflight.lock().unwrap().remove(&m.layer).unwrap_or_default();
+            // reads started for this layer from a guess at its routing, and those of earlier tokens' guesses not done yet:
+            // decode waits only for the experts it chose (those still reading join the second batch when it overlaps), the
+            // others left to finish meanwhile, their slots kept from eviction until then; a prompt pass waits for all
+            let mut pend = self.inflight.lock().unwrap().remove(&m.layer).unwrap_or_default();
+            let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+            for (l, x, p) in std::mem::take(&mut c.stale) {
+                if l == m.layer {
+                    pend.push((x, p));
+                } else if p.ready() {
+                    let failed = p.wait().is_err();
+                    c.settle(l, x, failed);
+                } else {
+                    c.stale.push((l, x, p));
+                }
+            }
+            let chosen: std::collections::HashSet<usize> = ent.iter().map(|x| x.1).collect();
             let tw = Instant::now();
-            for p in pend {
-                p.wait().map_err(e)?;
+            for (x, p) in pend {
+                if t == 1 && !chosen.contains(&x) {
+                    c.stale.push((m.layer, x, p));
+                } else if t == 1 && self.overlap && !cpu_on && !p.ready() {
+                    late.insert(x);
+                    late_wait.push((x, p));
+                } else {
+                    let r = p.wait();
+                    c.settle(m.layer, x, r.is_err());
+                    r.map_err(e)?;
+                }
             }
             self.times.lock().unwrap().pred_wait += tw.elapsed().as_secs_f64();
-            let mut c = self.cache.as_ref().unwrap().lock().unwrap();
-            c.reading.retain(|k| k.0 != m.layer);
             c.clock += 1;
             let clock = c.clock;
             c.scratch_map.clear();
@@ -1458,7 +1526,7 @@ impl NemotronH {
                         continue;
                     }
                     let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
-                    let sl = (0..c.pools[p].used.len()).min_by_key(|i| c.pools[p].used[*i]).unwrap();
+                    let sl = c.victim(p).ok_or_else(|| e("every slot of a pool is being read into"))?;
                     if let Some(old) = c.pools[p].owner[sl].take() {
                         c.map.remove(&old);
                     }
@@ -1534,17 +1602,24 @@ impl NemotronH {
         let n_a = ent.iter().filter(|x| !late.contains(&x.1)).count();
         let u = self.arena.f32(n_e * g.n_ff_exp)?;
         let dn = self.arena.f32(n_e * g.latent)?;
-        for (b0, b1) in [(0, n_a), (n_a, n_e)] {
+        for (bi, (b0, b1)) in [(0, n_a), (n_a, n_e)].into_iter().enumerate() {
             if b0 == b1 {
                 continue;
             }
-            if b0 > 0 {
+            if bi == 1 {
                 // the second batch: its reads waited for, then staged as the first was
                 if let Some((p, tio)) = late_io.take() {
                     p.wait().map_err(e)?;
                     self.times.lock().unwrap().io_s += tio.elapsed().as_secs_f64();
                 }
+                let tw = Instant::now();
                 let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+                for (x, p) in std::mem::take(&mut late_wait) {
+                    let r = p.wait();
+                    c.settle(m.layer, x, r.is_err());
+                    r.map_err(e)?;
+                }
+                self.times.lock().unwrap().pred_wait += tw.elapsed().as_secs_f64();
                 let xs: Vec<usize> = ent[b0..b1].iter().map(|x| x.1).collect();
                 self.stage(&mut c, m, &xs)?;
             }
