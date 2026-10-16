@@ -167,6 +167,12 @@ int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes) {
     return 0;
 }
 
+int ns_copy_2d(ns_gpu* g, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
+    NS_CU(use(g));
+    NS_CU(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, g->q));
+    return 0;
+}
+
 // Copies beside the GPU's work. The order between the streams is kept on the device (events, cudaStreamWaitEvent):
 // the host never waits on an event.
 static int64_t keep(ns_gpu* g, cudaStream_t s) {

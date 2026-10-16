@@ -205,6 +205,39 @@ __global__ void rms_rope_k(void* x, int dt, int64_t H, int64_t D, int64_t stride
     }
 }
 
+__global__ void layer_norm_k(const void* x, int xdt, int64_t C, const float* w, const float* b, float eps, void* out, int odt) {
+    const int64_t r = blockIdx.x;
+    float s = 0.0f;
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) s += get(x, xdt, r * C + i);
+    const float mean = block_sum(s) / (float) C;
+    float s2 = 0.0f;
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x) { const float d = get(x, xdt, r * C + i) - mean; s2 += d * d; }
+    const float inv = rsqrtf(block_sum(s2) / (float) C + eps);
+    for (int64_t i = threadIdx.x; i < C; i += blockDim.x)
+        put(out, odt, r * C + i, (get(x, xdt, r * C + i) - mean) * inv * (w ? w[i] : 1.0f) + (b ? b[i] : 0.0f));
+}
+
+__global__ void gelu_k(void* x, int dt, int64_t n, int mode) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = get(x, dt, i);
+    const float y = mode == 0 ? 0.5f * v * (1.0f + erff(v * 0.70710678118f))
+                              : 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+    put(x, dt, i, y);
+}
+
+__global__ void rope_k(void* x, int dt, int64_t D, int64_t stride, const float* cs, int rot, int64_t H) {
+    const int64_t m = blockIdx.x, h = blockIdx.y;
+    const int half = rot / 2;
+    const int64_t base = m * stride + h * D;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float c = cs[(m * half + i) * 2], sn = cs[(m * half + i) * 2 + 1];
+        const float a = get(x, dt, base + i), b = get(x, dt, base + half + i);
+        put(x, dt, base + i, a * c - b * sn);
+        put(x, dt, base + half + i, b * c + a * sn);
+    }
+}
+
 __global__ void swiglu_k(const void* x, int xdt, int64_t C, void* out, int odt, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -376,11 +409,11 @@ int nsd_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
     return 0;
 }
 
-int nsd_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out) {
+int nsd_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out, int64_t ldo) {
     auto* c = (Ctx*) ctx;
     CU(cudaSetDevice(c->dev));
-    if (int rc = gemm_nt(c, x, dt, M, K, w, dt, N, out, dt, 1.0f)) return rc;
-    if (bias) { bias_k<<<nb(M * N), 256, 0, c->s>>>(out, dt, M, N, bias); LAUNCHED("bias"); }
+    if (int rc = gemm_nt(c, x, dt, M, K, w, dt, N, out, dt, 1.0f, ldo)) return rc;
+    if (bias) { bias_cols_k<<<nb(M * N), 256, 0, c->s>>>(out, dt, M, ldo ? ldo : N, 0, N, bias); LAUNCHED("bias"); }
     return 0;
 }
 
@@ -450,6 +483,32 @@ int nsd_rms_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, 
     dim3 grid((unsigned) M, (unsigned) H);
     rms_rope_k<<<grid, 128, (size_t) D * 4, c->s>>>(x, x_dt, H, D, stride, weight, eps, cs, rot_dim);
     LAUNCHED("rms_rope");
+    return 0;
+}
+
+int nsd_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps, void* out, int out_dt) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    layer_norm_k<<<(unsigned) M, WG, 0, c->s>>>(x, x_dt, C, weight, bias, eps, out, out_dt);
+    LAUNCHED("layer_norm");
+    return 0;
+}
+
+int nsd_gelu(void* ctx, void* x, int x_dt, int64_t n, int mode) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    gelu_k<<<nb(n), 256, 0, c->s>>>(x, x_dt, n, mode);
+    LAUNCHED("gelu");
+    return 0;
+}
+
+int nsd_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* cs, int rot_dim) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    if (rot_dim > D || rot_dim % 2) return fail("nsd_rope: rot_dim must be even and at most D");
+    dim3 grid((unsigned) M, (unsigned) H);
+    rope_k<<<grid, 128, 0, c->s>>>(x, x_dt, D, stride, cs, rot_dim, H);
+    LAUNCHED("rope");
     return 0;
 }
 

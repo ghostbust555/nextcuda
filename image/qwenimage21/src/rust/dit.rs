@@ -20,7 +20,10 @@
 use std::sync::Arc;
 
 use nextcuda_core::{DevBuf, Error, Gpu, Result};
+use std::sync::Mutex;
+
 use nextcuda_diffusion::kernels::{none, Dt, Nsd};
+use nextcuda_diffusion::lora::{self, Delta};
 use nextcuda_gguf::{GType, Gguf};
 
 use super::prof;
@@ -43,11 +46,31 @@ struct Part {
     rows: usize,
 }
 
+/// A module a LoRA may name inside a matrix: its key, its rows and where they start in the matrix's output (a fused
+/// gate | up is two), and whether its rows are permuted like q's and k's
+struct Slot {
+    key: String,
+    rows: usize,
+    off: usize,
+    perm: bool,
+}
+
+/// One LoRA's update of a slot, half on the card: A [r, k] and B [rows, r] (B carries the scale)
+struct LoraPair {
+    a: DevBuf,
+    b: DevBuf,
+    r: usize,
+}
+
 /// A block's matrix [n, k] as the parts the file stores (a fused gate|up is one part; q, k and v are three, and may
-/// be of different types in a mixed-quant file)
+/// be of different types in a mixed-quant file). LoRAs ride beside it as low-rank products added to the output: the
+/// weights are quantized, so there is nothing to merge into.
 struct Mat {
     parts: Vec<Part>,
     n: usize,
+    k: usize,
+    slots: Vec<Slot>,
+    active: Mutex<Vec<(usize, LoraPair)>>,
 }
 
 impl Mat {
@@ -60,8 +83,45 @@ impl Mat {
             nsd.linear_q(x, Dt::F16, m, k, p.w.ptr(), p.qtype, p.rows, none(), o, out_dt, self.n)?;
             off += p.rows;
         }
+        let act = self.active.lock().unwrap();
+        if !act.is_empty() && out_dt == Dt::F16 {
+            for (si, l) in act.iter() {
+                let s = &self.slots[*si];
+                let tmp = DevBuf::new(&nsd.gpu, m * l.r * 2)?;
+                nsd.linear(x, Dt::F16, m, k, l.a.ptr(), l.r, none(), tmp.ptr(), Dt::F16)?;
+                let o = out.cast::<u8>().wrapping_add(s.off * esz).cast();
+                nsd.linear_acc(tmp.ptr(), Dt::F16, m, l.r, l.b.ptr(), s.rows, o, self.n)?;
+                // `tmp` goes at the end of the call: its free waits for the work above
+            }
+        }
         Ok(())
     }
+}
+
+fn f16_bits(f: f32) -> u16 {
+    let b = f.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let man = b & 0x7f_ffff;
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - exp);
+        return sign | ((m + 0xfff + ((m >> 13) & 1)) >> 13) as u16;
+    }
+    let r = ((exp as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    sign | (r + (rem > 0x1000 || (rem == 0x1000 && (r & 1) == 1)) as u32) as u16
+}
+
+fn half_buf(gpu: &Arc<Gpu>, v: &[f32]) -> Result<DevBuf> {
+    let b = DevBuf::new(gpu, v.len().max(1) * 2)?;
+    b.write(0, &v.iter().flat_map(|x| f16_bits(*x).to_le_bytes()).collect::<Vec<u8>>())?;
+    Ok(b)
 }
 
 /// One block's weights
@@ -88,13 +148,22 @@ pub struct Dit {
     modulation: DevBuf,
     norm_out: DevBuf,
     proj_out: DevBuf,
+    /// the small linears a LoRA was merged into (their float32 weights are changed in place): the originals, by field
+    saved: Mutex<Vec<(&'static str, DevBuf)>>,
+}
+
+enum Kv {
+    Dev(DevBuf),
+    Host(Vec<u8>),
 }
 
 /// The text's state every step reads: each layer's q | k | v rows of the text (k with its RoPE), half
 pub struct Prefix {
     /// rows: the text's, and the condition pictures' latents
     pub tokens: usize,
-    kv: Vec<DevBuf>,
+    /// each layer's k | v rows of the prefix, [tokens, 2 * 4096] half: on the card, or in host memory when the edit's
+    /// pictures would not fit beside the weights
+    kv: Vec<Kv>,
     /// the frame position the target picture takes (after the text and the pictures)
     pub frame: i64,
 }
@@ -141,10 +210,25 @@ impl Dit {
             w.write(0, &bytes)?;
             Ok(Part { w, qtype: code, rows })
         };
-        let mat = |names: &[&str], perm: &[bool]| -> Result<Mat> {
+        // `slots`: the modules a LoRA may name in it, as (module path, rows); the stored parts' names when None
+        let mat = |names: &[&str], perm: &[bool], slots: Option<&[(String, usize)]>, k: usize| -> Result<Mat> {
             let parts = names.iter().zip(perm).map(|(n, p)| part(n, *p)).collect::<Result<Vec<_>>>()?;
             let n = parts.iter().map(|p| p.rows).sum();
-            Ok(Mat { parts, n })
+            let list: Vec<Slot> = match slots {
+                Some(sl) => {
+                    let mut off = 0;
+                    sl.iter().map(|(nm, rows)| { let s = Slot { key: lora::key(nm), rows: *rows, off, perm: false }; off += rows; s }).collect()
+                }
+                None => {
+                    let mut off = 0;
+                    names.iter().zip(&parts).zip(perm).map(|((nm, p), pm)| {
+                        let s = Slot { key: lora::key(nm.strip_suffix(".weight").unwrap_or(nm)), rows: p.rows, off, perm: *pm };
+                        off += p.rows;
+                        s
+                    }).collect()
+                }
+            };
+            Ok(Mat { parts, n, k, slots: list, active: Mutex::new(Vec::new()) })
         };
         // a vector (norm weights, a small linear) as float32 on the host, whatever its stored type
         let host_vec = |name: &str| -> Result<Vec<f32>> {
@@ -169,15 +253,16 @@ impl Dit {
         for i in 0..n_blocks {
             let p = format!("transformer_blocks.{i}.");
             blocks.push(Block {
-                qkv: mat(&[&format!("{p}attn.to_q.weight"), &format!("{p}attn.to_k.weight"), &format!("{p}attn.to_v.weight")], &[true, true, false])?,
-                out: mat(&[&format!("{p}attn.to_out.0.weight")], &[false])?,
+                qkv: mat(&[&format!("{p}attn.to_q.weight"), &format!("{p}attn.to_k.weight"), &format!("{p}attn.to_v.weight")], &[true, true, false], None, DIM)?,
+                out: mat(&[&format!("{p}attn.to_out.0.weight")], &[false], None, DIM)?,
                 // the MLP's gate and up rows: two matrices, or one fused (`gate_up`)
                 gp: if f.tensor(&format!("{p}img_mlp.gate_up.weight")).is_some() {
-                    mat(&[&format!("{p}img_mlp.gate_up.weight")], &[false])?
+                    let sl = [(format!("{p}img_mlp.gate_layer"), FFN), (format!("{p}img_mlp.proj"), FFN)];
+                    mat(&[&format!("{p}img_mlp.gate_up.weight")], &[false], Some(&sl), DIM)?
                 } else {
-                    mat(&[&format!("{p}img_mlp.gate_layer.weight"), &format!("{p}img_mlp.proj.weight")], &[false, false])?
+                    mat(&[&format!("{p}img_mlp.gate_layer.weight"), &format!("{p}img_mlp.proj.weight")], &[false, false], None, DIM)?
                 },
-                down: mat(&[&format!("{p}img_mlp.out.weight")], &[false])?,
+                down: mat(&[&format!("{p}img_mlp.out.weight")], &[false], None, FFN)?,
                 norm_q: vector(&format!("{p}attn.norm_q.weight"), true)?,
                 norm_k: vector(&format!("{p}attn.norm_k.weight"), true)?,
             });
@@ -199,9 +284,115 @@ impl Dit {
             modulation: single("modulation.1.weight")?,
             norm_out: single("norm_out.linear.weight")?,
             proj_out: single("proj_out.weight")?,
+            saved: Mutex::new(Vec::new()),
         };
         log(format!("qwen-image 2.1: {n_blocks} blocks on {} (as stored) in {:.1} s", gpu.name, t0.elapsed().as_secs_f64()));
         Ok(dit)
+    }
+
+    /// The small float32 linear a LoRA module names: (its key, field, rows, inputs)
+    fn small_names() -> [(&'static str, &'static str, usize, usize); 8] {
+        [
+            ("img_in", "img_in", DIM, LATENT),
+            ("txt_in.in_layer", "txt_in1", DIM, 0),
+            ("txt_in.out_layer", "txt_in2", DIM, DIM),
+            ("time_text_embed.timestep_embedder.linear_1", "t_lin1", DIM, 256),
+            ("time_text_embed.timestep_embedder.linear_2", "t_lin2", DIM, DIM),
+            ("modulation.1", "modulation", 4 * DIM, DIM),
+            ("norm_out.linear", "norm_out", DIM, DIM),
+            ("proj_out", "proj_out", LATENT, DIM),
+        ]
+    }
+
+    fn small_buf(&self, field: &str) -> &DevBuf {
+        match field {
+            "img_in" => &self.img_in,
+            "txt_in1" => &self.txt_in1,
+            "txt_in2" => &self.txt_in2,
+            "t_lin1" => &self.t_lin1,
+            "t_lin2" => &self.t_lin2,
+            "modulation" => &self.modulation,
+            "norm_out" => &self.norm_out,
+            _ => &self.proj_out,
+        }
+    }
+
+    /// Put an end to the LoRAs in use: the block side paths dropped, the small linears' weights put back
+    pub fn clear_loras(&self, nsd: &Nsd) -> Result<()> {
+        for b in &self.blocks {
+            for m in [&b.qkv, &b.out, &b.gp, &b.down] {
+                m.active.lock().unwrap().clear();
+            }
+        }
+        let mut saved = self.saved.lock().unwrap();
+        for (field, orig) in saved.drain(..) {
+            let w = self.small_buf(field);
+            w.copy_within(0, &orig, 0, orig.len)?;
+        }
+        nsd.wait()
+    }
+
+    /// Use `deltas` (a LoRA's updates, B scaled): beside the block matrices as low-rank side paths, merged into the
+    /// small float32 linears (their originals kept for `clear_loras`). A module this engine has no matrix for is an
+    /// error, as in nextsycl's.
+    pub fn set_loras(&self, nsd: &Nsd, deltas: &[Delta]) -> Result<()> {
+        self.clear_loras(nsd)?;
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let gpu = &self.gpu;
+        let mut by_key: std::collections::BTreeMap<String, Vec<&Delta>> = Default::default();
+        for d in deltas {
+            by_key.entry(lora::key(&d.target)).or_default().push(d);
+        }
+        let mut used = std::collections::BTreeSet::new();
+        for b in &self.blocks {
+            for m in [&b.qkv, &b.out, &b.gp, &b.down] {
+                for (si, s) in m.slots.iter().enumerate() {
+                    for d in by_key.get(&s.key).into_iter().flatten() {
+                        if d.n != s.rows || d.k != m.k {
+                            return Err(Error(format!("LoRA {}: {}x{}, the matrix is {}x{}", d.target, d.n, d.k, s.rows, m.k)));
+                        }
+                        // B's rows reordered as the matrix's are
+                        let bv: Vec<f32> = if s.perm {
+                            (0..d.n).flat_map(|row| {
+                                let src = (row / HEAD) * HEAD + rope_perm(row % HEAD);
+                                d.b[src * d.r..(src + 1) * d.r].iter().copied()
+                            }).collect()
+                        } else {
+                            d.b.clone()
+                        };
+                        m.active.lock().unwrap().push((si, LoraPair { a: half_buf(gpu, &d.a)?, b: half_buf(gpu, &bv)?, r: d.r }));
+                        used.insert(s.key.clone());
+                    }
+                }
+            }
+        }
+        for (key, field, n, k) in Self::small_names() {
+            let k_key = lora::key(key);
+            let Some(list) = by_key.get(&k_key) else { continue };
+            let w = self.small_buf(field);
+            let orig = DevBuf::new(gpu, w.len)?;
+            orig.copy_within(0, w, 0, w.len)?;
+            self.saved.lock().unwrap().push((field, orig));
+            for d in list {
+                let k_in = if k == 0 { d.k } else { k };
+                if d.n != n || d.k != k_in {
+                    return Err(Error(format!("LoRA {}: {}x{}, the matrix is {n}x{k_in}", d.target, d.n, d.k)));
+                }
+                let at: Vec<f32> = (0..d.k).flat_map(|c| (0..d.r).map(move |j| (c, j))).map(|(c, j)| d.a[j * d.k + c]).collect();
+                let (bd, ad) = (DevBuf::from_f32(gpu, &d.b)?, DevBuf::from_f32(gpu, &at)?);
+                nsd.linear_acc(bd.ptr(), Dt::F32, d.n, d.r, ad.ptr(), d.k, w.ptr(), 0)?;
+                nsd.wait()?;
+                used.insert(k_key.clone());
+            }
+        }
+        let missed: std::collections::BTreeSet<&str> = deltas.iter().filter(|d| !used.contains(&lora::key(&d.target))).map(|d| d.target.as_str()).collect();
+        if !missed.is_empty() {
+            let few: Vec<&str> = missed.iter().take(4).copied().collect();
+            return Err(Error(format!("LoRA modules this engine does not take ({} of them): {}", missed.len(), few.join(", "))));
+        }
+        Ok(())
     }
 
     /// Attention of `sq` query rows (q at `q`, `qs`-element rows) over `skv` keys of every head (32 x 128): the silo's
@@ -386,6 +577,11 @@ impl Dit {
         let cs = self.rope_table(&idx)?;
         let (h, qkv, att, o) = (DevBuf::new(gpu, p * DIM * 2)?, DevBuf::new(gpu, p * 3 * DIM * 2)?, DevBuf::new(gpu, p * DIM * 2)?, DevBuf::new(gpu, p * DIM * 2)?);
         let (gp, act) = (DevBuf::new(gpu, p * 2 * FFN * 2)?, DevBuf::new(gpu, p * FFN * 2)?);
+        // the prefix kept on the card when its k | v of every layer leaves room for the activations beside the weights
+        // (a few GiB: a step's buffers, the attention's score blocks, the VAE); else in host memory, a layer a step
+        let kv_bytes = self.blocks.len() * p * 2 * DIM * 2;
+        let (_, free) = gpu.memory()?;
+        let spill = free.is_some_and(|f| (kv_bytes as u64) + (3u64 << 30) + (p as u64) * 400 * 1024 > f);
         let mut kv = Vec::with_capacity(self.blocks.len());
         let off = |buf: &DevBuf| -> *const f32 { buf.fp().wrapping_add(DIM) }; // the t = 0 row
         let half_at = |buf: &DevBuf, n: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(n).cast() };
@@ -409,9 +605,16 @@ impl Dit {
                 }
             }
             // the layer's prefix q|k|v, kept for every step
-            let keep = DevBuf::new(gpu, p * 3 * DIM * 2)?;
-            keep.copy_within(0, &qkv, 0, p * 3 * DIM * 2)?;
-            kv.push(keep);
+            // k | v of the prefix's rows (the queries are not read again)
+            let keep = DevBuf::new(gpu, p * 2 * DIM * 2)?;
+            keep.copy_2d(0, 2 * DIM * 2, &qkv, DIM * 2, 3 * DIM * 2, 2 * DIM * 2, p)?;
+            if spill {
+                let mut host = vec![0u8; keep.len];
+                keep.read(0, &mut host)?;
+                kv.push(Kv::Host(host));
+            } else {
+                kv.push(Kv::Dev(keep));
+            }
             b.out.apply(nsd, att.ptr(), p, DIM, o.ptr(), Dt::F16)?;
             nsd.gate_add(x.ptr(), Dt::F32, p, DIM, o.ptr(), Dt::F16, zeros.ptr(), off(&md[1]).cast())?;
             self.block_ffn(nsd, b, &x, p, &md, 1, &zeros, &h, &gp, &act, &o)?;
@@ -445,9 +648,18 @@ impl Dit {
         let (gp, act) = (DevBuf::new(gpu, n * 2 * FFN * 2)?, DevBuf::new(gpu, n * FFN * 2)?);
         let half_at = |buf: &DevBuf, at: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(at).cast() };
         let img = tt * 3 * DIM; // the image's first row in `all`, in halves
+        let stage = if pre.kv.iter().any(|k| matches!(k, Kv::Host(_))) { Some(DevBuf::new(gpu, tt * 2 * DIM * 2)?) } else { None };
         prof::mark(nsd, "step setup")?;
         for (bi, b) in self.blocks.iter().enumerate() {
-            all.copy_within(0, &pre.kv[bi], 0, tt * 3 * DIM * 2)?;
+            // the prefix's k | v into the first rows of this layer's buffer
+            match &pre.kv[bi] {
+                Kv::Dev(b) => all.copy_2d(DIM * 2, 3 * DIM * 2, b, 0, 2 * DIM * 2, 2 * DIM * 2, tt)?,
+                Kv::Host(v) => {
+                    let st = stage.as_ref().expect("a staging buffer for host prefixes");
+                    st.write(0, v)?;
+                    all.copy_2d(DIM * 2, 3 * DIM * 2, st, 0, 2 * DIM * 2, 2 * DIM * 2, tt)?;
+                }
+            }
             prof::mark(nsd, "prefix copy")?;
             // SAFETY: x holds n x 4096 floats, h as many halves; the scale row 4096 floats.
             ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), n as i64, DIM as i64, EPS, md[0].fp(), h.ptr()) }, "norm + modulate")?;

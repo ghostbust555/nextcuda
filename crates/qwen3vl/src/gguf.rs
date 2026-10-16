@@ -15,13 +15,16 @@
 //!
 //! The result is the last layer's hidden state for every token, before the final norm (as the image pipelines take it).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nextcuda_core::{DevBuf, Error, Gpu, Result};
 use nextcuda_diffusion::kernels::{none, Dt, Nsd};
 use nextcuda_gguf::{GType, Gguf};
 use nextcuda_tok::Tokenizer;
+
+use crate::vision::{self, Seen};
 
 const HEAD: usize = 128;
 
@@ -40,6 +43,9 @@ pub struct GgufTextEncoder {
     layers: usize,
     theta: f64,
     eps: f32,
+    /// the layers' bytes once read, in host memory (`NC_TE_HOST_CACHE=0`: read from the file each time): the encoder
+    /// is streamed to the card for every prompt, and a read of 5 GB costs more than the copy
+    cache: Option<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
 }
 
 /// A tensor of a layer on the card, as stored
@@ -82,6 +88,7 @@ impl GgufTextEncoder {
             layers,
             theta,
             eps,
+            cache: (std::env::var("NC_TE_HOST_CACHE").map_or(true, |v| v != "0")).then(|| Mutex::new(HashMap::new())),
         })
     }
 
@@ -94,6 +101,20 @@ impl GgufTextEncoder {
         self.file.tensor(name).ok_or_else(|| Error(format!("{}: no tensor {name}", self.file.paths[0].display())))
     }
 
+    /// A tensor's bytes, from the host cache after the first read
+    fn bytes(&self, name: &str, t: &nextcuda_gguf::Tensor) -> Result<Arc<Vec<u8>>> {
+        if let Some(c) = &self.cache {
+            if let Some(b) = c.lock().unwrap().get(name) {
+                return Ok(b.clone());
+            }
+        }
+        let b = Arc::new(self.file.read(t).map_err(ge)?);
+        if let Some(c) = &self.cache {
+            c.lock().unwrap().insert(name.to_string(), b.clone());
+        }
+        Ok(b)
+    }
+
     /// A matrix of the file on the card, as stored
     fn matrix(&self, name: &str) -> Result<W> {
         let t = self.tensor(name)?;
@@ -101,7 +122,7 @@ impl GgufTextEncoder {
         if ![0, 1, 8, 12, 13, 14, 30].contains(&code) {
             return Err(Error(format!("{name}: {} weights are not read yet", t.ty.name())));
         }
-        let raw = self.file.read(t).map_err(ge)?;
+        let raw = self.bytes(name, t)?;
         let buf = DevBuf::new(&self.gpu, raw.len())?;
         buf.write(0, &raw)?;
         Ok(W { buf, qtype: code, rows: t.shape[0] as usize })
@@ -149,22 +170,87 @@ impl GgufTextEncoder {
 
     /// The hidden state after the first `n` layers
     pub fn encode_layers(&self, nsd: &Nsd, ids: &[u32], n: usize) -> Result<DevBuf> {
+        self.encode_seen(nsd, ids, &[], n)
+    }
+
+    /// Each token's (time, height, width) position (transformers' get_rope_index): text tokens advance one on all
+    /// three axes; a picture's run of `<|image_pad|>` tokens (its merged grid, row by row) sits at the run's start
+    /// plus its row and column, and the next text starts past the larger side
+    pub fn positions(ids: &[u32], pad: u32, grids: &[(usize, usize)]) -> Result<Vec<[i64; 3]>> {
+        let mut out = Vec::with_capacity(ids.len());
+        let (mut p, mut i, mut g) = (0i64, 0usize, 0usize);
+        while i < ids.len() {
+            if ids[i] != pad {
+                out.push([p, p, p]);
+                p += 1;
+                i += 1;
+                continue;
+            }
+            let (gh, gw) = *grids.get(g).ok_or_else(|| Error("more pictures in the prompt than were given".into()))?;
+            let (lh, lw) = (gh / vision::MERGE, gw / vision::MERGE);
+            for r in 0..lh {
+                for c in 0..lw {
+                    if ids.get(i) != Some(&pad) {
+                        return Err(Error(format!("picture {g}: its run of image tokens is shorter than its {lh} x {lw} grid")));
+                    }
+                    out.push([p, p + r as i64, p + c as i64]);
+                    i += 1;
+                }
+            }
+            p += lh.max(lw) as i64;
+            g += 1;
+        }
+        Ok(out)
+    }
+
+    /// The hidden state after `n` layers for `ids` with pictures in it: `seen` (the vision tower's, in the order of
+    /// their `<|image_pad|>` runs) at their tokens, Qwen3-VL's interleaved M-RoPE (24 / 20 / 20 pairs: t, then h and
+    /// w on every third pair from the second), the deepstack features added after the first layers
+    pub fn encode_seen(&self, nsd: &Nsd, ids: &[u32], seen: &[&Seen], n: usize) -> Result<DevBuf> {
         let s = ids.len();
         let (d, h, kv, f) = (self.hidden, self.heads, self.kv_heads, self.ffn);
         let qkv_w = (h + 2 * kv) * HEAD;
         let gpu = &self.gpu;
         let x = self.embed(nsd, ids)?;
+        let pad = self.tok.id("<|image_pad|>").unwrap_or(u32::MAX);
+        // each picture's rows: the start of its run of image tokens
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < s {
+            if ids[i] == pad {
+                let st = i;
+                while i < s && ids[i] == pad {
+                    i += 1;
+                }
+                runs.push((st, i - st));
+            } else {
+                i += 1;
+            }
+        }
+        if runs.len() != seen.len() || runs.iter().zip(seen).any(|((_, len), v)| *len != v.n) {
+            return Err(Error(format!("the prompt holds {} picture runs {:?}; {} pictures were seen", runs.len(), runs.iter().map(|r| r.1).collect::<Vec<_>>(),
+                                     seen.len())));
+        }
+        for ((st, len), v) in runs.iter().zip(seen) {
+            x.copy_within(st * d * 4, &v.tokens, 0, len * d * 4)?;
+        }
+        let pos: Vec<[i64; 3]> = if seen.is_empty() {
+            (0..s as i64).map(|p| [p, p, p]).collect()
+        } else {
+            Self::positions(ids, pad, &seen.iter().map(|v| v.grid).collect::<Vec<_>>())?
+        };
         let hb = DevBuf::new(gpu, s * d * 2)?;
         let qkv = DevBuf::new(gpu, s * qkv_w * 2)?;
         let att = DevBuf::new(gpu, s * h * HEAD * 2)?;
         let o = DevBuf::f32(gpu, s * d)?;
         let gu = DevBuf::new(gpu, s * 2 * f * 2)?;
         let act = DevBuf::new(gpu, s * f * 2)?;
-        // (cos, sin) per token and pair (i, 64 + i): plain RoPE (text only: the three M-RoPE axes agree)
+        // (cos, sin) per token and pair (i, 64 + i); pair i's axis: interleaved M-RoPE (the three agree on text)
         let mut cs = vec![0f32; s * HEAD];
-        for t in 0..s {
+        for (t, p) in pos.iter().enumerate() {
             for i in 0..HEAD / 2 {
-                let a = t as f64 / self.theta.powf(2.0 * i as f64 / HEAD as f64);
+                let axis = if i < 60 && i % 3 == 1 { 1 } else if i < 60 && i % 3 == 2 { 2 } else { 0 };
+                let a = p[axis] as f64 / self.theta.powf(2.0 * i as f64 / HEAD as f64);
                 cs[t * HEAD + 2 * i] = a.cos() as f32;
                 cs[t * HEAD + 2 * i + 1] = a.sin() as f32;
             }
@@ -208,6 +294,12 @@ impl GgufTextEncoder {
                 nsd.wait()?;
             }
             nsd.gate_add(x.ptr(), Dt::F32, s, d, o.ptr(), Dt::F32, none(), none())?;
+            // deepstack: the pictures' features of this depth added at their tokens
+            for ((st, len), v) in runs.iter().zip(seen) {
+                if let Some(ds) = v.deep.get(l) {
+                    nsd.gate_add(x.fp().wrapping_add(st * d).cast(), Dt::F32, *len, d, ds.ptr(), Dt::F32, none(), none())?;
+                }
+            }
         }
         nsd.wait()?;
         Ok(x)

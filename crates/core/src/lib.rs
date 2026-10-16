@@ -368,6 +368,26 @@ impl DevBuf {
         unsafe { std::ptr::copy(src.ptr.cast::<u8>().add(src_at), self.ptr.cast::<u8>().add(at), n) };
         Ok(())
     }
+    /// `height` rows of `width` bytes from `src` (at `src_at`, rows `src_pitch` apart) into this buffer (at `at`, rows
+    /// `dst_pitch` apart): a block of columns into a wider matrix, queued like any copy
+    pub fn copy_2d(&self, at: usize, dst_pitch: usize, src: &DevBuf, src_at: usize, src_pitch: usize, width: usize, height: usize) -> Result<()> {
+        if height == 0 || width == 0 {
+            return Ok(());
+        }
+        self.bounds(at, (height - 1) * dst_pitch + width)?;
+        src.bounds(src_at, (height - 1) * src_pitch + width)?;
+        if let Some((a, r)) = self.gpu.dev {
+            // SAFETY: both ranges in bounds (checked), same GPU.
+            return check(a, unsafe { (a.copy_2d)(r, self.ptr.cast::<u8>().add(at).cast(), dst_pitch, src.ptr.cast::<u8>().add(src_at).cast(), src_pitch, width, height) },
+                         "copying rows on the GPU");
+        }
+        for row in 0..height {
+            // SAFETY: both rows in bounds (checked); `copy` allows overlap.
+            unsafe { std::ptr::copy(src.ptr.cast::<u8>().add(src_at + row * src_pitch), self.ptr.cast::<u8>().add(at + row * dst_pitch), width) };
+        }
+        Ok(())
+    }
+
     /// Bytes `[at, at + len)` as a buffer of its own that does not free them.
     pub fn view(&self, at: usize, len: usize) -> Result<DevBuf> {
         self.bounds(at, len)?;

@@ -41,6 +41,8 @@ int ns_free_host(ns_gpu* g, void* p);
 int ns_copy_to(ns_gpu* g, void* dst, const void* src_host, size_t bytes);
 int ns_copy_from(ns_gpu* g, void* dst_host, const void* src, size_t bytes);
 int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes);
+/* `height` rows of `width` bytes, device to device, the rows `dpitch` / `spitch` bytes apart (queued like ns_copy_dev) */
+int ns_copy_2d(ns_gpu* g, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height);
 int ns_mark(ns_gpu* g, int64_t* ticket);
 int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_await(ns_gpu* g, int64_t ticket);

@@ -31,11 +31,14 @@ struct Api {
     destroy: unsafe extern "C" fn(M),
     wait: unsafe extern "C" fn(M) -> c_int,
     linear: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, c_int) -> c_int,
-    linear_acc: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M) -> c_int,
+    linear_acc: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, i64) -> c_int,
     linear_q: unsafe extern "C" fn(M, P, c_int, i64, i64, P, c_int, i64, *const f32, M, c_int, i64) -> c_int,
     dequant: unsafe extern "C" fn(M, P, c_int, i64, M, c_int) -> c_int,
     rms_norm_mod: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, f32, *const i32, *const f32, *const f32, M, c_int) -> c_int,
     rms_rope: unsafe extern "C" fn(M, M, c_int, i64, i64, i64, i64, *const f32, f32, *const f32, c_int) -> c_int,
+    layer_norm: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, *const f32, f32, M, c_int) -> c_int,
+    gelu: unsafe extern "C" fn(M, M, c_int, i64, c_int) -> c_int,
+    rope: unsafe extern "C" fn(M, M, c_int, i64, i64, i64, i64, *const f32, c_int) -> c_int,
     swiglu: unsafe extern "C" fn(M, P, c_int, i64, i64, M, c_int) -> c_int,
     gate_add: unsafe extern "C" fn(M, M, c_int, i64, i64, P, c_int, *const i32, *const f32) -> c_int,
     attention_causal: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, i64, M) -> c_int,
@@ -77,6 +80,9 @@ fn api() -> Result<&'static Api> {
             dequant: sym!("nsd_dequant"),
             rms_norm_mod: sym!("nsd_rms_norm_mod"),
             rms_rope: sym!("nsd_rms_rope"),
+            layer_norm: sym!("nsd_layer_norm"),
+            gelu: sym!("nsd_gelu"),
+            rope: sym!("nsd_rope"),
             swiglu: sym!("nsd_swiglu"),
             gate_add: sym!("nsd_gate_add"),
             attention_causal: sym!("nsd_attention_causal"),
@@ -150,11 +156,11 @@ impl Nsd {
         self.ok(unsafe { (self.k.linear)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, bias.cast(), out, out_dt as c_int) }, "linear")
     }
 
-    /// out [M, N] += x [M, K] . W^T, all in `dt`
+    /// out [M, N] += x [M, K] . W^T, all in `dt`; `ldo`: the row stride of out (0: n)
     #[allow(clippy::too_many_arguments)]
-    pub fn linear_acc(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, out: M) -> Result<()> {
+    pub fn linear_acc(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, out: M, ldo: usize) -> Result<()> {
         // SAFETY: the caller's buffers hold the sizes named.
-        self.ok(unsafe { (self.k.linear_acc)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, std::ptr::null(), out) }, "linear (accumulated)")
+        self.ok(unsafe { (self.k.linear_acc)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, std::ptr::null(), out, ldo as i64) }, "linear (accumulated)")
     }
 
     /// out [M, N] = x [M, K] . W^T + bias with W a GGUF-quantized matrix [N, K] of type `qtype` (kept in its stored
@@ -187,6 +193,26 @@ impl Nsd {
         // SAFETY: the caller's buffers hold the sizes named.
         self.ok(unsafe { (self.k.rms_rope)(self.ctx, x, dt as c_int, m as i64, h as i64, d as i64, stride as i64, weight.cast(), eps, cs.cast(), rot as c_int) },
                 "rms norm + rope")
+    }
+
+    /// Layer norm of [M, C] rows with float32 weight and bias (either may be null)
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_norm(&self, x: P, x_dt: Dt, m: usize, c: usize, weight: P, bias: P, eps: f32, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.layer_norm)(self.ctx, x, x_dt as c_int, m as i64, c as i64, weight.cast(), bias.cast(), eps, out, out_dt as c_int) }, "layer norm")
+    }
+
+    /// GELU in place: the tanh approximation (`tanh`) or the exact erf form
+    pub fn gelu(&self, x: M, dt: Dt, n: usize, tanh: bool) -> Result<()> {
+        // SAFETY: x holds n values.
+        self.ok(unsafe { (self.k.gelu)(self.ctx, x, dt as c_int, n as i64, tanh as c_int) }, "gelu")
+    }
+
+    /// Rotary positions alone, in place (rows of stride `stride`, `cs` (cos, sin) per token and pair)
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(&self, x: M, dt: Dt, m: usize, h: usize, d: usize, stride: usize, cs: P, rot: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.rope)(self.ctx, x, dt as c_int, m as i64, h as i64, d as i64, stride as i64, cs.cast(), rot as c_int) }, "rope")
     }
 
     /// out [M, C] = silu(x[:, :C]) * x[:, C:] for x [M, 2C]

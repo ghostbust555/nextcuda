@@ -313,6 +313,59 @@ pub fn selftest(gpu: &Arc<Gpu>) -> Result<Vec<f32>> {
         nsd.wait()?;
         out.push(within("rms norm + rope", &dx.to_f32()?, &want, 1e-5)?);
     }
+    // layer norm, gelu (both forms), rope alone
+    {
+        let (m, c, eps) = (5usize, 70usize, 1e-6f32);
+        let (x, w, b) = (data(m * c, 50, 2.0), data(c, 51, 1.0), data(c, 52, 1.0));
+        let mut want = vec![0f32; m * c];
+        for r in 0..m {
+            let row = &x[r * c..(r + 1) * c];
+            let mean = row.iter().sum::<f32>() / c as f32;
+            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / c as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for i in 0..c {
+                want[r * c + i] = (row[i] - mean) * inv * w[i] + b[i];
+            }
+        }
+        let (dx, dw, db, o) = (put_f32(g, &x)?, put_f32(g, &w)?, put_f32(g, &b)?, DevBuf::f32(g, m * c)?);
+        nsd.layer_norm(dx.ptr(), Dt::F32, m, c, dw.ptr(), db.ptr(), eps, o.ptr(), Dt::F32)?;
+        nsd.wait()?;
+        out.push(within("layer norm", &o.to_f32()?, &want, 1e-5)?);
+        let g_in = data(500, 53, 3.0);
+        for (name, tanh) in [("gelu (erf)", false), ("gelu (tanh)", true)] {
+            let want: Vec<f32> = g_in.iter().map(|&v| if tanh { 0.5 * v * (1.0 + (0.7978845608f32 * (v + 0.044715 * v * v * v)).tanh()) } else {
+                // erf via the Abramowitz-Stegun 7.1.26 series is too coarse for 1e-5; use the libm-free A&S 7.1.28 identity through tanh-free f64 series
+                let z = v as f64 / std::f64::consts::SQRT_2;
+                let t = 1.0 / (1.0 + 0.3275911 * z.abs());
+                let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-z * z).exp();
+                (0.5 * v as f64 * (1.0 + y.copysign(z))) as f32
+            }).collect();
+            let dg = put_f32(g, &g_in)?;
+            nsd.gelu(dg.ptr(), Dt::F32, g_in.len(), tanh)?;
+            nsd.wait()?;
+            out.push(within(name, &dg.to_f32()?, &want, if tanh { 1e-5 } else { 2e-3 })?);
+        }
+        // rope alone
+        let (rm, hh, d) = (3usize, 2usize, 16usize);
+        let stride = hh * d + 8;
+        let xr = data(rm * stride, 54, 1.5);
+        let cs: Vec<f32> = (0..rm * d / 2).flat_map(|i| [(0.1 * i as f32).cos(), (0.1 * i as f32).sin()]).collect();
+        let mut want = xr.clone();
+        for r in 0..rm {
+            for hd in 0..hh {
+                let base = r * stride + hd * d;
+                for i in 0..d / 2 {
+                    let (c, s) = (cs[(r * d / 2 + i) * 2], cs[(r * d / 2 + i) * 2 + 1]);
+                    want[base + i] = xr[base + i] * c - xr[base + d / 2 + i] * s;
+                    want[base + d / 2 + i] = xr[base + d / 2 + i] * c + xr[base + i] * s;
+                }
+            }
+        }
+        let (dx, dc) = (put_f32(g, &xr)?, put_f32(g, &cs)?);
+        nsd.rope(dx.ptr(), Dt::F32, rm, hh, d, stride, dc.ptr(), d)?;
+        nsd.wait()?;
+        out.push(within("rope", &dx.to_f32()?, &want, 1e-5)?);
+    }
     // swiglu and gated add
     {
         let (m, c) = (3usize, 50usize);

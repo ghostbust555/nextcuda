@@ -32,8 +32,9 @@ int nsd_wait(void* ctx);
  * bfloat16); bias float32 [N] or NULL; out [M, N] in out_dt (float32 or dt). Accumulated in float32. */
 int nsd_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias,
                void* out, int out_dt);
-/* out [M, N] += x [M, K] . W^T (W [N, K]), all in type dt: a LoRA's second factor, accumulated into the output. */
-int nsd_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out);
+/* out [M, N] += x [M, K] . W^T (W [N, K]), all in type dt: a LoRA's second factor, accumulated into the output. `ldo`:
+ * the elements between the rows of out (0: N) - a matrix's output beside others' in a wider buffer. */
+int nsd_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out, int64_t ldo);
 
 /* dequant: n values of a GGUF type into out_dt: 12 = Q4_K, 14 = Q6_K (multiples of 256), 8 = Q8_0 (of 32), 13 = Q5_K,
  * 30 = BF16, 1 = F16, 0 = F32. */
@@ -52,6 +53,16 @@ int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const v
  * x, out [M, C]; weight float32 [C] (NULL: 1); rows int32 [M]; scale, shift float32 [R, C]. out may be x. */
 int nsd_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, float eps,
                      const int32_t* rows, const float* scale, const float* shift, void* out, int out_dt);
+
+/* Layer norm of x [M, C] per row: (x - mean) / sqrt(var + eps) * weight + bias (weight, bias float32 [C] or NULL). */
+int nsd_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps,
+                   void* out, int out_dt);
+
+/* GELU in place over n values: exact (erf, mode 0) or the tanh approximation (mode 1). */
+int nsd_gelu(void* ctx, void* x, int x_dt, int64_t n, int mode);
+
+/* RoPE alone (no norm), in place, as nsd_rms_rope without its norm; cs float32 [M, rot_dim/2, 2]. */
+int nsd_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* cs, int rot_dim);
 
 /* Per-head RMS norm, then the rotary position rotation, in place. x holds M token rows of H heads x D features; row m
  * starts at element m * stride. Each head's D features are normalized (weight float32 [D], NULL: none); then feature
