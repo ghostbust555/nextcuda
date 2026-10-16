@@ -46,3 +46,29 @@ llama.cpp (mainline, CPU, the same file, greedy): "The user is asking a simple f
 answer is Paris. ..." (prompt 0.85 tok/s, decode 1.46 tok/s on this box). nextcuda: the same first eight tokens, then "...: capital of
 France. Answer: Paris. ..." - a different but equally right continuation after a near tie on a 1-bit quant (activations through
 Q8_1, as llama.cpp's CUDA path does; its CPU path differs in rounding). Logit-level comparison (cosine) is not done.
+
+## Later the same night: overlap, fewer guessed copies, prompts that borrow the hot set
+
+Same method, the second of two runs kept, 128 new tokens. Prompts of more than 128 rows take passes of 2,048 rows in VRAM
+borrowed from the hot set's tail (its least wanted experts, read back after the prompt: Strata's trick), so decode keeps a
+bigger hot set (4.7 GiB) and prompts sweep the experts a quarter as often. Decode multiplies the experts it has while the
+misses are read (the missed ones in a second batch), and copies only the top 8 of a guessed next layer up.
+
+| pinned cache | prompt tokens | prompt read | prompt tok/s | decode tok/s | cache hit | peak GPU MiB | avg W | energy J |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 25 GiB | 20 | 1.2 s | 16.1 | 9.85 | 95.8 % | 10,786 | 71 | 973 |
+| 25 GiB | 2,000 | 10.7 s | 186.1 | 8.01 | 90.6 % | 10,812 | 73 | 1,917 |
+| 25 GiB | 8,000 | 42.6 s | 187.8 | 10.52 | 89.5 % | 10,850 | 92 | 5,018 |
+| 22 GiB | 20 | 1.5 s | 13.5 | 8.04 | 92.9 % | 10,780 | 64 | 1,092 |
+| 22 GiB | 2,000 | 11.8 s | 168.8 | 6.12 | 86.2 % | 10,806 | 65 | 2,129 |
+| 22 GiB | 8,000 | 45.5 s | 175.8 | 7.78 | 84.2 % | 10,844 | 85 | 5,266 |
+| 18 GiB | 20 | 1.9 s | 10.4 | 5.75 | 87.8 % | 10,772 | 54 | 1,299 |
+| 18 GiB | 2,000 | 13.6 s | 147.4 | 4.17 | 78.9 % | 10,798 | 55 | 2,413 |
+| 18 GiB | 8,000 | 52.3 s | 153.1 | 5.39 | 76.3 % | 10,836 | 73 | 5,544 |
+
+Against the first table (25 GiB): prompts 103 -> 186 tok/s at 2,000 and 121 -> 188 at 8,000; decode 8.9 -> 9.9, 7.8 -> 8.0, 9.4 -> 10.5.
+Passes of 1,024 rows borrowed instead: prompts 143 / 161, decode about the same. The model card serves with 22 GiB.
+
+What was tried and lost (2,000-token decode, 25 GiB): guesses two or three layers ahead or wider (7.6 -> 6.7 / 6.2 / 5.9);
+the CPU multiplying part of the pinned experts with ggml-cpu (8.4 -> 7.2 / 7.0 / 6.8 at 30 / 50 / 70 %: 8 vCPUs do ~10 GB/s on a
+layer's few experts, the link ~24); an LRU VRAM tier (48K copies in, 7 % more VRAM hits, twice the misses: 9.2 -> 7.0).

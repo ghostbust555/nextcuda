@@ -172,6 +172,7 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
         ids.truncate(n);
         let mut s = m.session((n + new + 8).min(12000)).expect("session");
         let (from, h0) = (smp.lock().unwrap().len(), m.cache_stats());
+        let ts0 = m.tier_stats();
         let t0 = Instant::now();
         let mut logits = m.forward(&mut s, &ids, 1).expect("prompt");
         let pp = t0.elapsed().as_secs_f64();
@@ -184,6 +185,8 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
             logits = m.forward(&mut s, &[next], 1).expect("decode");
         }
         let dec = t1.elapsed().as_secs_f64();
+        let ts1 = m.tier_stats();
+        eprintln!("[{n}: tiers (VRAM hits, pinned hits, misses, copied into VRAM) over prompt + decode: {:?}]", (ts1.0 - ts0.0, ts1.1 - ts0.1, ts1.2 - ts0.2, ts1.3 - ts0.3));
         let h1 = m.cache_stats();
         eprintln!("[{n}: decode times {:?}]", m.times.lock().unwrap());
         *m.times.lock().unwrap() = Default::default();

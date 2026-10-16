@@ -135,3 +135,12 @@ a model card, MTP (probably not worth it: a verify pass reads the union of its r
   the link's limit), misses read and waited for ~42 ms (24 MB a token: latency, not bandwidth), Mamba 10, the rest ~25.
   Next: a larger VRAM hot set (the prompt arena borrowed from it, Strata's trick, frees ~1 GB at decode), bigger prompt
   chunks in that room, MTP.
+
+## Status (2026-10-16, later night): prompts 186 tok/s, decode 10.5 (25 GiB); Open WebUI on :3000
+
+Done: misses read while the GPU multiplies what it has (two batches), guessed copies for the top 8 only (+15 % decode); one
+GPU wait a MoE layer (the guess read back with the router); prompts borrow the hot set's tail for passes of 2,048 rows
+(103 -> 186 tok/s, and decode keeps a 4.7 GiB hot set). Lost: an LRU VRAM tier (off, NS_NH_DYN_VRAM). The card serves with
+22 GiB pinned (decode 6-8 tok/s). Open WebUI (tooling/open-webui.sh, user unit) chats through the front door's /v1.
+Next: GPU-side routing and cache lookup (the last wait a layer), Q6_K mmvq at full bandwidth (Mamba 10 ms a token at ~350 of
+672 GB/s), write-back from VRAM to pinned for an LRU tier that does not lose experts, MTP.

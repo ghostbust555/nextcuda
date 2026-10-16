@@ -31,7 +31,7 @@ use nextcuda_gguf::{GType, Gguf, Tensor};
 /// Rows a pass takes
 pub const DEC: usize = 8;
 /// Rows a pass of the grouped MoE path takes (prompts); passes up to SMALL rows run each expert entry on its own
-pub const CHUNK: usize = 1024;
+pub const CHUNK: usize = 2048;
 const SMALL: usize = 4;
 
 fn e(x: impl std::fmt::Display) -> Error {
@@ -267,6 +267,8 @@ pub struct Times {
     /// decode's experts multiplied on the CPU, and the seconds it took (the GPU working meanwhile)
     pub cpu_experts: u64,
     pub cpu_s: f64,
+    /// seconds reading the borrowed hot experts back after long prompts
+    pub give_back_s: f64,
     /// NS_NH_PROFILE=1: a MoE layer's parts (seconds, each waited for)
     pub parts: std::collections::BTreeMap<&'static str, f64>,
 }
@@ -307,7 +309,7 @@ impl Default for Options {
             profile: None,
             stage: env("NS_NH_STAGE").map_or(true, |v| v != "0"),
             scratch_mib: env("NS_NH_SCRATCH_MIB").and_then(|v| v.parse().ok()).unwrap_or(1024),
-            chunk: env("NS_NH_CHUNK").and_then(|v| v.parse().ok()).unwrap_or(512).clamp(1, CHUNK),
+            chunk: env("NS_NH_CHUNK").and_then(|v| v.parse().ok()).unwrap_or(2048).clamp(1, CHUNK),
         }
     }
 }
@@ -322,6 +324,12 @@ pub struct NemotronH {
     output_norm: DevBuf,
     output: Mat,
     arena: Arena,
+    /// the arena's own buffer (decode, short prompts), the rows it takes, and what a long prompt borrows from the hot set's tail
+    arena_home: DevBuf,
+    resident_rows: usize,
+    borrow_bytes: usize,
+    /// the hot matrices the borrowed tail held (key, stride, offset), read back after the prompt
+    lent: std::sync::Mutex<Vec<(Key, usize, usize)>>,
     /// the experts of the layers not in VRAM: slots of pinned host memory, the recently used kept (LRU)
     cache: Option<std::sync::Mutex<ExpertCache>>,
     io: Io,
@@ -329,6 +337,14 @@ pub struct NemotronH {
     inflight: std::sync::Mutex<std::collections::HashMap<usize, Vec<Arc<Pending>>>>,
     chunk: usize,
     predict: bool,
+    /// decode multiplies the experts it has while the misses are read, the missed ones in a second batch (NS_NH_OVERLAP=0: all after the reads)
+    overlap: bool,
+    /// NS_NH_DYN_VRAM=1: decode's copies up go into the VRAM tier's slots (LRU) instead of a per-pass buffer. Off: measured, 48K copies
+    /// in gave 7 % more VRAM hits and twice the misses (what it gives up is not in pinned memory), decode 9.2 -> 7.0 tok/s
+    dyn_vram: bool,
+    /// copies toward VRAM for the first NS_NH_PRE_K (8) of a guess's experts (by score) only: a wrong guess's copy is the link's time
+    /// lost (all 22: 2,000-token decode 8.5 tok/s, the top 8: 8.9)
+    pre_k: usize,
     pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
     /// MoE layers ahead whose misses a guess reads, and how many of each guess's top experts
     pred_ahead: usize,
@@ -354,6 +370,14 @@ struct Pool {
     used: Vec<u64>,
 }
 
+/// VRAM slots of one matrix size in the hot buffer (from `base`): who holds each, and when it was last wanted
+struct VSlots {
+    stride: usize,
+    base: usize,
+    owner: Vec<Option<Key>>,
+    used: Vec<u64>,
+}
+
 /// The experts of the layers not in VRAM, a matrix (up or down) a slot of its size's pool: the used lately kept (LRU)
 struct ExpertCache {
     pools: Vec<Pool>,
@@ -367,6 +391,11 @@ struct ExpertCache {
     hot: std::collections::HashMap<Key, usize>,
     hot_buf: Option<DevBuf>,
     hot_hits: u64,
+    /// the hot buffer as slots of each matrix size, and where each hot matrix is in them
+    vslots: Vec<VSlots>,
+    hot_at: std::collections::HashMap<Key, (usize, usize)>,
+    /// matrices decode copied up into a VRAM slot (another given up)
+    pub vram_ins: u64,
     /// pinned room for the misses of a prompt pass, used and dropped (a sweep over every layer's experts would only push
     /// out what the profile put in the pools)
     scratch: Option<(HostBuf, DevBuf)>,
@@ -434,14 +463,46 @@ impl NemotronH {
                 all.extend(keys.iter().map(|k| (*k, st)));
             }
             all.sort_by_key(|(k, _)| std::cmp::Reverse(want.get(k).copied().unwrap_or(0)));
+            // the most wanted until the buffer is full, then laid out as slots of each matrix size (decode swaps the experts it
+            // copies up into them, the least recently used given up: the VRAM tier follows the conversation)
             let mut at = 0usize;
+            let mut chosen: Vec<(Key, usize)> = Vec::new();
             for (k, st) in all {
                 if at + st > cap {
                     continue;
                 }
-                hot_jobs.push((k, st, at));
+                chosen.push((k, st));
                 at += st;
             }
+            let mut sizes: std::collections::BTreeMap<usize, usize> = Default::default();
+            for (_, st) in &chosen {
+                *sizes.entry(*st).or_default() += 1;
+            }
+            let mut base = 0usize;
+            let mut vi_of: std::collections::HashMap<usize, usize> = Default::default();
+            for (&st, &n) in &sizes {
+                vi_of.insert(st, c.vslots.len());
+                c.vslots.push(VSlots { stride: st, base, owner: vec![None; n], used: vec![0; n] });
+                base += n * st;
+            }
+            let mut next = vec![0usize; c.vslots.len()];
+            let mut rank_at = 0usize;
+            for (k, st) in chosen {
+                let vi = vi_of[&st];
+                let sl = next[vi];
+                next[vi] += 1;
+                // the LRU tier's slots by size; else in rank order (the least wanted last: what a long prompt borrows)
+                let off = if self.dyn_vram {
+                    c.vslots[vi].owner[sl] = Some(k);
+                    c.hot_at.insert(k, (vi, sl));
+                    c.vslots[vi].base + sl * st
+                } else {
+                    rank_at += st;
+                    rank_at - st
+                };
+                hot_jobs.push((k, st, off));
+            }
+            hot_jobs.sort_by_key(|j| j.2);
             for (k, _, off) in &hot_jobs {
                 c.hot.insert(*k, *off);
             }
@@ -472,42 +533,19 @@ impl NemotronH {
         self.io.run(&reqs).map_err(e)?;
         // the hot matrices into VRAM, in chunks through a host buffer
         if !hot_jobs.is_empty() {
-            let hb = {
-                let c = cache.lock().unwrap();
-                let b = c.hot_buf.as_ref().unwrap();
-                b.view(0, b.len)?
-            };
-            let chunk_bytes = 192usize << 20;
-            let mut stage = vec![0u8; chunk_bytes];
-            let mut i = 0;
-            while i < hot_jobs.len() {
-                let start = hot_jobs[i].2;
-                let mut j = i;
-                while j < hot_jobs.len() && hot_jobs[j].2 + hot_jobs[j].1 - start <= chunk_bytes {
-                    j += 1;
-                }
-                let part = &hot_jobs[i..j];
-                let sbase = stage.as_mut_ptr() as usize;
-                let reqs: Vec<IoReq> = part.iter().filter_map(|&((l, x, down), _, off)| {
-                    let Mix::Moe(m) = &self.layers[l].mix else { return None };
-                    let ex = if down { &m.down } else { &m.up };
-                    Some(self.req(ex, x, sbase + off - start))
-                }).collect();
-                self.io.run(&reqs).map_err(e)?;
-                let end = part.last().map(|q| q.2 + q.1).unwrap();
-                hb.write(start, &stage[..end - start])?;
-                i = j;
-            }
+            self.fill_hot(&hot_jobs)?;
             filled += hot_jobs.len();
         }
         log(format!("nemotronh: the cache preloaded with {filled} matrices ({}) in {:.1} s", if have_profile { "by the saved profile" } else { "in file order" }, t0.elapsed().as_secs_f64()));
         Ok(filled)
     }
 
-    /// While layer `l` (a MoE layer) is about to run: a guess at the next MoE layer's routing - its router on the residual stream as
-    /// it is now (80% of the experts it will choose, measured) - and the reads of what that layer will need and the cache lacks
-    /// started now, to be waited for when it runs
-    fn predict_next(&self, l: usize, x: &DevBuf) -> Result<()> {
+    /// While MoE layer `l` runs (decode): a guess at the next MoE layer's routing - its router on the residual stream as it is
+    /// before `l` (58 % of the experts it will choose, measured) - and the reads of what that layer will need and the cache
+    /// lacks started now, to be waited for when it runs.
+    /// The guesses' routers launched (their logits in the returned buffer, read with the layer's own router: one wait on the GPU a
+    /// layer, not two)
+    fn predict_launch(&self, l: usize, x: &DevBuf) -> Result<Option<(Vec<usize>, DevBuf)>> {
         let g = &self.g;
         // the next MoE layers (NS_NH_PRED_AHEAD, 1 by default: further guesses read wrong experts that push right ones out of the pools, measured slower): each one's router on the residual stream as it is now; the
         // reads of the misses among each guess's top NS_NH_PRED_K (more than the 22 it will choose: a wrong guess costs a read the
@@ -515,9 +553,8 @@ impl NemotronH {
         let targets: Vec<usize> = (l + 1..g.layers).filter(|i| g.kinds[*i] == Kind::Moe).take(self.pred_ahead).collect();
         let targets: Vec<usize> = targets.into_iter().filter(|t| matches!(&self.layers[*t].mix, Mix::Moe(m) if matches!(m.up.home, Home::Cached))).collect();
         if targets.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let mark = self.arena.mark();
         let hh = self.arena.f32(g.n_embd)?;
         let lg = self.arena.f32(g.experts * targets.len())?;
         for (i, &lt) in targets.iter().enumerate() {
@@ -525,8 +562,12 @@ impl NemotronH {
             self.rms(x, &self.layers[lt].norm, &hh, 1, g.n_embd)?;
             self.matmul(&mt.router, &hh, None, 1, &lg.view(i * g.experts * 4, g.experts * 4)?)?;
         }
-        let all = lg.to_f32()?;
-        self.arena.rewind(mark);
+        Ok(Some((targets, lg)))
+    }
+
+    /// The guesses' choices from their logits: the reads of the misses started, the first guess's pinned experts copied up
+    fn predict_finish(&self, targets: &[usize], all: &[f32]) -> Result<()> {
+        let g = &self.g;
         let mut reqs: Vec<IoReq> = Vec::new();
         let mut c = self.cache.as_ref().unwrap().lock().unwrap();
         let clock = c.clock;
@@ -550,7 +591,7 @@ impl NemotronH {
             let p = self.io.submit(&reqs);
             // by the layer of the slots: every batch that writes them is waited for before that layer reads them
             let mut fl = self.inflight.lock().unwrap();
-            for &lt in &targets {
+            for &lt in targets {
                 fl.entry(lt).or_default().push(p.clone());
             }
         }
@@ -599,7 +640,7 @@ impl NemotronH {
             let after: Vec<i64> = if c.pre_done[b] >= 0 { vec![c.pre_done[b]] } else { Vec::new() };
             let api = nextcuda_core::api()?;
             let mut last = -1i64;
-            for x in self.pred.lock().unwrap().get(&l2).cloned().unwrap_or_default() {
+            for x in self.pred.lock().unwrap().get(&l2).cloned().unwrap_or_default().into_iter().take(self.pre_k) {
                 for (down, ex) in [(false, &m2.up), (true, &m2.down)] {
                     let key = (l2, x, down);
                     if c.hot.contains_key(&key) || c.pre_used[b] + ex.stride > cap {
@@ -622,6 +663,66 @@ impl NemotronH {
             }
             if last >= 0 {
                 c.pre_ticket.insert(l2, (last, b));
+            }
+        }
+        Ok(())
+    }
+
+    /// A decode pass's experts `xs` of layer m (those not in VRAM already) copied from their pinned slots into the
+    /// staging buffer, on the GPU's stream: the products then read VRAM
+    fn stage(&self, c: &mut ExpertCache, m: &Moe, xs: &[usize]) -> Result<()> {
+        let Some(cap) = c.stage.as_ref().map(|b| b.len) else { return Ok(()) };
+        let mut done = std::collections::HashSet::new();
+        for x in xs {
+            if !done.insert(*x) {
+                continue;
+            }
+            for (down, ex) in [(false, &m.up), (true, &m.down)] {
+                let key = (m.layer, *x, down);
+                if c.hot.contains_key(&key) || c.stage_map.contains_key(&key) {
+                    continue;
+                }
+                if c.pre_map.contains_key(&key) {
+                    self.times.lock().unwrap().pre_hit += 1;
+                    continue;
+                }
+                let Some(&(p, sl)) = c.map.get(&key) else { continue };
+                let src = c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride;
+                // into the VRAM tier: the least recently wanted slot of its size that this layer does not use (what earlier
+                // layers' kernels read from it is queued before this copy, on the same stream)
+                if self.dyn_vram {
+                    if let Some(vi) = c.vslots.iter().position(|v| v.stride == ex.stride) {
+                        let clock = c.clock;
+                        let (vs, _) = c.vslots[vi].used.iter().enumerate().fold((usize::MAX, u64::MAX), |b, (i, u)| if *u < b.1 { (i, *u) } else { b });
+                        if vs != usize::MAX && c.vslots[vi].used[vs] < clock {
+                            if let Some(old) = c.vslots[vi].owner[vs].take() {
+                                c.hot.remove(&old);
+                                c.hot_at.remove(&old);
+                            }
+                            let off = c.vslots[vi].base + vs * ex.stride;
+                            // SAFETY: a pinned slot of ex.stride bytes into the hot buffer's slot [off, off + stride), on the GPU's stream.
+                            let dst = unsafe { c.hot_buf.as_ref().unwrap().ptr().cast::<u8>().add(off) };
+                            ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "an expert into VRAM")?;
+                            c.vslots[vi].owner[vs] = Some(key);
+                            c.vslots[vi].used[vs] = clock;
+                            c.hot.insert(key, off);
+                            c.hot_at.insert(key, (vi, vs));
+                            c.vram_ins += 1;
+                            self.times.lock().unwrap().stage_copy += 1;
+                            continue;
+                        }
+                    }
+                }
+                if c.stage_used + ex.stride > cap {
+                    continue;
+                }
+                self.times.lock().unwrap().stage_copy += 1;
+                let off = c.stage_used;
+                c.stage_used += (ex.stride + 255) & !255;
+                // SAFETY: a pinned slot of ex.stride bytes to the staging buffer's [off, off + stride), on the GPU's stream.
+                let dst = unsafe { c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off) };
+                ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "staging an expert")?;
+                c.stage_map.insert(key, off);
             }
         }
         Ok(())
@@ -665,6 +766,14 @@ impl NemotronH {
 
 /// (hits, misses) of the expert cache
 impl NemotronH {
+    /// (VRAM hits, pinned hits, misses, matrices decode copied into VRAM slots)
+    pub fn tier_stats(&self) -> (u64, u64, u64, u64) {
+        self.cache.as_ref().map_or((0, 0, 0, 0), |c| {
+            let c = c.lock().unwrap();
+            (c.hot_hits, c.hits, c.misses, c.vram_ins)
+        })
+    }
+
     pub fn cache_stats(&self) -> (u64, u64) {
         self.cache.as_ref().map_or((0, 0), |c| {
             let c = c.lock().unwrap();
@@ -840,11 +949,24 @@ impl NemotronH {
         // what the pass buffers take beside the weights: the arena, the biggest dense matrix as half, the decode staging
         let w16_need = f.tensors.iter().filter(|t| !t.name.contains("_exps.") && !t.name.starts_with(&nextn_prefix) && t.shape.len() >= 2 && !plain(t.ty)).map(|t| t.elements() * 2).max().unwrap_or(0);
         let widest_pair = (0..g.layers).filter(|l| exp_bytes[*l] > 0).map(|l| exp_bytes[l] / g.experts as u64).max().unwrap_or(0);
-        let arena_need = ((96u64 << 20) + o.chunk as u64 * 700_000 + (o.chunk * g.used * 28_000) as u64) + w16_need + if o.stage { SMALL as u64 * g.used as u64 * widest_pair + 2 * g.used as u64 * widest_pair } else { 0 };
+        // a prompt pass's buffers for `rows` rows; with a profile (the VRAM then a hot set) only decode's and short prompts' stay
+        // resident (NS_NH_RESIDENT_ROWS, 128) and a long prompt borrows the rest from the hot set's tail (Strata's trick: the
+        // least wanted hot experts, read back after it)
+        let arena_bytes = |rows: usize| (96u64 << 20) + rows as u64 * 700_000 + (rows * g.used * 28_000) as u64;
+        let has_profile = o.profile.as_ref().is_some_and(|p| p.exists()) && std::env::var("NS_NH_HOT").map_or(true, |v| v != "0");
+        let resident_rows = if has_profile && std::env::var("NS_NH_BORROW").map_or(true, |v| v != "0") {
+            std::env::var("NS_NH_RESIDENT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).min(o.chunk)
+        } else {
+            o.chunk
+        };
+        let arena_need = arena_bytes(resident_rows) + w16_need + if o.stage { SMALL as u64 * g.used as u64 * widest_pair + 2 * g.used as u64 * widest_pair } else { 0 };
         let mut vram_left = free.saturating_sub(dense + reserve + arena_need);
         let mut homes = vec![0u8; g.layers]; // 0 VRAM, 2 the cache
         // with a profile the VRAM is the hot experts' (of any layer), not the first layers' whole
-        let hot_budget = if o.profile.as_ref().is_some_and(|p| p.exists()) && std::env::var("NS_NH_HOT").map_or(true, |v| v != "0") { vram_left } else { 0 };
+        let hot_budget = if has_profile { vram_left } else { 0 };
+        // what a long prompt borrows (0: none - its passes are the resident rows')
+        let borrow_bytes = if resident_rows < o.chunk && hot_budget >= arena_bytes(o.chunk) + (512 << 20) { arena_bytes(o.chunk) as usize } else { 0 };
+        let chunk = if resident_rows < o.chunk && borrow_bytes == 0 { resident_rows } else { o.chunk };
         for l in 0..g.layers {
             if exp_bytes[l] == 0 {
                 continue;
@@ -973,7 +1095,7 @@ impl NemotronH {
         let pre_bytes = if stage_bytes > 0 { stage_bytes / SMALL } else { 0 };
         let pre: Vec<DevBuf> = if pre_bytes > 0 && std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0") { (0..2).map(|_| DevBuf::new(&gpu, pre_bytes)).collect::<Result<_>>()? } else { Vec::new() };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default() })) };
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, vslots: Vec::new(), hot_at: Default::default(), vram_ins: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default() })) };
         // the CPU's share: when ggml-cpu is there and takes every cached layer's expert types
         let cpu = cpu::Ggml::get().filter(|gg| layers.iter().all(|ly| match &ly.mix {
             Mix::Moe(m) if matches!(m.up.home, Home::Cached) => gg.supports(m.up.ty.code() as i32) && gg.supports(m.down.ty.code() as i32),
@@ -984,13 +1106,17 @@ impl NemotronH {
             log(format!("nemotronh: decode multiplies {:.0} % of a layer's pinned experts on {} CPU threads (ggml-cpu)", cpu_frac * 100.0, p.threads));
         }
         let io = Io::new(&f, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
-        let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 28_000))?;
+        let arena_home = DevBuf::new(&gpu, arena_bytes(resident_rows) as usize)?;
+        let arena = Arena::on(arena_home.view(0, arena_home.len)?);
+        if borrow_bytes > 0 {
+            log(format!("nemotronh: prompts of more than {resident_rows} rows borrow {:.1} GiB of the hot set for passes of {chunk}", gib(borrow_bytes as u64)));
+        }
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk: o.chunk, predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8) })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -1183,7 +1309,8 @@ impl NemotronH {
     }
 
     /// A latent-MoE layer on h [t, n_embd]: the routed experts in the latent, projected back, plus the shared expert
-    fn moe(&self, m: &Moe, h: &DevBuf, t: usize) -> Result<DevBuf> {
+    /// `x`: the residual stream before the layer, for the next MoE layer's guessed routing (decode)
+    fn moe(&self, m: &Moe, h: &DevBuf, t: usize, x: Option<&DevBuf>) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let prof = std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1");
         let mut lap_t = Instant::now();
@@ -1202,7 +1329,15 @@ impl NemotronH {
         let lat = self.arena.f32(t * g.latent)?;
         self.matmul(&m.to_latent, h, Some(&hq8), t, &lat)?;
         lap("router+latent");
+        let guess = match x {
+            Some(x) => self.predict_launch(m.layer, x)?,
+            None => None,
+        };
         let lg = logits.to_f32()?;
+        if let Some((targets, glg)) = guess {
+            let all = glg.to_f32()?;
+            self.predict_finish(&targets, &all)?;
+        }
         // the CPU's share needs the latent row on the host (the sync above has it ready)
         let cpu_on = t == 1 && self.cpu.is_some() && self.cpu_frac > 0.0 && matches!(m.up.home, Home::Cached);
         let lat_host = if cpu_on { Some(lat.to_f32()?) } else { None };
@@ -1246,6 +1381,9 @@ impl NemotronH {
         // used given up), the misses read from the file on a few threads
         let tf = Instant::now();
         let mut pre_b: Option<usize> = None;
+        // decode's missed experts, read while the first batch runs, and their reads
+        let mut late: std::collections::HashSet<usize> = Default::default();
+        let mut late_io: Option<(Arc<Pending>, Instant)> = None;
         if matches!(m.up.home, Home::Cached) {
             // reads started for this layer from a guess at its routing
             let pend = self.inflight.lock().unwrap().remove(&m.layer).unwrap_or_default();
@@ -1275,6 +1413,9 @@ impl NemotronH {
                     *c.wanted.entry(key).or_default() += 1;
                     if c.hot.contains_key(&key) {
                         c.hot_hits += 1;
+                        if let Some(&(vi, sl)) = c.hot_at.get(&key) {
+                            c.vslots[vi].used[sl] = clock;
+                        }
                         continue;
                     }
                     if let Some(&(p, sl)) = c.map.get(&key) {
@@ -1306,10 +1447,15 @@ impl NemotronH {
                 let tio = Instant::now();
                 let nbytes: usize = jobs.iter().map(|j| if j.0 { m.down.stride } else { m.up.stride }).sum();
                 let reqs: Vec<IoReq> = jobs.iter().map(|&(down, x, at)| self.req(if down { &m.down } else { &m.up }, x, at)).collect();
-                self.io.run(&reqs).map_err(e)?;
-                let mut tm = self.times.lock().unwrap();
-                tm.io_s += tio.elapsed().as_secs_f64();
-                tm.io_bytes += nbytes as u64;
+                self.times.lock().unwrap().io_bytes += nbytes as u64;
+                if t == 1 && self.overlap && !cpu_on {
+                    // decode: the reads in flight while the GPU multiplies the experts it has (a second batch takes these)
+                    late.extend(jobs.iter().map(|j| j.1));
+                    late_io = Some((self.io.submit(&reqs), tio));
+                } else {
+                    self.io.run(&reqs).map_err(e)?;
+                    self.times.lock().unwrap().io_s += tio.elapsed().as_secs_f64();
+                }
             }
             lap("fetch misses");
             // the CPU's share: of the experts whose matrices are both in pinned memory only (not hot, not copied up already
@@ -1332,36 +1478,9 @@ impl NemotronH {
                 self.times.lock().unwrap().cpu_experts += cpu_jobs.len() as u64;
             }
             // a decode pass: the experts not in VRAM already copied into the staging buffer, then the products read that
-            if t <= SMALL && c.stage.is_some() {
-                let cap = c.stage.as_ref().unwrap().len;
-                let mut done = std::collections::HashSet::new();
-                for (_, x, _) in &ent {
-                    if !done.insert(*x) || cpu_x.contains(x) {
-                        continue;
-                    }
-                    for (down, ex) in [(false, &m.up), (true, &m.down)] {
-                        let key = (m.layer, *x, down);
-                        if c.hot.contains_key(&key) {
-                            continue;
-                        }
-                        if c.pre_map.contains_key(&key) {
-                            self.times.lock().unwrap().pre_hit += 1;
-                            continue;
-                        }
-                        if c.stage_used + ex.stride > cap {
-                            continue;
-                        }
-                        self.times.lock().unwrap().stage_copy += 1;
-                        let Some(&(p, sl)) = c.map.get(&key) else { continue };
-                        let src = c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride;
-                        let off = c.stage_used;
-                        c.stage_used += (ex.stride + 255) & !255;
-                        // SAFETY: a pinned slot of ex.stride bytes to the staging buffer's [off, off + stride), on the GPU's stream.
-                        let dst = unsafe { c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off) };
-                        ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "staging an expert")?;
-                        c.stage_map.insert(key, off);
-                    }
-                }
+            if t <= SMALL {
+                let xs: Vec<usize> = ent.iter().map(|x| x.1).filter(|x| !cpu_x.contains(x) && !late.contains(x)).collect();
+                self.stage(&mut c, m, &xs)?;
             }
             // the copies of the guessed experts, if any: the kernels wait for them (on the device)
             if t <= SMALL {
@@ -1383,39 +1502,61 @@ impl NemotronH {
             mo.fill(0)?;
             mo
         } else if t <= SMALL { {
+        // the entries the GPU has the bytes of first, the missed ones (reads still in flight) after
+        let mut ent = ent;
+        ent.sort_by_key(|x| late.contains(&x.1));
+        let n_a = ent.iter().filter(|x| !late.contains(&x.1)).count();
         let u = self.arena.f32(n_e * g.n_ff_exp)?;
-        // the experts' addresses and the activation rows, in one upload: up's pointers | down's | the tokens' rows | 0..n_e
-        let mut ptrs: Vec<u8> = Vec::with_capacity(n_e * 24);
-        for (_, x, _) in &ent {
-            ptrs.extend_from_slice(&(self.expert_at(&m.up, m.layer, false, *x) as u64).to_le_bytes());
-        }
-        for (_, x, _) in &ent {
-            ptrs.extend_from_slice(&(self.expert_at(&m.down, m.layer, true, *x) as u64).to_le_bytes());
-        }
-        for (r, _, _) in &ent {
-            ptrs.extend_from_slice(&(*r as i32).to_le_bytes());
-        }
-        for j in 0..n_e {
-            ptrs.extend_from_slice(&(j as i32).to_le_bytes());
-        }
-        let pb = self.arena.bytes(ptrs.len())?;
-        pb.write(0, &ptrs)?;
-        let (up_p, down_p) = (pb.ptr().cast_const(), unsafe { pb.ptr().cast::<u8>().add(n_e * 8).cast_const() });
-        let (rows_p, seq_p) = unsafe { (pb.ptr().cast::<u8>().add(n_e * 16).cast::<i32>().cast_const(), pb.ptr().cast::<u8>().add(n_e * 16 + n_e * 4).cast::<i32>().cast_const()) };
-        // SAFETY: n_e experts' up [n_ff, latent] in their blocks, the tokens' latent Q8_1 rows, u [n_e][n_ff].
-        self.op("expert up", || unsafe {
-            (k.mmvq_ptrs)(self.raw(), m.up.ty.code() as i32, up_p.cast(), rows_p, latq.buf.ptr(), u.fp(), g.latent as i64, g.n_ff_exp as i64, n_e as i64)
-        })?;
-        lap("expert up");
-        // SAFETY: n floats.
-        self.op("relu2", || unsafe { (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64) })?;
-        let uq8 = self.quantize(u.fp(), g.n_ff_exp, n_e)?;
         let dn = self.arena.f32(n_e * g.latent)?;
-        // SAFETY: the experts' down [latent, n_ff], entry j's Q8_1 row, dn [n_e][latent].
-        self.op("expert down", || unsafe {
-            (k.mmvq_ptrs)(self.raw(), m.down.ty.code() as i32, down_p.cast(), seq_p, uq8.buf.ptr(), dn.fp(), g.n_ff_exp as i64, g.latent as i64, n_e as i64)
-        })?;
-        lap("expert down");
+        for (b0, b1) in [(0, n_a), (n_a, n_e)] {
+            if b0 == b1 {
+                continue;
+            }
+            if b0 > 0 {
+                // the second batch: its reads waited for, then staged as the first was
+                if let Some((p, tio)) = late_io.take() {
+                    p.wait().map_err(e)?;
+                    self.times.lock().unwrap().io_s += tio.elapsed().as_secs_f64();
+                }
+                let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+                let xs: Vec<usize> = ent[b0..b1].iter().map(|x| x.1).collect();
+                self.stage(&mut c, m, &xs)?;
+            }
+            let bt = &ent[b0..b1];
+            let nb = bt.len();
+            // the experts' addresses and the activation rows, in one upload: up's pointers | down's | the tokens' rows | 0..nb
+            let mut ptrs: Vec<u8> = Vec::with_capacity(nb * 24);
+            for (_, x, _) in bt {
+                ptrs.extend_from_slice(&(self.expert_at(&m.up, m.layer, false, *x) as u64).to_le_bytes());
+            }
+            for (_, x, _) in bt {
+                ptrs.extend_from_slice(&(self.expert_at(&m.down, m.layer, true, *x) as u64).to_le_bytes());
+            }
+            for (r, _, _) in bt {
+                ptrs.extend_from_slice(&(*r as i32).to_le_bytes());
+            }
+            for j in 0..nb {
+                ptrs.extend_from_slice(&(j as i32).to_le_bytes());
+            }
+            let pb = self.arena.bytes(ptrs.len())?;
+            pb.write(0, &ptrs)?;
+            let (up_p, down_p) = (pb.ptr().cast_const(), unsafe { pb.ptr().cast::<u8>().add(nb * 8).cast_const() });
+            let (rows_p, seq_p) = unsafe { (pb.ptr().cast::<u8>().add(nb * 16).cast::<i32>().cast_const(), pb.ptr().cast::<u8>().add(nb * 16 + nb * 4).cast::<i32>().cast_const()) };
+            // SAFETY: the batch's rows of u [n_e][n_ff] and dn [n_e][latent], from entry b0.
+            let (ub, dnb) = unsafe { (u.fp().add(b0 * g.n_ff_exp), dn.fp().add(b0 * g.latent)) };
+            // SAFETY: nb experts' up [n_ff, latent] in their blocks, the tokens' latent Q8_1 rows, ub [nb][n_ff].
+            self.op("expert up", || unsafe {
+                (k.mmvq_ptrs)(self.raw(), m.up.ty.code() as i32, up_p.cast(), rows_p, latq.buf.ptr(), ub, g.latent as i64, g.n_ff_exp as i64, nb as i64)
+            })?;
+            // SAFETY: n floats.
+            self.op("relu2", || unsafe { (k.relu2)(self.raw(), ub, (nb * g.n_ff_exp) as i64) })?;
+            let uq8 = self.quantize(ub, g.n_ff_exp, nb)?;
+            // SAFETY: the experts' down [latent, n_ff], entry j's Q8_1 row, dnb [nb][latent].
+            self.op("expert down", || unsafe {
+                (k.mmvq_ptrs)(self.raw(), m.down.ty.code() as i32, down_p.cast(), seq_p, uq8.buf.ptr(), dnb, g.n_ff_exp as i64, g.latent as i64, nb as i64)
+            })?;
+        }
+        lap("expert up+down");
         // the weighted sum per token (entries in token order)
         let mut tp = vec![0i32; t + 1];
         for (r, _, _) in &ent {
@@ -1589,13 +1730,11 @@ impl NemotronH {
             let mark = self.arena.mark();
             let t1 = Instant::now();
             self.rms(&x, &ly.norm, &h, t, g.n_embd)?;
-            if t == 1 && g.kinds[l] == Kind::Moe && self.predict {
-                self.predict_next(l, &x)?;
-            }
+            let guess_x = (t == 1 && g.kinds[l] == Kind::Moe && self.predict).then_some(&x);
             let out = match (&ly.mix, st) {
                 (Mix::Mamba(m), LState::Mamba { conv, s: ss }) => self.mamba(m, conv, ss, &h, t)?,
                 (Mix::Attn(a), LState::Attn { k, v }) => self.attention(a, k, v, s.max_ctx, &h, t, p0)?,
-                (Mix::Moe(m), LState::None) => self.moe(m, &h, t)?,
+                (Mix::Moe(m), LState::None) => self.moe(m, &h, t, guess_x)?,
                 _ => return Err(e(format!("layer {l}: its state and its weights disagree"))),
             };
             self.add(&x, &out, t * g.n_embd)?;
@@ -1630,15 +1769,114 @@ impl NemotronH {
         Ok(all.chunks_exact(g.vocab).map(|c| c.to_vec()).collect())
     }
 
-    /// Rows of any length: the passes of DEC rows, the logits of the last `n_out`
+    /// Rows of any length: the passes, the logits of the last `n_out`
     pub fn forward(&self, s: &mut Session, tokens: &[u32], n_out: usize) -> Result<Vec<Vec<f32>>> {
-        let mut out = Vec::new();
-        let chunks: Vec<&[u32]> = tokens.chunks(self.chunk).collect();
-        let last = chunks.len() - 1;
-        for (i, c) in chunks.iter().enumerate() {
-            out = self.pass(s, c, if i == last { n_out } else { 0 })?;
+        Ok(self.feed(s, tokens, n_out, &|_| false)?.1)
+    }
+
+    /// As `forward`, `stop(read)` asked between passes: (tokens read, the last pass's logits). A prompt longer than the resident
+    /// rows borrows the hot set's tail for passes of `chunk` rows, given back (its experts read again) at the end
+    pub fn feed(&self, s: &mut Session, tokens: &[u32], n_out: usize, stop: &dyn Fn(usize) -> bool) -> Result<(usize, Vec<Vec<f32>>)> {
+        let big = self.borrow_bytes > 0 && tokens.len() > self.resident_rows;
+        let rows = if big || self.borrow_bytes == 0 { self.chunk } else { self.resident_rows };
+        if big {
+            self.borrow()?;
         }
-        Ok(out)
+        let mut run = || -> Result<(usize, Vec<Vec<f32>>)> {
+            let mut out = Vec::new();
+            let mut done = 0;
+            for c in tokens.chunks(rows) {
+                if done > 0 && stop(done) {
+                    break;
+                }
+                // every pass's last rows' logits when asked for (the head is a millisecond): a stop may come after any
+                out = self.pass(s, c, n_out)?;
+                done += c.len();
+            }
+            Ok((done, out))
+        };
+        let r = run();
+        if big {
+            self.give_back()?;
+        }
+        r
+    }
+
+    /// The hot set's tail as the arena: its matrices dropped from the hot set until `give_back`
+    fn borrow(&self) -> Result<()> {
+        let Some(cache) = &self.cache else { return Ok(()) };
+        let mut c = cache.lock().unwrap();
+        let Some(hb) = c.hot_buf.as_ref().map(|b| b.view(0, b.len)).transpose()? else { return Ok(()) };
+        let start = (hb.len - self.borrow_bytes) & !4095;
+        let stride = |k: &Key| match &self.layers[k.0].mix {
+            Mix::Moe(m) => if k.2 { m.down.stride } else { m.up.stride },
+            _ => 0,
+        };
+        let mut lent = Vec::new();
+        c.hot.retain(|k, off| {
+            let st = stride(k);
+            if *off + st > start {
+                lent.push((*k, st, *off));
+                false
+            } else {
+                true
+            }
+        });
+        drop(c);
+        lent.sort_by_key(|j| j.2);
+        *self.lent.lock().unwrap() = lent;
+        self.arena.set(hb.view(start, hb.len - start)?);
+        Ok(())
+    }
+
+    /// The arena back on its own buffer, the borrowed tail's matrices read into it again (after the prompt's kernels: the same stream)
+    fn give_back(&self) -> Result<()> {
+        self.arena.set(self.arena_home.view(0, self.arena_home.len)?);
+        let lent = std::mem::take(&mut *self.lent.lock().unwrap());
+        if lent.is_empty() {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        self.fill_hot(&lent)?;
+        let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+        for (k, _, off) in &lent {
+            c.hot.insert(*k, *off);
+        }
+        self.times.lock().unwrap().give_back_s += t0.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// Matrices (key, stride, offset in the hot buffer; by offset) read from the file into the hot buffer, a few hundred MB at a time
+    fn fill_hot(&self, jobs: &[(Key, usize, usize)]) -> Result<()> {
+        let hb = {
+            let c = self.cache.as_ref().unwrap().lock().unwrap();
+            let b = c.hot_buf.as_ref().unwrap();
+            b.view(0, b.len)?
+        };
+        let chunk_bytes = 192usize << 20;
+        let mut stage = vec![0u8; chunk_bytes];
+        let mut i = 0;
+        while i < jobs.len() {
+            let start = jobs[i].2;
+            let mut j = i;
+            while j < jobs.len() && jobs[j].2 + jobs[j].1 - start <= chunk_bytes {
+                j += 1;
+            }
+            let part = &jobs[i..j];
+            let sbase = stage.as_mut_ptr() as usize;
+            let reqs: Vec<IoReq> = part.iter().filter_map(|&((l, x, down), _, off)| {
+                let Mix::Moe(m) = &self.layers[l].mix else { return None };
+                let ex = if down { &m.down } else { &m.up };
+                Some(self.req(ex, x, sbase + off - start))
+            }).collect();
+            self.io.run(&reqs).map_err(e)?;
+            let end = part.last().map(|q| q.2 + q.1).unwrap();
+            hb.write(start, &stage[..end - start])?;
+            // the host buffer is reused for the next part: this copy done first
+            self.gpu.sync()?;
+            i = j;
+        }
+        Ok(())
     }
 
     pub fn tokenizer(&self) -> std::result::Result<nextcuda_tok::Tokenizer, String> {

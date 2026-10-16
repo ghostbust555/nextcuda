@@ -15,7 +15,7 @@ use crate::{Kind, LState, NemotronH, Options};
 pub const ARCH: &str = "nemotron_h_moe";
 
 pub const OPTIONS: &[EngineOption] = &[
-    EngineOption { name: "chunk", env: "NS_NH_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 512)", at: At::Load },
+    EngineOption { name: "chunk", env: "NS_NH_CHUNK", value: "TOKENS", help: "a long prompt pass's rows (default 2048, in VRAM borrowed from the hot set)", at: At::Load },
     EngineOption { name: "pinned-gib", env: "NS_NH_PINNED_GIB", value: "GIB", help: "pinned host memory for the expert cache (default: the server's mirror share)", at: At::Load },
     EngineOption { name: "reserve-mib", env: "NS_NH_RESERVE_MIB", value: "MIB", help: "VRAM kept free beside the weights (default 700)", at: At::Load },
 ];
@@ -268,16 +268,8 @@ impl NemotronH {
 impl Served {
     fn feed_until(&self, s: &mut crate::Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync)) -> Result<(usize, Vec<f32>)> {
         let _w = self.work.lock().unwrap();
-        let mut logits = Vec::new();
-        let mut done = 0;
-        for c in tokens.chunks(self.m.chunk) {
-            if done > 0 && stop(done) {
-                break;
-            }
-            logits = self.m.pass(s, c, 1)?.pop().unwrap_or_default();
-            done += c.len();
-        }
-        Ok((done, logits))
+        let (done, mut out) = self.m.feed(s, tokens, 1, &|n| stop(n))?;
+        Ok((done, out.pop().unwrap_or_default()))
     }
 }
 

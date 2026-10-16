@@ -6,14 +6,14 @@ id: nemotron-3.5-super-iq1m
 kind: llm
 arch: nemotron_h_moe
 title: Nemotron 3.5 Super 120B-A12B UD-IQ1_M (one card, experts streamed)
-about: 'unsloth''s dynamic 1-bit quant of NVIDIA''s hybrid Mamba-2 / latent-MoE / attention model (43 GiB; IQ1_S / IQ2 / IQ3_XXS ups, Q2_0 downs). On one 12 GB card: dense weights and hot experts in VRAM, 18 GiB of experts in pinned host memory, the rest from the disk. Text only'
+about: 'unsloth''s dynamic 1-bit quant of NVIDIA''s hybrid Mamba-2 / latent-MoE / attention model (43 GiB; IQ1_S / IQ2 / IQ3_XXS ups, Q2_0 downs). On one 12 GB card: dense weights and hot experts in VRAM, 22 GiB of experts in pinned host memory, the rest from the disk. Text only'
 gpus: '0'
 vram_gib: 11.0
 ctx: '8192'
 tools: true
 tasks: true
 env:
-  NS_NH_PINNED_GIB: '18'      # host RAM for the expert cache; more is faster (25: +20 % decode) but the box shares its 31 GB
+  NS_NH_PINNED_GIB: '22'      # host RAM for the expert cache: 18 GiB decodes 4-6 tok/s, 22 6-8, 25 8-10.5; the box shares its 31 GB
   NS_PROMPT_CACHE_MIB: '2048' # a checkpoint is ~175 MB (the 40 Mamba states) + 8 KB a token
 files:
   model:

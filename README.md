@@ -88,11 +88,12 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
   read in 18.1 s the first time took 2.1 s the second.
 - **The expert profile** (`expert-profile.txt` beside the model): which experts decode asked for. The next start fills
   VRAM and the pinned cache by it, so the first runs of a new topic are slower than later ones.
-- **Memory:** `NS_NH_PINNED_GIB` is the biggest knob (the card sets 18; 25 gives about +20 % decode but leaves the
-  31 GB box little else). The prompt cache comes out of the same RAM.
-- **Speed on the 5070** (`nh --bench`, `docs/benchy/nemotron-3.5-super-iq1m.md`): decode 7.8-9.4 tok/s with 25 GiB
-  pinned (13-15 on a topic the profile knows), 6-7.5 with 22, about 5.5 with the card's 18; prompts 100-120 tok/s.
-- **Engine options** (`nextcuda llm engines`): `--opt-pinned-gib`, `--opt-chunk` (prompt rows a pass, 512),
+- **Memory:** `NS_NH_PINNED_GIB` is the biggest knob (the card sets 22; 25 is faster but leaves the 31 GB box little
+  else, 18 slower). The prompt cache comes out of the same RAM.
+- **Speed on the 5070** (`nh --bench`, `docs/benchy/nemotron-3.5-super-iq1m.md`): decode 8-10.5 tok/s with 25 GiB
+  pinned, 6-8 with the card's 22, 4-6 with 18; prompts 170-190 tok/s (a prompt longer than 128 rows borrows 2.6 GiB of
+  the VRAM's hot experts for passes of 2,048 rows, read back after it).
+- **Engine options** (`nextcuda llm engines`): `--opt-pinned-gib`, `--opt-chunk` (prompt rows a pass, 2048),
   `--opt-reserve-mib` (VRAM left free, 700). `NS_NH_CPU_FRAC` gives part of each layer's pinned experts to the CPU
   (ggml-cpu, `libggml-base.so` / `libggml-cpu.so` beside the program) - measured slower here than the copies over
   gen4 x16, so it is off.
