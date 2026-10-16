@@ -1,4 +1,4 @@
-/* nextsycl - the box at a glance: H3's palette (wfe/image/style.css), its pill, metric strip and panels; the cards and services grids added */
+/* nextcuda - the box at a glance: H3's palette (wfe/image/style.css), its pill, metric strip and panels; the cards and services grids added */
 @font-face{font-family:"NF";src:url(/static/nf.woff2) format("woff2");font-display:swap}
  .i{font-family:"NF",system-ui;font-style:normal;display:inline-block;min-width:1.1em;text-align:center;color:#93c5fd}
  .i.dim{color:#6b7280} .i.ok{color:#22c55e} .i.warn{color:#f59e0b} .i.err{color:#f87171}

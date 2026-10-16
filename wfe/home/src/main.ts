@@ -71,7 +71,7 @@ async function poll(): Promise<void> {
     ui.error = null;
     settle();
   } catch (e) {
-    ui.error = `nextsycl serve does not answer (${String(e)})`;
+    ui.error = `nextcuda serve does not answer (${String(e)})`;
   }
   render();
   const busy = Object.keys(ui.pending).length > 0 || ui.state?.runs.some((x) => x.rc === null);

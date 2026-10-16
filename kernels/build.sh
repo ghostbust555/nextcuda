@@ -21,7 +21,7 @@ GEN=()
 last=
 for a in $ARCHS; do GEN+=(-gencode "arch=compute_$a,code=sm_$a"); last=$a; done
 GEN+=(-gencode "arch=compute_$last,code=compute_$last")      # PTX of the newest: a newer card JITs it
-FLAGS=(-std=c++17 -O3 --use_fast_math -Xcompiler -fPIC -lineinfo "${GEN[@]}" -Ins -I"$SDCPP/include")
+FLAGS=(-std=c++17 -O3 --use_fast_math -Xcompiler -fPIC -lineinfo "${GEN[@]}" -Ins -Ins -Idiffusion -I"$SDCPP/include")
 # --use_fast_math is not on for the numerics that must match a reference: a source names its own flags below
 precise() { case "$1" in diffusion/*) return 0 ;; esac; return 1; }
 
@@ -29,7 +29,7 @@ KINDS="llm image video audio"
 # stable-diffusion.cpp (ggml-cuda), the CUDA implementation the image engines are built on: its source tree (headers)
 # and a shared build of it (-DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON), copied beside the libraries
 sources() {
-  ls ns/*.cu 2>/dev/null || true
+  ls ns/*.cu diffusion/*.cu 2>/dev/null || true
   for k in $KINDS; do ls $k/*/*.cu 2>/dev/null || true; done
   [ -f "$SDCPP/include/stable-diffusion.h" ] && ls image/sd/*.cpp 2>/dev/null || true
 }
@@ -37,8 +37,11 @@ silo_sources() { for k in $KINDS; do ls $k/*/silo/*.cu 2>/dev/null || true; done
 
 compile() {
   f=$1; o="$OBJ/$(echo "$f" | tr / _).o"
-  fl=("${FLAGS[@]}")
-  precise "$f" && fl=("${fl[@]/--use_fast_math/}")
+  fl=()
+  for a in "${FLAGS[@]}"; do
+    precise "$f" && [ "$a" = "--use_fast_math" ] && continue
+    fl+=("$a")
+  done
   if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ ns/ns_internal.hpp -nt "$o" ]; then
     "$NVCC" "${fl[@]}" -c "$f" -o "$o" && echo "ok   $f" || { echo "FAIL $f"; return 1; }
   else echo "cached $f"; fi

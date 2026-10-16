@@ -278,7 +278,7 @@ export function App() {
     <div id="app">
       <div class="top">
         <h1 class="brand">
-          <img attrs={{ src: "/static/logo.svg", alt: "nextsycl" }} />
+          <img attrs={{ src: "/static/logo.svg", alt: "nextcuda" }} />
           <span class="host">on {location.hostname}</span>
         </h1>
         {h
