@@ -17,6 +17,7 @@
 //! VRAM; the other layers' through a cache of pinned host memory (which the kernels read in place over PCIe) of the
 //! experts used lately, the misses read from the file.
 
+pub mod cpu;
 pub mod engine;
 pub mod ffi;
 
@@ -263,6 +264,9 @@ pub struct Times {
     pub stage_copy: u64,
     pub pred_right: u64,
     pub pred_total: u64,
+    /// decode's experts multiplied on the CPU, and the seconds it took (the GPU working meanwhile)
+    pub cpu_experts: u64,
+    pub cpu_s: f64,
     /// NS_NH_PROFILE=1: a MoE layer's parts (seconds, each waited for)
     pub parts: std::collections::BTreeMap<&'static str, f64>,
 }
@@ -333,6 +337,9 @@ pub struct NemotronH {
     w16: Option<DevBuf>,
     dense_gemm_min: usize,
     pub times: std::sync::Mutex<Times>,
+    /// decode's CPU share (cpu.rs): ggml's products and the workers, and the share of a layer's pinned experts it takes
+    cpu: Option<(&'static cpu::Ggml, cpu::Pool)>,
+    cpu_frac: f64,
     pub load_s: f64,
 }
 
@@ -967,6 +974,15 @@ impl NemotronH {
         let pre: Vec<DevBuf> = if pre_bytes > 0 && std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0") { (0..2).map(|_| DevBuf::new(&gpu, pre_bytes)).collect::<Result<_>>()? } else { Vec::new() };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
         let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0, reading: Default::default() })) };
+        // the CPU's share: when ggml-cpu is there and takes every cached layer's expert types
+        let cpu = cpu::Ggml::get().filter(|gg| layers.iter().all(|ly| match &ly.mix {
+            Mix::Moe(m) if matches!(m.up.home, Home::Cached) => gg.supports(m.up.ty.code() as i32) && gg.supports(m.down.ty.code() as i32),
+            _ => true,
+        })).map(|gg| (gg, cpu::Pool::new(std::env::var("NS_NH_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())))));
+        let cpu_frac: f64 = std::env::var("NS_NH_CPU_FRAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0f64).clamp(0.0, 1.0);
+        if let (Some((_, p)), true) = (&cpu, cpu_frac > 0.0) {
+            log(format!("nemotronh: decode multiplies {:.0} % of a layer's pinned experts on {} CPU threads (ggml-cpu)", cpu_frac * 100.0, p.threads));
+        }
         let io = Io::new(&f, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
         let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 28_000))?;
         gpu.sync()?;
@@ -974,7 +990,7 @@ impl NemotronH {
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk: o.chunk, predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk: o.chunk, predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -1187,6 +1203,11 @@ impl NemotronH {
         self.matmul(&m.to_latent, h, Some(&hq8), t, &lat)?;
         lap("router+latent");
         let lg = logits.to_f32()?;
+        // the CPU's share needs the latent row on the host (the sync above has it ready)
+        let cpu_on = t == 1 && self.cpu.is_some() && self.cpu_frac > 0.0 && matches!(m.up.home, Home::Cached);
+        let lat_host = if cpu_on { Some(lat.to_f32()?) } else { None };
+        let mut cpu_jobs: Vec<cpu::Job> = Vec::new();
+        let mut cpu_x: std::collections::HashSet<usize> = Default::default();
         let n_e = t * g.used;
         let mut ent: Vec<(usize, usize, f32)> = Vec::with_capacity(n_e);
         for r in 0..t {
@@ -1291,12 +1312,31 @@ impl NemotronH {
                 tm.io_bytes += nbytes as u64;
             }
             lap("fetch misses");
+            // the CPU's share: of the experts whose matrices are both in pinned memory only (not hot, not copied up already
+            // for a guess), the first part by weight multiplied there by the CPU while the GPU does the rest
+            if cpu_on {
+                let mut cand: Vec<(usize, f32, usize, usize)> = Vec::new();
+                for &(_, x, w) in &ent {
+                    let (ku, kd) = ((m.layer, x, false), (m.layer, x, true));
+                    if c.hot.contains_key(&ku) || c.hot.contains_key(&kd) || c.pre_map.contains_key(&ku) || c.pre_map.contains_key(&kd) {
+                        continue;
+                    }
+                    let (Some(&(pu, su)), Some(&(pd, sd))) = (c.map.get(&ku), c.map.get(&kd)) else { continue };
+                    cand.push((x, w, c.pools[pu]._host.as_slice().as_ptr() as usize + su * m.up.stride, c.pools[pd]._host.as_slice().as_ptr() as usize + sd * m.down.stride));
+                }
+                let n = (cand.len() as f64 * self.cpu_frac).round() as usize;
+                for (x, w, up, down) in cand.into_iter().take(n) {
+                    cpu_x.insert(x);
+                    cpu_jobs.push(cpu::Job { up, down, w });
+                }
+                self.times.lock().unwrap().cpu_experts += cpu_jobs.len() as u64;
+            }
             // a decode pass: the experts not in VRAM already copied into the staging buffer, then the products read that
             if t <= SMALL && c.stage.is_some() {
                 let cap = c.stage.as_ref().unwrap().len;
                 let mut done = std::collections::HashSet::new();
                 for (_, x, _) in &ent {
-                    if !done.insert(*x) {
+                    if !done.insert(*x) || cpu_x.contains(x) {
                         continue;
                     }
                     for (down, ex) in [(false, &m.up), (true, &m.down)] {
@@ -1334,8 +1374,15 @@ impl NemotronH {
         lap("route+fetch");
         self.times.lock().unwrap().moe_fetch += tf.elapsed().as_secs_f64();
         let latq = self.quantize(lat.fp(), g.latent, t)?;
+        // the GPU's entries: those the CPU does not take
+        let ent: Vec<(usize, usize, f32)> = if cpu_x.is_empty() { ent } else { ent.into_iter().filter(|x| !cpu_x.contains(&x.1)).collect() };
+        let n_e = ent.len();
         // SAFETY: arithmetic only.
-        let mo = if t <= SMALL { {
+        let mo = if t <= SMALL && n_e == 0 {
+            let mo = self.arena.f32(t * g.latent)?;
+            mo.fill(0)?;
+            mo
+        } else if t <= SMALL { {
         let u = self.arena.f32(n_e * g.n_ff_exp)?;
         // the experts' addresses and the activation rows, in one upload: up's pointers | down's | the tokens' rows | 0..n_e
         let mut ptrs: Vec<u8> = Vec::with_capacity(n_e * 24);
@@ -1485,6 +1532,18 @@ impl NemotronH {
             self.op("moe combine", || unsafe { (k.moe_combine_ids)(self.raw(), mo.fp(), dn.fp(), tb.ptr().cast(), ib.ptr().cast(), wb.fp(), t as i64, g.latent as i64) })?;
             mo
         };
+        // the CPU's experts, multiplied while the GPU runs its own, then added to theirs
+        if let (Some((gg, pool)), Some(xh)) = (&self.cpu, &lat_host) {
+            if !cpu_jobs.is_empty() {
+                let tc = Instant::now();
+                let v = cpu::experts(gg, pool, &cpu_jobs, m.up.ty.code() as i32, m.down.ty.code() as i32, xh, g.n_ff_exp);
+                self.times.lock().unwrap().cpu_s += tc.elapsed().as_secs_f64();
+                let cb = self.arena.f32(g.latent)?;
+                cb.write(0, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+                self.add(&mo, &cb, g.latent)?;
+            }
+        }
+        lap("cpu experts");
         if matches!(m.up.home, Home::Cached) {
             let mut c = self.cache.as_ref().unwrap().lock().unwrap();
             c.pre_map.retain(|k, _| k.0 != m.layer);

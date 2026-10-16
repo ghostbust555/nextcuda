@@ -116,3 +116,22 @@ Load: 20 s + 15 s preload. Next: promote on a miss into VRAM (dynamic hot set), 
 reader threads, scratch for a prompt's misses, DMA staging for decode, routing guessed a layer ahead. Left: logit cosine against llama.cpp,
 reading further ahead (two MoE layers), dynamic promotion into VRAM, wiring the engine to the `Engine` contract and `nextcuda llm serve`,
 a model card, MTP (probably not worth it: a verify pass reads the union of its rows' experts).
+
+## Status (2026-10-16, night): served on :8000, prompt cache, two experiments that lost
+
+- **Served:** `llm/nemotronh` is behind the `Engine` contract (`engine.rs`: sessions, decode step, nextsycl's `NSNMH`
+  checkpoints); `nextcuda llm start | serve | stop | logs` run it as a native process; model card
+  `model-cards/llm/nemotron-3.5-super-iq1m.yml` (18 GiB pinned, 2 GiB prompt cache). The front door starts it on
+  `llm.chat` / `/v1/chat/completions`: checked end to end on brainiac-nvidia.
+- **Prompt cache:** checkpoints at each template's user-turn start (nextsycl's `USER_TURNS`; nextcuda only knew GLM's
+  `<|user|>`, so ChatML prompts never matched). Measured: a 1,314-token prompt 18.1 s, then 2.1 s with the same system
+  prompt; 454 tokens 11.5 s, then 2.8 s.
+- **Reading further ahead lost:** guesses for two or three MoE layers and wider (top 32-48) read wrong experts that push
+  right ones out of the pools: 2,000-token decode 7.6 -> 6.7 / 6.2 / 5.9 tok/s. Default stays one layer, top 22.
+- **The CPU's share lost here:** ggml-cpu (Strata's / nextsycl deepseek2's tier) multiplying part of each layer's pinned
+  experts in place: 8.4 tok/s with none, 7.2 / 7.0 / 6.8 at 30 / 50 / 70 % (the VM's 8 vCPUs do ~10 GB/s on a layer's
+  few experts; the x16 link copies at ~24). Kept, off (`NS_NH_CPU_FRAC`), for boxes with more cores or a slower link.
+- **Where the time is (profiled, 25 GiB):** ~115 ms a token: copies of pinned experts to VRAM ~38 ms (about 1 GB a token,
+  the link's limit), misses read and waited for ~42 ms (24 MB a token: latency, not bandwidth), Mamba 10, the rest ~25.
+  Next: a larger VRAM hot set (the prompt arena borrowed from it, Strata's trick, frees ~1 GB at decode), bigger prompt
+  chunks in that room, MTP.

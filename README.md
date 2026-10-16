@@ -9,7 +9,8 @@ We stand on the shoulders of giants.
 - **No Python** - Rust on the control side, CUDA ([stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s
   ggml-cuda kernels) on the GPU side; the model stays loaded between pictures
 - **Made for the cards people have** - Qwen-Image 2.1 and 2512 run from GGUF on a 12 GB card, weights streamed from
-  host memory per graph
+  host memory per graph; Nemotron 3.5 Super (120B, 43 GiB) chats on one 12 GB card, its experts streamed from
+  pinned host memory and the disk
 - **A single API control plane** - one service, `nextcuda.service`, answers on :8000 and starts a model server when a
   request names its model
 - **A Docker-style CLI** - `nextcuda <kind> start | stop | ps | logs | ...`, as a process, not a container
@@ -58,6 +59,46 @@ engine's VAE is 3x faster than ggml's and its steps are 1.7-2.3x slower, which i
 over PCIe on every prompt, so it costs 2.7 s on the 5070 and 7.8 s on the 3060's x1 link (a host-resident cache of
 the encoder is the fix). `docs/PHASES.md` has the history of the numbers.
 
+## Running the LLMs
+
+One engine so far: **Nemotron 3.5 Super 120B-A12B UD-IQ1_M** (`llm/nemotronh`; Mamba-2 + latent MoE + attention) on one
+12 GB card. The dense weights (5.8 GiB) and the experts wanted most stay in VRAM, a cache of experts in pinned host
+memory, the rest is read from the file as decode asks for it; the 3060 on its x1 link is not used.
+
+```sh
+nextcuda models pull nemotron-3.5-super-iq1m          # 46 GB, or --from DIR to link files you have
+nextcuda llm start nemotron-3.5-super-iq1m            # a process (pid, log in the socket directory), up in ~25 s
+nextcuda llm chat "What is the capital of France?"    # one request through the control socket, streamed
+nextcuda llm status                                   # the model, the card, the prompt cache
+nextcuda llm logs | nextcuda llm stop
+```
+
+The server speaks OpenAI's chat API on `127.0.0.1:8085` (`/v1/chat/completions`, `/v1/models`; `/api/chat` for a page);
+through the front door, `llm.chat` (or `/v1/chat/completions` on :8000) starts it when a request names the model:
+
+```sh
+curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/json' \
+     -d '{"model": "nemotron-3.5-super-iq1m", "max_tokens": 200, "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+- **Prompt cache:** the server checkpoints each prompt (every attention layer's keys and values, every Mamba layer's
+  state: ~175 MB + 8 KB a token) at the start of its first and last user turn and at its end, in host memory
+  (`NS_PROMPT_CACHE_MIB`, the card's 2048) and then on disk (`NS_CACHE_DIR`, default `~/.cache/nextcuda/prompts`).
+  A request that shares a system prompt or continues a chat reads only what is new: measured, a 1,314-token prompt
+  read in 18.1 s the first time took 2.1 s the second.
+- **The expert profile** (`expert-profile.txt` beside the model): which experts decode asked for. The next start fills
+  VRAM and the pinned cache by it, so the first runs of a new topic are slower than later ones.
+- **Memory:** `NS_NH_PINNED_GIB` is the biggest knob (the card sets 18; 25 gives about +20 % decode but leaves the
+  31 GB box little else). The prompt cache comes out of the same RAM.
+- **Speed on the 5070** (`nh --bench`, `docs/benchy/nemotron-3.5-super-iq1m.md`): decode 7.8-9.4 tok/s with 25 GiB
+  pinned (13-15 on a topic the profile knows), 6-7.5 with 22, about 5.5 with the card's 18; prompts 100-120 tok/s.
+- **Engine options** (`nextcuda llm engines`): `--opt-pinned-gib`, `--opt-chunk` (prompt rows a pass, 512),
+  `--opt-reserve-mib` (VRAM left free, 700). `NS_NH_CPU_FRAC` gives part of each layer's pinned experts to the CPU
+  (ggml-cpu, `libggml-base.so` / `libggml-cpu.so` beside the program) - measured slower here than the copies over
+  gen4 x16, so it is off.
+- **`nh`** (`llm/nemotronh/src/bin/nh.rs`): the engine without the server - `nh MODEL --prompt TEXT --n N`, or
+  `--bench 20,2000,8000 --new 128` for the numbers.
+
 ## Supported models
 
 | id | model | engine | on disk | status |
@@ -66,6 +107,7 @@ the encoder is the fix). `docs/PHASES.md` has the history of the numbers.
 | `qwen-image-2.1-q6k` | the same with a Q6_K transformer | `qwen-image-2.1` | 12.0 GiB | listed |
 | `qwen-image-2.1-rrq4` | [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs): a Q8_0 / Q6_K / Q5_K mix | `qwen-image-2.1` | 11.9 GiB | served, checked |
 | `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B Q4_K_M, its VAE and the Lightning 4-step LoRA | `qwen-image-2512` | 17.7 GiB | served, checked |
+| `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | `nemotron_h_moe` | 43.0 GiB | served (one 12 GB card, experts streamed) |
 
 The model cards are in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256).
 `nextcuda models pull <id> [--from DIR]...` downloads what is missing or hard-links a file already on the machine,
@@ -155,6 +197,8 @@ kernels/image/qwenimage21   the engine's own kernels (qi21.cu)
 kernels/image/sd      a flat C ABI over stable-diffusion.cpp's ggml-cuda: one loaded model, progress, cancel
 crates/core           the safe layer over libnextcuda-<kind>.so (host-memory fallback without it)
 image/qwenimage21     the engines: Qwen-Image 2.1 and 2512 behind nextcuda-image's contract
+kernels/llm/nemotronh, llm/nemotronh   Nemotron-H: Mamba-2, attention and Strata's i-quant products (CUDA), the
+                      engine behind nextcuda-llm's contract (llm/contract), its expert cache and reader threads
 glue/serve, glue/models, cli/nextcuda    the control plane, the registry and the program, as nextsycl's
 ```
 
@@ -166,8 +210,8 @@ end; `kernels/build.sh` builds the CUDA libraries with `nvcc` for the 3060 (sm_8
 
 ## What is not here yet
 
-llm, video (H3), speech and music, OCR and 3D: their contracts are in the tree and the control plane routes them,
-but no engine of ours runs them. The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
+Video (H3), speech and music, OCR and 3D: their contracts are in the tree and the control plane routes them, but no
+engine of ours runs them; of the llm engines only Nemotron-H is here (no MTP drafts yet). The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
 engine behind the same contracts (`docs/PHASES.md`); the python worker of phase 1 stays as a fallback until then.
 
 ## Clocking it
