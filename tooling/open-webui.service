@@ -1,0 +1,13 @@
+# ~/.config/systemd/user/open-webui.service: the Open WebUI container (made by tooling/open-webui.sh) with the box
+[Unit]
+Description=Open WebUI (chat front end; its models through nextcuda's front door on :8000)
+After=nextcuda.service
+
+[Service]
+ExecStart=/usr/bin/podman start -a open-webui
+ExecStop=/usr/bin/podman stop -t 10 open-webui
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

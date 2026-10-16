@@ -96,6 +96,10 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
   `--opt-reserve-mib` (VRAM left free, 700). `NS_NH_CPU_FRAC` gives part of each layer's pinned experts to the CPU
   (ggml-cpu, `libggml-base.so` / `libggml-cpu.so` beside the program) - measured slower here than the copies over
   gen4 x16, so it is off.
+- **Open WebUI:** `tooling/open-webui.sh` (re)makes its container (:3000, the `open-webui` volume kept) with the front
+  door's `/v1` and token as its OpenAI connection, and `tooling/open-webui.service` starts it with the box. The chat
+  model loads on the first message (~25 s) and unloads after `NS_IDLE_MINUTES`; the image models are listed too (they
+  do not chat). Set the connection's header `{"X-Keep-Up-S": "300"}` to keep the model up between messages.
 - **`nh`** (`llm/nemotronh/src/bin/nh.rs`): the engine without the server - `nh MODEL --prompt TEXT --n N`, or
   `--bench 20,2000,8000 --new 128` for the numbers.
 
