@@ -39,6 +39,12 @@ fn main() {
         eprintln!("load: {}", x.0);
         std::process::exit(1)
     });
+    let prof = std::path::PathBuf::from(path).with_file_name("expert-profile.txt");
+    if std::env::var("NS_NH_PRELOAD").map_or(true, |v| v != "0") {
+        if let Err(x) = m.preload(Some(&prof), &mut |s| eprintln!("{s}")) {
+            eprintln!("preload: {}", x.0);
+        }
+    }
     let tok = m.tokenizer().unwrap_or_else(|x| {
         eprintln!("tokenizer: {x}");
         std::process::exit(1)
@@ -60,12 +66,24 @@ fn main() {
         std::process::exit(1)
     });
     eprintln!("prompt read in {:.1} s ({:.1} tok/s)", t0.elapsed().as_secs_f64(), ids.len() as f64 / t0.elapsed().as_secs_f64());
+    eprintln!("prompt times: {:?}", m.times.lock().unwrap());
+    *m.times.lock().unwrap() = Default::default();
     let t1 = Instant::now();
     let mut out = Vec::new();
-    for _ in 0..n {
+    let (mut tl, mut hl) = (Instant::now(), m.cache_stats());
+    for i in 0..n {
+        if i > 0 && i % 16 == 0 {
+            let h = m.cache_stats();
+            eprintln!("\n[{i}: {:.2} tok/s, cache hits {} misses {}]", 16.0 / tl.elapsed().as_secs_f64(), h.0 - hl.0, h.1 - hl.1);
+            tl = Instant::now();
+            hl = h;
+        }
         let l = &logits[0];
         let next = l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|x| x.0 as u32).unwrap();
         out.push(next);
+        if tok.decode(&[next]).contains("<|im_end|>") && a.iter().all(|x| x != "--no-stop") {
+            break;
+        }
         print!("{}", tok.decode(&[next]));
         let _ = std::io::stdout().flush();
         logits = m.forward(&mut s, &[next], 1).unwrap_or_else(|x| {
@@ -74,5 +92,8 @@ fn main() {
         });
     }
     println!();
-    eprintln!("{} tokens in {:.1} s ({:.2} tok/s); {:?}", n, t1.elapsed().as_secs_f64(), n as f64 / t1.elapsed().as_secs_f64(), m.times.lock().unwrap());
+    if let Err(x) = m.save_profile(&prof) {
+        eprintln!("profile: {x}");
+    }
+    eprintln!("{} tokens in {:.1} s ({:.2} tok/s); {:?}; expert cache (hits, misses) {:?}", n, t1.elapsed().as_secs_f64(), n as f64 / t1.elapsed().as_secs_f64(), m.times.lock().unwrap(), m.cache_stats());
 }

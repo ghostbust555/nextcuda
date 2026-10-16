@@ -54,6 +54,9 @@ size_t ns_nh_q8_1_bytes(int64_t C, int64_t T);
 int ns_nh_quantize(ns_gpu* g, const float* x, int64_t T, int64_t C, void* out);
 /* y [ncols][n_out] = W [n_out][n_in] . xq [ncols] (W stored blocks of `type`, rows of n_in) */
 int ns_nh_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+/* the experts of a layer in one launch: entry j multiplies the weights at wptrs[j] (a device array of addresses; each [n_out][n_in]
+ * in `type`'s blocks) by Q8_1 row xrow[j] of xq: y [n_entries][n_out] */
+int ns_nh_mmvq_ptrs(ns_gpu* g, int type, const void* wptrs, const int32_t* xrow, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t n_entries);
 /* rows of a token embedding table (device or mapped host memory) as float32 */
 int ns_nh_embed(ns_gpu* g, int type, const void* table, int64_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd, float* out);
 

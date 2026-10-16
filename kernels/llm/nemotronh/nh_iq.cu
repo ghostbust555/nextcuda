@@ -8,6 +8,36 @@
 
 #include <cuda_fp16.h>
 
+// the experts of a layer in one launch: entry j multiplies the weights at wp[j] (rows of `row_bytes`) by the q8_1 row xrow[j]
+// of x (rows of n_in values), into row j of y (n_out floats)
+namespace strata::kernels {
+namespace {
+template<int TY>
+__global__ void __launch_bounds__(128) mmvq_ptrs_kernel(const unsigned long long* __restrict__ wp, size_t row_bytes, const int32_t* __restrict__ xrow,
+                                                        const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    if (row >= n_out) return;
+    const int j = blockIdx.y;
+    const uint8_t* wr = (const uint8_t*) wp[j] + (size_t) row * row_bytes;
+    const float s = row_dot<TY>(wr, x + (size_t) xrow[j] * (n_in / 32), n_in / Fmt<TY>::qk, threadIdx.x);
+    if (threadIdx.x == 0) y[(size_t) j * n_out + row] = s;
+}
+}  // namespace
+
+void iq_mmvq_ptrs(int t, const unsigned long long* wp, const int32_t* xrow, const void* x_q8_1, float* y, int n_in, int n_out, int n_entries, void* stream) {
+    const size_t rb = iq_row_bytes(t, n_in);
+    const dim3 grid((unsigned) ((n_out + 3) / 4), (unsigned) n_entries), block(32, 4);
+    cudaStream_t s = (cudaStream_t) stream;
+    switch (t) {
+#define NH_PTRS(T) case T: mmvq_ptrs_kernel<T><<<grid, block, 0, s>>>(wp, rb, xrow, (const block_q8_1*) x_q8_1, y, n_in, n_out); break;
+        STRATA_MMVQ_FMTS(NH_PTRS)
+#undef NH_PTRS
+        default: std::fprintf(stderr, "iq_mmvq_ptrs: type %d is not supported\n", t); std::exit(1);
+    }
+    check("iq_mmvq_ptrs");
+}
+}  // namespace strata::kernels
+
 namespace {
 
 // F32 / F16 / BF16 to float32, one thread a value
@@ -64,6 +94,16 @@ int ns_nh_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int
     NS_TRY
     if (!strata::kernels::iq_supported(type)) return ns_fail("ns_nh_mmvq: type " + std::to_string(type) + " is not one the products take");
     strata::kernels::iq_mmvq(type, w, xq, y, (int) n_in, (int) n_out, (int) ncols, g->q);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+int ns_nh_mmvq_ptrs(ns_gpu* g, int type, const void* wptrs, const int32_t* xrow, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t n_entries) {
+    NS_TRY
+    if (n_entries <= 0) return 0;
+    if (!strata::kernels::iq_supported(type)) return ns_fail("ns_nh_mmvq_ptrs: type " + std::to_string(type) + " is not one the products take");
+    strata::kernels::iq_mmvq_ptrs(type, (const unsigned long long*) wptrs, xrow, xq, y, (int) n_in, (int) n_out, (int) n_entries, g->q);
     NS_LAUNCH_CHECK();
     return 0;
     NS_CATCH

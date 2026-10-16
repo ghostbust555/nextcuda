@@ -14,8 +14,8 @@
 //!
 //! The weights stay in their GGUF blocks; every product goes through the Q8_1 kernels, a pass at most `DEC` rows. What
 //! does not change the answer, only where the bytes are: the dense weights and as many layers' experts as fit are in
-//! VRAM; the next layers' in pinned host memory, which the kernels read in place over PCIe; the rest on disk, read
-//! into a pinned staging buffer for the experts a pass chose.
+//! VRAM; the other layers' through a cache of pinned host memory (which the kernels read in place over PCIe) of the
+//! experts used lately, the misses read from the file.
 
 pub mod ffi;
 
@@ -160,10 +160,8 @@ pub struct Mat {
 /// Where a layer's experts are
 enum Home {
     Vram(DevBuf),
-    /// pinned host memory the kernels read in place (`view`)
-    Pinned(#[allow(dead_code)] HostBuf, DevBuf),
-    /// the file: the chosen experts are read into the staging buffer
-    Disk,
+    /// the file, through the expert cache: the experts a pass chose are in pinned host memory (read in place over PCIe)
+    Cached,
 }
 
 /// A layer's experts [n, rows, cols], each `stride` bytes
@@ -180,8 +178,7 @@ impl Experts {
     fn tier(&self) -> &'static str {
         match self.home {
             Home::Vram(_) => "VRAM",
-            Home::Pinned(..) => "pinned",
-            Home::Disk => "disk",
+            Home::Cached => "cached",
         }
     }
 }
@@ -205,6 +202,7 @@ struct Attn {
 }
 
 struct Moe {
+    layer: usize,
     router: Mat,
     /// the selection bias (exp_probs_b)
     bias: Vec<f32>,
@@ -291,10 +289,135 @@ pub struct NemotronH {
     output_norm: DevBuf,
     output: Mat,
     arena: Arena,
-    /// the disk-resident experts' staging (pinned), and its device view
-    staging: Option<(HostBuf, DevBuf, usize)>,
+    /// the experts of the layers not in VRAM: slots of pinned host memory, the recently used kept (LRU)
+    cache: Option<std::sync::Mutex<ExpertCache>>,
     pub times: std::sync::Mutex<Times>,
     pub load_s: f64,
+}
+
+type Key = (usize, usize, bool);
+
+/// Slots of one size (the stride of some layers' up or down matrices) of pinned host memory, the kernels reading in place
+struct Pool {
+    _host: HostBuf,
+    view: DevBuf,
+    stride: usize,
+    owner: Vec<Option<Key>>,
+    used: Vec<u64>,
+}
+
+/// The experts of the layers not in VRAM, a matrix (up or down) a slot of its size's pool: the used lately kept (LRU)
+struct ExpertCache {
+    pools: Vec<Pool>,
+    map: std::collections::HashMap<Key, (usize, usize)>,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    /// how often each matrix was wanted (the profile saved for the next start)
+    wanted: std::collections::HashMap<Key, u32>,
+}
+
+impl NemotronH {
+    /// Fill the cache before the first token: the matrices a saved profile says were wanted most, then the rest in file order,
+    /// until the pools are full (reads on a few threads). Returns the slots filled
+    pub fn preload(&self, profile: Option<&std::path::Path>, log: &mut dyn FnMut(String)) -> Result<usize> {
+        let Some(cache) = &self.cache else { return Ok(0) };
+        let t0 = Instant::now();
+        let mut want: std::collections::HashMap<Key, u32> = Default::default();
+        if let Some(text) = profile.and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in text.lines() {
+                let v: Vec<&str> = line.split_whitespace().collect();
+                if let [l, x, d, n] = v[..] {
+                    if let (Ok(l), Ok(x), Ok(d), Ok(n)) = (l.parse(), x.parse(), d.parse::<u8>(), n.parse()) {
+                        want.insert((l, x, d == 1), n);
+                    }
+                }
+            }
+        }
+        let have_profile = !want.is_empty();
+        let mut c = cache.lock().unwrap();
+        // (tensor name, expert, down, stride) of every cached matrix, by pool
+        let mut jobs: Vec<(usize, usize, usize, bool, usize)> = Vec::new(); // (layer, expert, slot-in-pool-encoded: pool, down, ...)
+        let mut cand: Vec<Vec<Key>> = vec![Vec::new(); c.pools.len()];
+        for (l, ly) in self.layers.iter().enumerate() {
+            if let Mix::Moe(m) = &ly.mix {
+                if !matches!(m.up.home, Home::Cached) {
+                    continue;
+                }
+                for (down, ex) in [(false, &m.up), (true, &m.down)] {
+                    let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
+                    cand[p].extend((0..self.g.experts).map(|x| (l, x, down)));
+                }
+            }
+        }
+        let mut filled = 0usize;
+        for (p, keys) in cand.iter_mut().enumerate() {
+            if have_profile {
+                keys.sort_by_key(|k| std::cmp::Reverse(want.get(k).copied().unwrap_or(0)));
+            }
+            let n = c.pools[p].owner.len().min(keys.len());
+            for (sl, key) in keys.iter().take(n).enumerate() {
+                c.pools[p].owner[sl] = Some(*key);
+                c.map.insert(*key, (p, sl));
+                jobs.push((key.0, key.1, p, key.2, sl));
+            }
+            filled += n;
+        }
+        let bases: Vec<usize> = c.pools.iter().map(|q| q._host.as_slice().as_ptr() as usize).collect();
+        let strides: Vec<usize> = c.pools.iter().map(|q| q.stride).collect();
+        drop(c);
+        let nt: usize = std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let err = std::sync::Mutex::new(None);
+        let mut by_layer: Vec<Vec<&(usize, usize, usize, bool, usize)>> = vec![Vec::new(); nt];
+        for (i, j) in jobs.iter().enumerate() {
+            by_layer[i % nt].push(j);
+        }
+        std::thread::scope(|sc| {
+            for part in &by_layer {
+                let (file, err, layers, bases, strides) = (&self.file, &err, &self.layers, &bases, &strides);
+                sc.spawn(move || {
+                    for &&(l, x, p, down, sl) in part {
+                        let Mix::Moe(m) = &layers[l].mix else { continue };
+                        let ex = if down { &m.down } else { &m.up };
+                        let Some(t) = file.tensor(&ex.name) else { continue };
+                        // SAFETY: the slot is inside its pool and owned by this job.
+                        let dst = unsafe { std::slice::from_raw_parts_mut((bases[p] + sl * strides[p]) as *mut u8, ex.stride) };
+                        if let Err(y) = file.read_into(t, (x * ex.stride) as u64, dst) {
+                            *err.lock().unwrap() = Some(y.0);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(y) = err.into_inner().unwrap() {
+            return Err(e(y));
+        }
+        log(format!("nemotronh: the cache preloaded with {filled} matrices ({}) in {:.1} s", if have_profile { "by the saved profile" } else { "in file order" }, t0.elapsed().as_secs_f64()));
+        Ok(filled)
+    }
+
+    /// The matrices wanted so far, to a file `preload` reads
+    pub fn save_profile(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let Some(cache) = &self.cache else { return Ok(()) };
+        let c = cache.lock().unwrap();
+        let mut v: Vec<(&Key, &u32)> = c.wanted.iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(*x.1));
+        let mut text = String::new();
+        for ((l, x, d), n) in v {
+            text += &format!("{l} {x} {} {n}\n", *d as u8);
+        }
+        std::fs::write(path, text)
+    }
+}
+
+/// (hits, misses) of the expert cache
+impl NemotronH {
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.cache.as_ref().map_or((0, 0), |c| {
+            let c = c.lock().unwrap();
+            (c.hits, c.misses)
+        })
+    }
 }
 
 fn plain(ty: GType) -> bool {
@@ -323,7 +446,6 @@ impl NemotronH {
         let dense = dense - f.tensor("token_embd.weight").map_or(0, |t| t.bytes);
         let reserve = o.reserve_mib << 20;
         let mut vram_left = free.saturating_sub(dense + reserve);
-        let mut pinned_left = (o.pinned_gib * (1u64 << 30) as f64) as u64;
         let mut homes = vec![0u8; g.layers]; // 0 VRAM, 1 pinned, 2 disk
         for l in 0..g.layers {
             if exp_bytes[l] == 0 {
@@ -331,16 +453,13 @@ impl NemotronH {
             }
             if exp_bytes[l] <= vram_left {
                 vram_left -= exp_bytes[l];
-            } else if exp_bytes[l] <= pinned_left {
-                homes[l] = 1;
-                pinned_left -= exp_bytes[l];
             } else {
                 homes[l] = 2;
             }
         }
         let n = |h: u8| (0..g.layers).filter(|l| exp_bytes[*l] > 0 && homes[*l] == h).count();
-        log(format!("nemotronh: {:.1} GiB dense + {:.1} GiB of experts in {} MoE layers; {:.1} GiB free on {}: experts of {} layers in VRAM, {} pinned, {} on disk",
-                    gib(dense), gib(exp_bytes.iter().sum()), g.count(Kind::Moe), gib(free), gpu.name, n(0), n(1), n(2)));
+        log(format!("nemotronh: {:.1} GiB dense + {:.1} GiB of experts in {} MoE layers; {:.1} GiB free on {}: experts of {} layers in VRAM, the other {} through the cache",
+                    gib(dense), gib(exp_bytes.iter().sum()), g.count(Kind::Moe), gib(free), gpu.name, n(0), n(2)));
 
         let mut layers = Vec::with_capacity(g.layers);
         let loaded = std::cell::Cell::new(0u64);
@@ -372,6 +491,7 @@ impl NemotronH {
                     let raw = f.read(bias_t).map_err(|x| e(x.0))?;
                     let bias: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                     let m = Moe {
+                        layer: l,
                         router,
                         bias,
                         to_latent: read(&w("ffn_latent_down"))?,
@@ -401,24 +521,36 @@ impl NemotronH {
         let output_norm = mat(&f, &gpu, k, "output_norm.weight", &loaded)?.buf;
         let output = mat(&f, &gpu, k, if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" }, &loaded)?;
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
-        // the disk-resident layers' staging: the most experts a pass can pick, the widest up + down
-        let widest = layers.iter().filter_map(|ly| match &ly.mix { Mix::Moe(m) if matches!(m.up.home, Home::Disk) => Some(m.up.stride + m.down.stride), _ => None }).max();
-        let staging = match widest {
-            Some(w) => {
-                let cap = DEC * g.used * w;
-                let mut hb = HostBuf::new(&gpu, cap)?;
-                let view = hb.device_view(0, cap)?;
-                Some((hb, view, w))
+        // the cache: a pool for each stride in use (up and down matrices of the layers outside VRAM), the pinned budget
+        // shared by the bytes each stride's tensors hold; at least a pass's worth of slots each
+        let mut by_stride: std::collections::BTreeMap<usize, u64> = Default::default();
+        for ly in &layers {
+            if let Mix::Moe(m) = &ly.mix {
+                if matches!(m.up.home, Home::Cached) {
+                    for x in [&m.up, &m.down] {
+                        *by_stride.entry(x.stride).or_default() += (x.stride * g.experts) as u64;
+                    }
+                }
             }
-            None => None,
-        };
+        }
+        let total: u64 = by_stride.values().sum();
+        let budget = (o.pinned_gib * (1u64 << 30) as f64) as u64;
+        let mut pools = Vec::new();
+        for (&stride, &bytes) in &by_stride {
+            let n = ((budget as f64 * bytes as f64 / total as f64) as usize / stride).clamp(DEC * g.used, (bytes as usize) / stride);
+            let mut hb = HostBuf::new(&gpu, n * stride)?;
+            let view = hb.device_view(0, n * stride)?;
+            log(format!("nemotronh: expert cache: {n} slots of {:.2} MiB ({:.1} GiB of {:.1} GiB)", stride as f64 / 1048576.0, gib((n * stride) as u64), gib(bytes)));
+            pools.push(Pool { _host: hb, view, stride, owner: vec![None; n], used: vec![0; n] });
+        }
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default() })) };
         let arena = Arena::new(&gpu, 160 << 20)?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, staging, times: Default::default(), load_s })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, times: Default::default(), load_s })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -555,13 +687,17 @@ impl NemotronH {
         Ok(out)
     }
 
-    /// The device address of expert `x`'s block of `ex` (a disk-resident one: its slot in the staging buffer)
-    fn expert_at(&self, ex: &Experts, x: usize, slot: usize, off: usize) -> *const c_void {
-        // SAFETY: inside the tensor / the staging buffer (callers' counts).
+    /// The device address of expert `x`'s matrix `ex` (of layer `l`; up or down)
+    fn expert_at(&self, ex: &Experts, l: usize, down: bool, x: usize) -> *const c_void {
+        // SAFETY: inside the tensor / the cache (callers' counts).
         unsafe {
             match &ex.home {
-                Home::Vram(b) | Home::Pinned(_, b) => b.ptr().cast::<u8>().add(x * ex.stride).cast(),
-                Home::Disk => self.staging.as_ref().unwrap().1.ptr().cast::<u8>().add(slot * self.staging.as_ref().unwrap().2 + off).cast(),
+                Home::Vram(b) => b.ptr().cast::<u8>().add(x * ex.stride).cast(),
+                Home::Cached => {
+                    let c = self.cache.as_ref().unwrap().lock().unwrap();
+                    let (p, sl) = c.map[&(l, x, down)];
+                    c.pools[p].view.ptr().cast::<u8>().add(sl * ex.stride).cast()
+                }
             }
         }
     }
@@ -597,51 +733,99 @@ impl NemotronH {
                 ent.push((r, i, x * g.w_scale));
             }
         }
-        // the experts' bytes where the kernels can read them: disk-resident ones into the staging slots
+        // the experts' bytes where the kernels can read them: those of a cached layer into slots (the least recently
+        // used given up), the misses read from the file on a few threads
         let tf = Instant::now();
-        let mut slot_of = std::collections::HashMap::new();
-        if matches!(m.up.home, Home::Disk) {
-            let (hb, _, w) = self.staging.as_ref().unwrap();
-            let base = hb.as_slice().as_ptr() as *mut u8;
-            let (tu, td) = (self.file.tensor(&m.up.name).unwrap(), self.file.tensor(&m.down.name).unwrap());
+        if matches!(m.up.home, Home::Cached) {
+            let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+            c.clock += 1;
+            let clock = c.clock;
+            // (matrix is down, expert, the pool's host base + slot)
+            let mut jobs: Vec<(bool, usize, usize)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for (_, x, _) in &ent {
-                if slot_of.contains_key(x) {
+                if !seen.insert(*x) {
                     continue;
                 }
-                let s = slot_of.len();
-                slot_of.insert(*x, s);
-                // SAFETY: the slot is inside the staging buffer (DEC * used slots of w bytes); nothing else touches it now.
-                let dst = unsafe { std::slice::from_raw_parts_mut(base.add(s * w), *w) };
-                let (a, b) = dst.split_at_mut(m.up.stride);
-                self.file.read_into(tu, (*x * m.up.stride) as u64, a).map_err(|y| e(y.0))?;
-                self.file.read_into(td, (*x * m.down.stride) as u64, &mut b[..m.down.stride]).map_err(|y| e(y.0))?;
+                for (down, ex) in [(false, &m.up), (true, &m.down)] {
+                    let key = (m.layer, *x, down);
+                    *c.wanted.entry(key).or_default() += 1;
+                    if let Some(&(p, sl)) = c.map.get(&key) {
+                        c.pools[p].used[sl] = clock;
+                        c.hits += 1;
+                        continue;
+                    }
+                    let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
+                    let sl = (0..c.pools[p].used.len()).min_by_key(|i| c.pools[p].used[*i]).unwrap();
+                    if let Some(old) = c.pools[p].owner[sl].take() {
+                        c.map.remove(&old);
+                    }
+                    c.pools[p].owner[sl] = Some(key);
+                    c.pools[p].used[sl] = clock;
+                    c.map.insert(key, (p, sl));
+                    c.misses += 1;
+                    jobs.push((down, *x, c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride));
+                }
+            }
+            if !jobs.is_empty() {
+                let (tu, td) = (self.file.tensor(&m.up.name).unwrap(), self.file.tensor(&m.down.name).unwrap());
+                let (us, ds) = (m.up.stride, m.down.stride);
+                let nt = jobs.len().clamp(1, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
+                let err = std::sync::Mutex::new(None);
+                std::thread::scope(|sc| {
+                    for part in jobs.chunks(jobs.len().div_ceil(nt)) {
+                        let (file, err) = (&self.file, &err);
+                        sc.spawn(move || {
+                            for &(down, x, at) in part {
+                                let (t, st) = if down { (td, ds) } else { (tu, us) };
+                                // SAFETY: the slot is inside its pool; each job owns its slot while the pass runs.
+                                let dst = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, st) };
+                                if let Err(y) = file.read_into(t, (x * st) as u64, dst) {
+                                    *err.lock().unwrap() = Some(y.0);
+                                }
+                            }
+                        });
+                    }
+                });
+                if let Some(y) = err.into_inner().unwrap() {
+                    return Err(e(y));
+                }
             }
         }
         self.times.lock().unwrap().moe_fetch += tf.elapsed().as_secs_f64();
         let latq = self.quantize(lat.fp(), g.latent, t)?;
         // SAFETY: arithmetic only.
-        let (lq, uq) = unsafe { ((k.q8_1_bytes)(g.latent as i64, 1), (k.q8_1_bytes)(g.n_ff_exp as i64, 1)) };
         let u = self.arena.f32(n_e * g.n_ff_exp)?;
-        for (j, (r, x, _)) in ent.iter().enumerate() {
-            let slot = slot_of.get(x).copied().unwrap_or(0);
-            let w = self.expert_at(&m.up, *x, slot, 0);
-            // SAFETY: expert x's up [n_ff, latent] in its blocks, token r's latent Q8_1, its row of u.
-            self.op("expert up", || unsafe {
-                (k.mmvq)(self.raw(), m.up.ty.code() as i32, w, latq.buf.ptr().cast::<u8>().add(r * lq).cast(), u.fp().add(j * g.n_ff_exp), g.latent as i64, g.n_ff_exp as i64, 1)
-            })?;
+        // the experts' addresses and the activation rows, in one upload: up's pointers | down's | the tokens' rows | 0..n_e
+        let mut ptrs: Vec<u8> = Vec::with_capacity(n_e * 24);
+        for (_, x, _) in &ent {
+            ptrs.extend_from_slice(&(self.expert_at(&m.up, m.layer, false, *x) as u64).to_le_bytes());
         }
+        for (_, x, _) in &ent {
+            ptrs.extend_from_slice(&(self.expert_at(&m.down, m.layer, true, *x) as u64).to_le_bytes());
+        }
+        for (r, _, _) in &ent {
+            ptrs.extend_from_slice(&(*r as i32).to_le_bytes());
+        }
+        for j in 0..n_e {
+            ptrs.extend_from_slice(&(j as i32).to_le_bytes());
+        }
+        let pb = self.arena.bytes(ptrs.len())?;
+        pb.write(0, &ptrs)?;
+        let (up_p, down_p) = (pb.ptr().cast_const(), unsafe { pb.ptr().cast::<u8>().add(n_e * 8).cast_const() });
+        let (rows_p, seq_p) = unsafe { (pb.ptr().cast::<u8>().add(n_e * 16).cast::<i32>().cast_const(), pb.ptr().cast::<u8>().add(n_e * 16 + n_e * 4).cast::<i32>().cast_const()) };
+        // SAFETY: n_e experts' up [n_ff, latent] in their blocks, the tokens' latent Q8_1 rows, u [n_e][n_ff].
+        self.op("expert up", || unsafe {
+            (k.mmvq_ptrs)(self.raw(), m.up.ty.code() as i32, up_p.cast(), rows_p, latq.buf.ptr(), u.fp(), g.latent as i64, g.n_ff_exp as i64, n_e as i64)
+        })?;
         // SAFETY: n floats.
         self.op("relu2", || unsafe { (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64) })?;
         let uq8 = self.quantize(u.fp(), g.n_ff_exp, n_e)?;
         let dn = self.arena.f32(n_e * g.latent)?;
-        for (j, (_, x, _)) in ent.iter().enumerate() {
-            let slot = slot_of.get(x).copied().unwrap_or(0);
-            let w = self.expert_at(&m.down, *x, slot, m.up.stride);
-            // SAFETY: expert x's down [latent, n_ff] in its blocks, entry j's Q8_1, its row of dn.
-            self.op("expert down", || unsafe {
-                (k.mmvq)(self.raw(), m.down.ty.code() as i32, w, uq8.buf.ptr().cast::<u8>().add(j * uq).cast(), dn.fp().add(j * g.latent), g.n_ff_exp as i64, g.latent as i64, 1)
-            })?;
-        }
+        // SAFETY: the experts' down [latent, n_ff], entry j's Q8_1 row, dn [n_e][latent].
+        self.op("expert down", || unsafe {
+            (k.mmvq_ptrs)(self.raw(), m.down.ty.code() as i32, down_p.cast(), seq_p, uq8.buf.ptr(), dn.fp(), g.n_ff_exp as i64, g.latent as i64, n_e as i64)
+        })?;
         // the weighted sum per token (entries in token order)
         let mut tp = vec![0i32; t + 1];
         for (r, _, _) in &ent {
@@ -776,7 +960,7 @@ fn mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &std::cell::C
     Ok(Mat { buf, ty: t.ty, rows, cols })
 }
 
-/// A layer's stacked experts [experts, rows, cols] where `home` says (0 VRAM, 1 pinned host memory, 2 the file)
+/// A layer's stacked experts [experts, rows, cols] where `home` says (0 VRAM, 2 the file through the cache)
 fn experts(f: &Gguf, gpu: &Arc<Gpu>, name: &str, home: u8, loaded: &std::cell::Cell<u64>) -> Result<Experts> {
     let t = f.tensor(name).ok_or_else(|| e(format!("no {name}")))?;
     if t.shape.len() != 3 {
@@ -788,14 +972,7 @@ fn experts(f: &Gguf, gpu: &Arc<Gpu>, name: &str, home: u8, loaded: &std::cell::C
         return Err(e(format!("{name}: {} bytes, not {n} experts of {stride}", t.bytes)));
     }
     let h = match home {
-        2 => Home::Disk,
-        1 => {
-            let mut pin = HostBuf::new(gpu, t.bytes as usize)?;
-            f.read_into(t, 0, pin.as_mut_slice()).map_err(|x| e(x.0))?;
-            let view = pin.device_view(0, t.bytes as usize)?;
-            loaded.set(loaded.get() + t.bytes);
-            Home::Pinned(pin, view)
-        }
+        2 => Home::Cached,
         _ => {
             // in slices: no host copy of the whole tensor
             let buf = DevBuf::new(gpu, t.bytes as usize)?;

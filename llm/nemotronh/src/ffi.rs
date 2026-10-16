@@ -27,6 +27,7 @@ pub struct Api {
     pub q8_1_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     pub quantize: unsafe extern "C" fn(G, F, i64, i64, M) -> c_int,
     pub mmvq: unsafe extern "C" fn(G, c_int, P, P, FM, i64, i64, i64) -> c_int,
+    pub mmvq_ptrs: unsafe extern "C" fn(G, c_int, P, *const i32, P, FM, i64, i64, i64) -> c_int,
     pub embed: unsafe extern "C" fn(G, c_int, P, i64, *const i32, i64, i64, FM) -> c_int,
 }
 
@@ -69,6 +70,7 @@ pub fn api() -> nextcuda_core::Result<&'static Api> {
             q8_1_bytes: sym!("ns_nh_q8_1_bytes"),
             quantize: sym!("ns_nh_quantize"),
             mmvq: sym!("ns_nh_mmvq"),
+            mmvq_ptrs: sym!("ns_nh_mmvq_ptrs"),
             embed: sym!("ns_nh_embed"),
         })
     })
