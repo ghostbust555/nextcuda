@@ -255,6 +255,13 @@ pub struct Times {
     /// seconds in the reader threads and the bytes they read
     pub io_s: f64,
     pub io_bytes: u64,
+    /// NS_NH_PREDICT=1: routing of the next MoE layer guessed from the residual stream: the experts guessed right / chosen
+    pub pred_wait: f64,
+    /// matrices served from the guessed experts' buffer / copied at the layer
+    pub pre_hit: u64,
+    pub stage_copy: u64,
+    pub pred_right: u64,
+    pub pred_total: u64,
     /// NS_NH_PROFILE=1: a MoE layer's parts (seconds, each waited for)
     pub parts: std::collections::BTreeMap<&'static str, f64>,
 }
@@ -291,7 +298,7 @@ impl Default for Options {
             gpu: env("NS_NH_GPU").and_then(|v| v.parse().ok()).unwrap_or(0),
             ctx: env("NS_NH_CTX").and_then(|v| v.parse().ok()).unwrap_or(4096),
             pinned_gib: env("NS_NH_PINNED_GIB").and_then(|v| v.parse().ok()).unwrap_or(14.0),
-            reserve_mib: env("NS_NH_RESERVE_MIB").and_then(|v| v.parse().ok()).unwrap_or(1800),
+            reserve_mib: env("NS_NH_RESERVE_MIB").and_then(|v| v.parse().ok()).unwrap_or(700),
             profile: None,
             stage: env("NS_NH_STAGE").map_or(true, |v| v != "0"),
             scratch_mib: env("NS_NH_SCRATCH_MIB").and_then(|v| v.parse().ok()).unwrap_or(1024),
@@ -312,8 +319,12 @@ pub struct NemotronH {
     arena: Arena,
     /// the experts of the layers not in VRAM: slots of pinned host memory, the recently used kept (LRU)
     cache: Option<std::sync::Mutex<ExpertCache>>,
-    direct: Option<Direct>,
+    io: Io,
+    /// reads started for the next MoE layer from a guess at its routing, by layer
+    inflight: std::sync::Mutex<std::collections::HashMap<usize, Arc<Pending>>>,
     chunk: usize,
+    predict: bool,
+    pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
     /// the largest dense matrix as half (the prompt passes' GEMMs), and the rows from which they are used
     w16: Option<DevBuf>,
     dense_gemm_min: usize,
@@ -355,6 +366,15 @@ struct ExpertCache {
     stage: Option<DevBuf>,
     stage_used: usize,
     stage_map: std::collections::HashMap<Key, usize>,
+    /// two VRAM buffers the next MoE layer's guessed experts are copied into (on the copy lane) while this layer computes
+    pre: Vec<DevBuf>,
+    pre_used: [usize; 2],
+    pre_map: std::collections::HashMap<Key, (usize, usize)>,
+    /// by layer: the copy lane's ticket after its copies, and the buffer they went to
+    pre_ticket: std::collections::HashMap<usize, (i64, usize)>,
+    /// by buffer: a ticket after the kernels that last read it (the next copies into it wait for that)
+    pre_done: [i64; 2],
+    pre_ring: usize,
 }
 
 impl NemotronH {
@@ -431,36 +451,12 @@ impl NemotronH {
         let bases: Vec<usize> = c.pools.iter().map(|q| q._host.as_slice().as_ptr() as usize).collect();
         let strides: Vec<usize> = c.pools.iter().map(|q| q.stride).collect();
         drop(c);
-        let nt: usize = std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-        let err = std::sync::Mutex::new(None);
-        let mut by_layer: Vec<Vec<&(usize, usize, usize, bool, usize)>> = vec![Vec::new(); nt];
-        for (i, j) in jobs.iter().enumerate() {
-            by_layer[i % nt].push(j);
-        }
-        std::thread::scope(|sc| {
-            for part in &by_layer {
-                let (file, err, layers, bases, strides, direct) = (&self.file, &err, &self.layers, &bases, &strides, &self.direct);
-                sc.spawn(move || {
-                    for &&(l, x, p, down, sl) in part {
-                        let Mix::Moe(m) = &layers[l].mix else { continue };
-                        let ex = if down { &m.down } else { &m.up };
-                        let Some(t) = file.tensor(&ex.name) else { continue };
-                        // SAFETY: the slot is inside its pool and owned by this job.
-                        let dst = unsafe { std::slice::from_raw_parts_mut((bases[p] + sl * strides[p]) as *mut u8, ex.stride) };
-                        let r = match direct {
-                            Some(d) => d.read(t, (x * ex.stride) as u64, dst).map_err(|y| y.to_string()),
-                            None => file.read_into(t, (x * ex.stride) as u64, dst).map_err(|y| y.0),
-                        };
-                        if let Err(y) = r {
-                            *err.lock().unwrap() = Some(y);
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(y) = err.into_inner().unwrap() {
-            return Err(e(y));
-        }
+        let reqs: Vec<IoReq> = jobs.iter().filter_map(|&(l, x, p, down, sl)| {
+            let Mix::Moe(m) = &self.layers[l].mix else { return None };
+            let ex = if down { &m.down } else { &m.up };
+            Some(self.req(ex, x, bases[p] + sl * strides[p]))
+        }).collect();
+        self.io.run(&reqs).map_err(e)?;
         // the hot matrices into VRAM, in chunks through a host buffer
         if !hot_jobs.is_empty() {
             let hb = {
@@ -479,31 +475,12 @@ impl NemotronH {
                 }
                 let part = &hot_jobs[i..j];
                 let sbase = stage.as_mut_ptr() as usize;
-                let err2 = std::sync::Mutex::new(None);
-                std::thread::scope(|sc| {
-                    for q in part.chunks(part.len().div_ceil(nt).max(1)) {
-                        let (file, layers, err2, direct) = (&self.file, &self.layers, &err2, &self.direct);
-                        sc.spawn(move || {
-                            for &((l, x, down), st, off) in q {
-                                let Mix::Moe(m) = &layers[l].mix else { continue };
-                                let ex = if down { &m.down } else { &m.up };
-                                let Some(t) = file.tensor(&ex.name) else { continue };
-                                // SAFETY: each job owns its [off - start, +st) of the staging buffer.
-                                let dst = unsafe { std::slice::from_raw_parts_mut((sbase + off - start) as *mut u8, st) };
-                                let r = match direct {
-                                    Some(d) => d.read(t, (x * st) as u64, dst).map_err(|y| y.to_string()),
-                                    None => file.read_into(t, (x * st) as u64, dst).map_err(|y| y.0),
-                                };
-                                if let Err(y) = r {
-                                    *err2.lock().unwrap() = Some(y);
-                                }
-                            }
-                        });
-                    }
-                });
-                if let Some(y) = err2.into_inner().unwrap() {
-                    return Err(e(y));
-                }
+                let reqs: Vec<IoReq> = part.iter().filter_map(|&((l, x, down), _, off)| {
+                    let Mix::Moe(m) = &self.layers[l].mix else { return None };
+                    let ex = if down { &m.down } else { &m.up };
+                    Some(self.req(ex, x, sbase + off - start))
+                }).collect();
+                self.io.run(&reqs).map_err(e)?;
                 let end = part.last().map(|q| q.2 + q.1).unwrap();
                 hb.write(start, &stage[..end - start])?;
                 i = j;
@@ -512,6 +489,106 @@ impl NemotronH {
         }
         log(format!("nemotronh: the cache preloaded with {filled} matrices ({}) in {:.1} s", if have_profile { "by the saved profile" } else { "in file order" }, t0.elapsed().as_secs_f64()));
         Ok(filled)
+    }
+
+    /// While layer `l` (a MoE layer) is about to run: a guess at the next MoE layer's routing - its router on the residual stream as
+    /// it is now (80% of the experts it will choose, measured) - and the reads of what that layer will need and the cache lacks
+    /// started now, to be waited for when it runs
+    fn predict_next(&self, l: usize, x: &DevBuf) -> Result<()> {
+        let g = &self.g;
+        let Some(l2) = (l + 1..g.layers).find(|i| g.kinds[*i] == Kind::Moe) else { return Ok(()) };
+        let Mix::Moe(m2) = &self.layers[l2].mix else { return Ok(()) };
+        if !matches!(m2.up.home, Home::Cached) {
+            return Ok(());
+        }
+        let mark = self.arena.mark();
+        let hh = self.arena.f32(g.n_embd)?;
+        self.rms(x, &self.layers[l2].norm, &hh, 1, g.n_embd)?;
+        let lg2 = self.arena.f32(g.experts)?;
+        self.matmul(&m2.router, &hh, None, 1, &lg2)?;
+        let v = lg2.to_f32()?;
+        self.arena.rewind(mark);
+        let mut idx: Vec<usize> = (0..g.experts).collect();
+        let sc = |i: usize| 1.0 / (1.0 + (-v[i]).exp()) + m2.bias[i];
+        idx.sort_by(|a, b| sc(*b).total_cmp(&sc(*a)).then(a.cmp(b)));
+        idx.truncate(g.used);
+        self.pred.lock().unwrap().insert(l2, idx.clone());
+        let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+        let clock = c.clock;
+        let mut reqs: Vec<IoReq> = Vec::new();
+        for x in idx {
+            for (down, ex) in [(false, &m2.up), (true, &m2.down)] {
+                let key = (l2, x, down);
+                if c.hot.contains_key(&key) {
+                    continue;
+                }
+                if let Some(&(p, sl)) = c.map.get(&key) {
+                    c.pools[p].used[sl] = clock;
+                    continue;
+                }
+                let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
+                let sl = (0..c.pools[p].used.len()).min_by_key(|i| c.pools[p].used[*i]).unwrap();
+                if c.pools[p].used[sl] >= clock {
+                    continue; // nothing older to give up
+                }
+                if let Some(old) = c.pools[p].owner[sl].take() {
+                    c.map.remove(&old);
+                }
+                c.pools[p].owner[sl] = Some(key);
+                c.pools[p].used[sl] = clock;
+                c.map.insert(key, (p, sl));
+                c.misses += 1;
+                reqs.push(self.req(ex, x, c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride));
+            }
+        }
+        // the guessed experts already in pinned memory (not those just queued to be read) copied toward VRAM now, on the copy lane,
+        // after the kernels that last read the buffer
+        if !c.pre.is_empty() {
+            let b = c.pre_ring;
+            c.pre_ring = 1 - b;
+            c.pre_used[b] = 0;
+            let cap = c.pre[b].len;
+            let fresh: std::collections::HashSet<usize> = reqs.iter().map(|r| r.3).collect();
+            let after: Vec<i64> = if c.pre_done[b] >= 0 { vec![c.pre_done[b]] } else { Vec::new() };
+            let api = nextcuda_core::api()?;
+            let mut last = -1i64;
+            for x in self.pred.lock().unwrap().get(&l2).cloned().unwrap_or_default() {
+                for (down, ex) in [(false, &m2.up), (true, &m2.down)] {
+                    let key = (l2, x, down);
+                    if c.hot.contains_key(&key) || c.pre_used[b] + ex.stride > cap {
+                        continue;
+                    }
+                    let Some(&(p, sl)) = c.map.get(&key) else { continue };
+                    let src = c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride;
+                    if fresh.contains(&src) {
+                        continue;
+                    }
+                    let off = c.pre_used[b];
+                    c.pre_used[b] += (ex.stride + 255) & !255;
+                    let mut ticket = 0i64;
+                    // SAFETY: a pinned slot of ex.stride bytes into the buffer's [off, off + stride), on the copy lane after the ticket.
+                    let dst = unsafe { c.pre[b].ptr().cast::<u8>().add(off) };
+                    ffi::check(unsafe { (api.stream_copy)(self.raw(), dst.cast(), src as *const c_void, ex.stride, after.as_ptr(), after.len() as i32, 0, &mut ticket) }, "copying a guessed expert")?;
+                    last = ticket;
+                    c.pre_map.insert(key, (b, off));
+                }
+            }
+            if last >= 0 {
+                c.pre_ticket.insert(l2, (last, b));
+            }
+        }
+        drop(c);
+        if !reqs.is_empty() {
+            let p = self.io.submit(&reqs);
+            self.inflight.lock().unwrap().insert(l2, p);
+        }
+        Ok(())
+    }
+
+    /// The read of expert `x`'s matrix of `ex` into `dst`
+    fn req(&self, ex: &Experts, x: usize, dst: usize) -> IoReq {
+        let t = self.file.tensor(&ex.name).unwrap();
+        (t.shard, t.offset + (x * ex.stride) as u64, ex.stride, dst)
     }
 
     /// The matrices wanted so far, to a file `preload` reads
@@ -554,65 +631,142 @@ impl NemotronH {
     }
 }
 
-/// The model's files opened for direct reads (O_DIRECT: past the page cache, which holds the same bytes the cache pools do
-/// and slows the reads; many in flight, an NVMe's speed)
-struct Direct {
-    files: Vec<std::fs::File>,
+/// A read of the model's files: (file of the split, absolute offset, bytes, destination address)
+type IoReq = (usize, u64, usize, usize);
+
+/// A batch of reads in flight
+struct Pending {
+    left: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+    err: std::sync::Mutex<Option<String>>,
 }
 
-impl Direct {
-    fn open(f: &Gguf) -> Option<Direct> {
-        use std::os::unix::fs::OpenOptionsExt;
-        if std::env::var("NS_NH_DIRECT").is_ok_and(|v| v == "0") {
-            return None;
+impl Pending {
+    fn wait(&self) -> std::result::Result<(), String> {
+        let mut l = self.left.lock().unwrap();
+        while *l > 0 {
+            l = self.cv.wait(l).unwrap();
         }
-        let files: std::io::Result<Vec<_>> = f.paths.iter().map(|p| std::fs::OpenOptions::new().read(true).custom_flags(0x4000).open(p)).collect();
-        files.ok().map(|files| Direct { files })
+        match self.err.lock().unwrap().take() {
+            Some(x) => Err(x),
+            None => Ok(()),
+        }
     }
+}
 
-    /// bytes [at, at + dst.len()) of tensor `t`
-    fn read(&self, t: &Tensor, at: u64, dst: &mut [u8]) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        let abs = t.offset + at;
-        let start = abs & !4095;
-        let end = (abs + dst.len() as u64 + 4095) & !4095;
-        let n = (end - start) as usize;
-        let layout = std::alloc::Layout::from_size_align(n, 4096).unwrap();
-        // SAFETY: a non-zero layout; freed below.
-        let p = unsafe { std::alloc::alloc(layout) };
-        if p.is_null() {
-            return Err(std::io::Error::other("no memory for a direct read"));
+/// Reader threads over the model's files, opened for direct reads (O_DIRECT: past the page cache, which holds the same
+/// bytes the cache pools do and slows the reads; many in flight, an NVMe's speed) unless NS_NH_DIRECT=0. A batch is
+/// submitted and waited for later, so reads can run while the GPU computes.
+struct Io {
+    tx: std::sync::mpsc::Sender<(IoReq, Arc<Pending>)>,
+}
+
+struct AlignedBuf {
+    p: *mut u8,
+    cap: usize,
+}
+
+impl AlignedBuf {
+    fn get(&mut self, n: usize) -> &mut [u8] {
+        if self.cap < n {
+            if !self.p.is_null() {
+                // SAFETY: allocated below with this layout.
+                unsafe { std::alloc::dealloc(self.p, std::alloc::Layout::from_size_align(self.cap, 4096).unwrap()) };
+            }
+            let cap = n.next_multiple_of(1 << 20);
+            // SAFETY: a non-zero layout.
+            self.p = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(cap, 4096).unwrap()) };
+            self.cap = cap;
         }
-        // SAFETY: n bytes were allocated.
-        let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
-        // the file may end inside the last block: read what is there
-        let mut got = 0usize;
-        let r = loop {
-            match self.files[t.shard].read_at(&mut buf[got..], start + got as u64) {
-                Ok(0) => break Ok(()),
-                Ok(k) => {
-                    got += k;
-                    if got >= n {
-                        break Ok(());
+        // SAFETY: cap >= n bytes were allocated.
+        unsafe { std::slice::from_raw_parts_mut(self.p, n) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        if !self.p.is_null() {
+            // SAFETY: allocated in `get` with this layout.
+            unsafe { std::alloc::dealloc(self.p, std::alloc::Layout::from_size_align(self.cap, 4096).unwrap()) };
+        }
+    }
+}
+
+// SAFETY: a plain allocation owned by one thread.
+unsafe impl Send for AlignedBuf {}
+
+impl Io {
+    fn new(f: &Gguf, nthreads: usize) -> Io {
+        use std::os::unix::fs::OpenOptionsExt;
+        let direct: Option<Vec<std::fs::File>> = if std::env::var("NS_NH_DIRECT").is_ok_and(|v| v == "0") {
+            None
+        } else {
+            f.paths.iter().map(|p| std::fs::OpenOptions::new().read(true).custom_flags(0x4000).open(p)).collect::<std::io::Result<Vec<_>>>().ok()
+        };
+        let buffered: Vec<std::fs::File> = f.paths.iter().map(|p| std::fs::File::open(p).expect("the model file")).collect();
+        let files = Arc::new((direct, buffered));
+        let (tx, rx) = std::sync::mpsc::channel::<(IoReq, Arc<Pending>)>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..nthreads {
+            let (rx, files) = (rx.clone(), files.clone());
+            std::thread::spawn(move || {
+                let mut buf = AlignedBuf { p: std::ptr::null_mut(), cap: 0 };
+                loop {
+                    let job = rx.lock().unwrap().recv();
+                    let Ok((req, pend)) = job else { break };
+                    if let Err(x) = Io::read(&files, &mut buf, req) {
+                        *pend.err.lock().unwrap() = Some(x);
+                    }
+                    let mut l = pend.left.lock().unwrap();
+                    *l -= 1;
+                    if *l == 0 {
+                        pend.cv.notify_all();
                     }
                 }
-                Err(x) if x.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(x) => break Err(x),
-            }
+            });
+        }
+        Io { tx }
+    }
+
+    fn read(files: &(Option<Vec<std::fs::File>>, Vec<std::fs::File>), buf: &mut AlignedBuf, (shard, abs, len, dst): IoReq) -> std::result::Result<(), String> {
+        use std::os::unix::fs::FileExt;
+        // SAFETY: the destination is a slot or buffer of `len` bytes that the submitter keeps and does not touch until the batch is waited for.
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+        let Some(direct) = &files.0 else {
+            return files.1[shard].read_exact_at(dst, abs).map_err(|x| x.to_string());
         };
+        let start = abs & !4095;
+        let end = (abs + len as u64 + 4095) & !4095;
+        let n = (end - start) as usize;
+        let b = buf.get(n);
+        let mut got = 0usize;
+        while got < n {
+            match direct[shard].read_at(&mut b[got..], start + got as u64) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(x) if x.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(x) => return Err(x.to_string()),
+            }
+        }
         let skip = (abs - start) as usize;
-        let ok = r.is_ok() && got >= skip + dst.len();
-        if ok {
-            dst.copy_from_slice(&buf[skip..skip + dst.len()]);
+        if got < skip + len {
+            return Err("a direct read came up short".into());
         }
-        // SAFETY: allocated above with this layout.
-        unsafe { std::alloc::dealloc(p, layout) };
-        r?;
-        if ok {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("a direct read came up short"))
+        dst.copy_from_slice(&b[skip..skip + len]);
+        Ok(())
+    }
+
+    /// Queue the reads; wait on the result when the bytes are needed
+    fn submit(&self, reqs: &[IoReq]) -> Arc<Pending> {
+        let pend = Arc::new(Pending { left: std::sync::Mutex::new(reqs.len()), cv: std::sync::Condvar::new(), err: std::sync::Mutex::new(None) });
+        for r in reqs {
+            let _ = self.tx.send((*r, pend.clone()));
         }
+        pend
+    }
+
+    fn run(&self, reqs: &[IoReq]) -> std::result::Result<(), String> {
+        self.submit(reqs).wait()
     }
 }
 
@@ -641,7 +795,11 @@ impl NemotronH {
         // the embedding stays in the file (rows read as needed)
         let dense = dense - f.tensor("token_embd.weight").map_or(0, |t| t.bytes);
         let reserve = o.reserve_mib << 20;
-        let mut vram_left = free.saturating_sub(dense + reserve);
+        // what the pass buffers take beside the weights: the arena, the biggest dense matrix as half, the decode staging
+        let w16_need = f.tensors.iter().filter(|t| !t.name.contains("_exps.") && !t.name.starts_with(&nextn_prefix) && t.shape.len() >= 2 && !plain(t.ty)).map(|t| t.elements() * 2).max().unwrap_or(0);
+        let widest_pair = (0..g.layers).filter(|l| exp_bytes[*l] > 0).map(|l| exp_bytes[l] / g.experts as u64).max().unwrap_or(0);
+        let arena_need = ((96u64 << 20) + o.chunk as u64 * 700_000 + (o.chunk * g.used * 28_000) as u64) + w16_need + if o.stage { SMALL as u64 * g.used as u64 * widest_pair + 2 * g.used as u64 * widest_pair } else { 0 };
+        let mut vram_left = free.saturating_sub(dense + reserve + arena_need);
         let mut homes = vec![0u8; g.layers]; // 0 VRAM, 2 the cache
         // with a profile the VRAM is the hot experts' (of any layer), not the first layers' whole
         let hot_budget = if o.profile.as_ref().is_some_and(|p| p.exists()) && std::env::var("NS_NH_HOT").map_or(true, |v| v != "0") { vram_left } else { 0 };
@@ -763,24 +921,25 @@ impl NemotronH {
             }
         }
         let w16 = if big > 0 && o.chunk > 16 { Some(DevBuf::new(&gpu, big)?) } else { None };
-        let hot_budget = hot_budget.saturating_sub(big as u64);
         let stage_bytes = if o.stage && !pools.is_empty() {
             pools.iter().map(|q| q.stride).max().unwrap_or(0) * 0 + SMALL * g.used * (layers.iter().filter_map(|ly| match &ly.mix { Mix::Moe(m) if matches!(m.up.home, Home::Cached) => Some(m.up.stride + m.down.stride), _ => None }).max().unwrap_or(0))
         } else {
             0
         };
         let stage = if stage_bytes > 0 { Some(DevBuf::new(&gpu, stage_bytes)?) } else { None };
-        let hot_budget = hot_budget.saturating_sub(stage_bytes as u64);
+        // the guessed experts' two buffers: one layer's worth (22 experts) each
+        let pre_bytes = if stage_bytes > 0 { stage_bytes / SMALL } else { 0 };
+        let pre: Vec<DevBuf> = if pre_bytes > 0 && std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0") { (0..2).map(|_| DevBuf::new(&gpu, pre_bytes)).collect::<Result<_>>()? } else { Vec::new() };
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default() })) };
-        let direct = Direct::open(&f);
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default(), pre, pre_used: [0; 2], pre_map: Default::default(), pre_ticket: Default::default(), pre_done: [-1; 2], pre_ring: 0 })) };
+        let io = Io::new(&f, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
         let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 28_000))?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, direct, chunk: o.chunk, w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk: o.chunk, predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -941,6 +1100,9 @@ impl NemotronH {
                     if let Some(&off) = c.hot.get(&(l, x, down)) {
                         return (c.hot_buf.as_ref().unwrap().ptr().cast::<u8>().add(off).cast(), false);
                     }
+                    if let Some(&(b, off)) = c.pre_map.get(&(l, x, down)) {
+                        return (c.pre[b].ptr().cast::<u8>().add(off).cast(), false);
+                    }
                     if let Some(&off) = c.stage_map.get(&(l, x, down)) {
                         return (c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off).cast(), false);
                     }
@@ -1010,7 +1172,13 @@ impl NemotronH {
                 ent.push((r, i, x * g.w_scale));
             }
         }
+        lap("cpu route");
         if t == 1 {
+            if let Some(pr) = self.pred.lock().unwrap().remove(&m.layer) {
+                let mut tm = self.times.lock().unwrap();
+                tm.pred_total += ent.len() as u64;
+                tm.pred_right += ent.iter().filter(|x| pr.contains(&x.1)).count() as u64;
+            }
             if let Ok(path) = std::env::var("NS_NH_TRACE") {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -1021,7 +1189,15 @@ impl NemotronH {
         // the experts' bytes where the kernels can read them: those of a cached layer into slots (the least recently
         // used given up), the misses read from the file on a few threads
         let tf = Instant::now();
+        let mut pre_b: Option<usize> = None;
         if matches!(m.up.home, Home::Cached) {
+            // reads started for this layer from a guess at its routing
+            let pend = self.inflight.lock().unwrap().remove(&m.layer);
+            if let Some(p) = pend {
+                let tw = Instant::now();
+                p.wait().map_err(e)?;
+                self.times.lock().unwrap().pred_wait += tw.elapsed().as_secs_f64();
+            }
             let mut c = self.cache.as_ref().unwrap().lock().unwrap();
             c.clock += 1;
             let clock = c.clock;
@@ -1072,36 +1248,13 @@ impl NemotronH {
             if !jobs.is_empty() {
                 let tio = Instant::now();
                 let nbytes: usize = jobs.iter().map(|j| if j.0 { m.down.stride } else { m.up.stride }).sum();
-                let (tu, td) = (self.file.tensor(&m.up.name).unwrap(), self.file.tensor(&m.down.name).unwrap());
-                let (us, ds) = (m.up.stride, m.down.stride);
-                let nt = jobs.len().clamp(1, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
-                let err = std::sync::Mutex::new(None);
-                std::thread::scope(|sc| {
-                    for part in jobs.chunks(jobs.len().div_ceil(nt)) {
-                        let (file, err, direct) = (&self.file, &err, &self.direct);
-                        sc.spawn(move || {
-                            for &(down, x, at) in part {
-                                let (t, st) = if down { (td, ds) } else { (tu, us) };
-                                // SAFETY: the slot is inside its pool; each job owns its slot while the pass runs.
-                                let dst = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, st) };
-                                let r = match direct {
-                                    Some(d) => d.read(t, (x * st) as u64, dst).map_err(|y| y.to_string()),
-                                    None => file.read_into(t, (x * st) as u64, dst).map_err(|y| y.0),
-                                };
-                                if let Err(y) = r {
-                                    *err.lock().unwrap() = Some(y);
-                                }
-                            }
-                        });
-                    }
-                });
-                if let Some(y) = err.into_inner().unwrap() {
-                    return Err(e(y));
-                }
+                let reqs: Vec<IoReq> = jobs.iter().map(|&(down, x, at)| self.req(if down { &m.down } else { &m.up }, x, at)).collect();
+                self.io.run(&reqs).map_err(e)?;
                 let mut tm = self.times.lock().unwrap();
                 tm.io_s += tio.elapsed().as_secs_f64();
                 tm.io_bytes += nbytes as u64;
             }
+            lap("fetch misses");
             // a decode pass: the experts not in VRAM already copied into the staging buffer, then the products read that
             if t <= SMALL && c.stage.is_some() {
                 let cap = c.stage.as_ref().unwrap().len;
@@ -1112,9 +1265,17 @@ impl NemotronH {
                     }
                     for (down, ex) in [(false, &m.up), (true, &m.down)] {
                         let key = (m.layer, *x, down);
-                        if c.hot.contains_key(&key) || c.stage_used + ex.stride > cap {
+                        if c.hot.contains_key(&key) {
                             continue;
                         }
+                        if c.pre_map.contains_key(&key) {
+                            self.times.lock().unwrap().pre_hit += 1;
+                            continue;
+                        }
+                        if c.stage_used + ex.stride > cap {
+                            continue;
+                        }
+                        self.times.lock().unwrap().stage_copy += 1;
                         let Some(&(p, sl)) = c.map.get(&key) else { continue };
                         let src = c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride;
                         let off = c.stage_used;
@@ -1124,6 +1285,13 @@ impl NemotronH {
                         ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "staging an expert")?;
                         c.stage_map.insert(key, off);
                     }
+                }
+            }
+            // the copies of the guessed experts, if any: the kernels wait for them (on the device)
+            if t <= SMALL {
+                if let Some((tk, b)) = c.pre_ticket.remove(&m.layer) {
+                    ffi::check(unsafe { (nextcuda_core::api()?.await_)(self.raw(), tk) }, "waiting for the guessed experts")?;
+                    pre_b = Some(b);
                 }
             }
         }
@@ -1281,6 +1449,16 @@ impl NemotronH {
             self.op("moe combine", || unsafe { (k.moe_combine_ids)(self.raw(), mo.fp(), dn.fp(), tb.ptr().cast(), ib.ptr().cast(), wb.fp(), t as i64, g.latent as i64) })?;
             mo
         };
+        if matches!(m.up.home, Home::Cached) {
+            let mut c = self.cache.as_ref().unwrap().lock().unwrap();
+            c.pre_map.retain(|k, _| k.0 != m.layer);
+            if let Some(b) = pre_b {
+                // the buffer is free for the next copies once the kernels queued so far are done with it
+                let mut tk = 0i64;
+                ffi::check(unsafe { (nextcuda_core::api()?.mark)(self.raw(), &mut tk) }, "marking the stream")?;
+                c.pre_done[b] = tk;
+            }
+        }
         let out = self.arena.f32(t * g.n_embd)?;
         self.matmul(&m.from_latent, &mo, None, t, &out)?;
         lap("combine+latent up");
@@ -1316,6 +1494,9 @@ impl NemotronH {
             let mark = self.arena.mark();
             let t1 = Instant::now();
             self.rms(&x, &ly.norm, &h, t, g.n_embd)?;
+            if t == 1 && g.kinds[l] == Kind::Moe && self.predict {
+                self.predict_next(l, &x)?;
+            }
             let out = match (&ly.mix, st) {
                 (Mix::Mamba(m), LState::Mamba { conv, s: ss }) => self.mamba(m, conv, ss, &h, t)?,
                 (Mix::Attn(a), LState::Attn { k, v }) => self.attention(a, k, v, s.max_ctx, &h, t, p0)?,
