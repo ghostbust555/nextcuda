@@ -269,6 +269,8 @@ pub struct Times {
     pub cpu_s: f64,
     /// seconds reading the borrowed hot experts back after long prompts
     pub give_back_s: f64,
+    /// decode's chosen experts dropped by the tail skip
+    pub skipped: u64,
     /// NS_NH_PROFILE=1: a MoE layer's parts (seconds, each waited for)
     pub parts: std::collections::BTreeMap<&'static str, f64>,
 }
@@ -345,6 +347,12 @@ pub struct NemotronH {
     /// copies toward VRAM for the first NS_NH_PRE_K (8) of a guess's experts (by score) only: a wrong guess's copy is the link's time
     /// lost (all 22: 2,000-token decode 8.5 tok/s, the top 8: 8.9)
     pre_k: usize,
+    /// decode drops a chosen expert ranked after the first NS_NH_TAIL_SKIP (8; 0: off) whose bytes are not where
+    /// NS_NH_TAIL_TIER says (pinned, the default: in neither VRAM nor pinned memory, a disk read; vram: not in VRAM), its
+    /// weight not given to the others (Strata's route tail skip). 22 GiB, 384 tokens: decode 7.2 -> 9.5 and 5.9 -> 7.8 tok/s
+    /// at KL 0.0037 (top token the same 98.8 %); from rank 4 KL 0.0048 and no faster; vram from 12: KL 0.017
+    tail_skip: usize,
+    tail_vram: bool,
     pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
     /// MoE layers ahead whose misses a guess reads, and how many of each guess's top experts
     pred_ahead: usize,
@@ -1116,7 +1124,7 @@ impl NemotronH {
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8) })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram") })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -1376,6 +1384,24 @@ impl NemotronH {
                     let _ = writeln!(f, "{} {}", m.layer, ent.iter().map(|x| x.1.to_string()).collect::<Vec<_>>().join(","));
                 }
             }
+        }
+        // the tail skip: of a decode token's chosen experts (in rank order), the low-ranked ones whose bytes are not near
+        let mut ent = ent;
+        if t == 1 && self.tail_skip > 0 && self.tail_skip < ent.len() && matches!(m.up.home, Home::Cached) {
+            let c = self.cache.as_ref().unwrap().lock().unwrap();
+            let near = |x: usize| {
+                [false, true].iter().all(|&down| {
+                    let key = (m.layer, x, down);
+                    c.hot.contains_key(&key) || c.pre_map.contains_key(&key) || (!self.tail_vram && c.map.contains_key(&key))
+                })
+            };
+            let before = ent.len();
+            let mut rank = 0;
+            ent.retain(|e| {
+                rank += 1;
+                rank <= self.tail_skip || near(e.1)
+            });
+            self.times.lock().unwrap().skipped += (before - ent.len()) as u64;
         }
         // the experts' bytes where the kernels can read them: those of a cached layer into slots (the least recently
         // used given up), the misses read from the file on a few threads

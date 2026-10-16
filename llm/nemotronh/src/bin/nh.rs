@@ -144,6 +144,79 @@ fn sampler(gpu: usize) -> (Smp, std::process::Child) {
     (smp, child)
 }
 
+/// a step's log-probabilities: the top K (token, log p) of the full softmax
+fn top_logp(l: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = mx + l.iter().map(|x| (x - mx).exp()).sum::<f32>().ln();
+    let mut v: Vec<(u32, f32)> = l.iter().enumerate().map(|(i, x)| (i as u32, x - lse)).collect();
+    v.select_nth_unstable_by(k, |a, b| b.1.total_cmp(&a.1));
+    v.truncate(k);
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v
+}
+
+/// NS_NH_KL=FILE: the reference run (no FILE yet) writes each decode step's top 256 log-probabilities and the token it took;
+/// a later run feeds the same tokens and prints the mean KL(reference || this) over those 256 (the rest of the mass is
+/// under 1e-4 here) and how often the top token agrees
+struct Kl {
+    path: String,
+    reference: Option<Vec<(usize, u32, Vec<(u32, f32)>)>>,
+    out: Vec<String>,
+    sum: f64,
+    n: usize,
+    same: usize,
+}
+
+impl Kl {
+    fn new() -> Option<Kl> {
+        let path = std::env::var("NS_NH_KL").ok()?;
+        let reference = std::fs::read_to_string(&path).ok().map(|t| {
+            t.lines()
+                .filter_map(|l| {
+                    let mut it = l.split(' ');
+                    let n: usize = it.next()?.parse().ok()?;
+                    let tok: u32 = it.next()?.parse().ok()?;
+                    let top = it.filter_map(|p| p.split_once(':')).filter_map(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).collect();
+                    Some((n, tok, top))
+                })
+                .collect()
+        });
+        Some(Kl { path, reference, out: Vec::new(), sum: 0.0, n: 0, same: 0 })
+    }
+
+    /// the token to feed after step `i` of the prompt of size `n`
+    fn step(&mut self, n: usize, i: usize, l: &[f32]) -> u32 {
+        let greedy = l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|x| x.0 as u32).unwrap();
+        let top = top_logp(l, 256);
+        match &self.reference {
+            None => {
+                self.out.push(format!("{n} {greedy} {}", top.iter().map(|(t, p)| format!("{t}:{p}")).collect::<Vec<_>>().join(" ")));
+                greedy
+            }
+            Some(r) => {
+                let Some((_, tok, rt)) = r.iter().filter(|x| x.0 == n).nth(i) else { return greedy };
+                let mine: std::collections::HashMap<u32, f32> = top.iter().copied().collect();
+                // a token outside this run's top 256: its log p bounded by the 256th's
+                let floor = top.last().map_or(-30.0, |x| x.1);
+                self.sum += rt.iter().map(|(t, p)| (p.exp() * (p - mine.get(t).copied().unwrap_or(floor))) as f64).sum::<f64>();
+                self.n += 1;
+                self.same += (greedy == rt[0].0) as usize;
+                *tok
+            }
+        }
+    }
+
+    fn finish(&self) {
+        match &self.reference {
+            None => {
+                let _ = std::fs::write(&self.path, self.out.join("\n") + "\n");
+                eprintln!("[kl: reference written to {}]", self.path);
+            }
+            Some(_) => println!("KL {:.5} over {} steps, top-1 agrees {:.1} %", self.sum / self.n.max(1) as f64, self.n, 100.0 * self.same as f64 / self.n.max(1) as f64),
+        }
+    }
+}
+
 /// nh MODEL --bench 20,2000,8000 [--new 64]: a prompt of about each size (token counts exact), read, then `new` greedy tokens
 fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
     let mut o = Options::default();
@@ -160,6 +233,7 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
     let note = a.iter().position(|x| x == "--note").and_then(|i| a.get(i + 1)).cloned().unwrap_or_default();
     println!("| prompt tokens | prompt read (s) | prompt tok/s | decode tok/s | cache hit % | peak GPU MiB (idle {idle:.0}) | avg W | energy J | {note} |");
     println!("|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+    let mut kl = Kl::new();
     for &n in &sizes {
         let mut text = String::new();
         let mut i = 0;
@@ -179,9 +253,12 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
         eprintln!("[{n}: prompt times {:?}]", m.times.lock().unwrap());
         *m.times.lock().unwrap() = Default::default();
         let t1 = Instant::now();
-        for _ in 0..new {
+        for i in 0..new {
             let l = &logits[0];
-            let next = l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|x| x.0 as u32).unwrap();
+            let next = match &mut kl {
+                Some(k) => k.step(n, i, l),
+                None => l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|x| x.0 as u32).unwrap(),
+            };
             logits = m.forward(&mut s, &[next], 1).expect("decode");
         }
         let dec = t1.elapsed().as_secs_f64();
@@ -202,6 +279,9 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
         };
         let (hits, miss) = (h1.0 - h0.0, h1.1 - h0.1);
         println!("| {n} | {pp:.1} | {:.1} | {:.2} | {:.1} | {peak:.0} | {:.0} | {joules:.0} | |", n as f64 / pp, new as f64 / dec, 100.0 * hits as f64 / (hits + miss).max(1) as f64, joules / secs.max(0.001));
+    }
+    if let Some(k) = &kl {
+        k.finish();
     }
     if let Err(x) = m.save_profile(&std::path::PathBuf::from(path).with_file_name("expert-profile.txt")) {
         eprintln!("profile: {x}");
