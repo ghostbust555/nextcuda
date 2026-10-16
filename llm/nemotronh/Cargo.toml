@@ -1,0 +1,11 @@
+[package]
+name = "nextcuda-llm-nemotronh"
+description = "NVIDIA Nemotron-H MoE (Nemotron 3.5 Super: Mamba-2, latent MoE, attention) on one CUDA card, its experts streamed from host memory and disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-tok.workspace = true

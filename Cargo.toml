@@ -4,7 +4,7 @@ resolver = "2"
 # crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
-    "llm/contract",
+    "llm/contract", "llm/nemotronh",
     "image/contract", "image/qwenimage21",
     "video/contract",
     "audio/contract",
@@ -25,6 +25,7 @@ nextcuda-tok = { path = "crates/tok" }
 nextcuda-diffusion = { path = "crates/diffusion" }
 nextcuda-qwen3vl = { path = "crates/qwen3vl" }
 nextcuda-llm = { path = "llm/contract" }
+nextcuda-llm-nemotronh = { path = "llm/nemotronh" }
 nextcuda-image = { path = "image/contract" }
 nextcuda-image-qwenimage21 = { path = "image/qwenimage21" }
 nextcuda-video = { path = "video/contract" }

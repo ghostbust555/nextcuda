@@ -76,3 +76,17 @@ without drafts and a few hundred tok/s prompt; the miss rate decides it, which i
 - [ ] 5. Expert store: profile, miss swap on two streams, prefetch; measure `FREE_MISSES` first.
 - [ ] 6. Bench with `nextcuda llm bench` (benchy methodology as the image kind: cold/warm, peak MiB, PCIe, energy).
 - [ ] 7. MTP drafts; model card `model-cards/llm/nemotron-3.5-super-iq1m.yml`; serve behind the same RPC.
+
+## Status (2026-10-16): it works
+
+`nh MODEL.gguf --prompt TEXT --n N` (llm/nemotronh, kernels/llm/nemotronh) on the 5070 alone: UD-IQ1_M loads in 35 s
+(5.8 GiB dense in VRAM; experts: 5 layers in VRAM, 16 pinned, 19 on disk), answers coherently ("The user is asking a
+simple factual question" to "What is the capital of France?", greedy). Both shards sha256-match nextsycl's card.
+First clock: 30-token prompt 25.5 s (1.2 tok/s: 8-row passes, 25 s of the 29 s in MoE are reading disk-resident
+experts), decode 1.87 tok/s once warm (page cache).
+Kernels: Strata's i-quant mmvq (+ IQ1_S and Q6_K added from llama.cpp's vecdotq), plain ones of our own (Mamba-2
+conv/scan, gated norm, attention to 12K keys, RMS norm, combine). Not yet checked against llama.cpp's logits.
+
+Next: check against llama.cpp (cosine of logits); the expert cache (hot experts by profile; pinned tier chosen per
+expert, not per layer); bigger prompt chunks (group by expert, read each once); `FREE_MISSES` bound; GPU routing;
+Mamba chunked scan; MTP.

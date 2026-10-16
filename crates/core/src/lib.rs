@@ -396,29 +396,65 @@ impl DevBuf {
     }
 }
 
-/// Host memory kept for fast copies on a CUDA/SYCL runtime; here an ordinary allocation.
+/// Host memory the GPU can read in place (page-locked, CUDA's unified addressing: `device_view` is a pointer a kernel
+/// takes as it is, over PCIe); an ordinary allocation when there is no device.
 pub struct HostBuf {
+    /// pinned memory from the library (None: `data` is the memory)
+    pin: Option<*mut u8>,
     data: Vec<u8>,
     pub len: usize,
     gpu: Arc<Gpu>,
 }
 
+// SAFETY: plain memory owned by the buffer.
+unsafe impl Send for HostBuf {}
+unsafe impl Sync for HostBuf {}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        if let (Some(p), Some((a, r))) = (self.pin, self.gpu.dev) {
+            // SAFETY: allocated by ns_alloc_host on this GPU.
+            unsafe {
+                (a.free_host)(r, p.cast());
+            }
+        }
+    }
+}
+
 impl HostBuf {
     pub fn new(gpu: &Arc<Gpu>, len: usize) -> Result<HostBuf> {
-        Ok(HostBuf { data: vec![0; len.max(1)], len, gpu: gpu.clone() })
+        if let Some((a, r)) = gpu.dev {
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: an out-pointer to a local.
+            check(a, unsafe { (a.alloc_host)(r, len.max(1), &mut ptr) }, &format!("pinning {len} bytes of host memory"))?;
+            return Ok(HostBuf { pin: Some(ptr.cast()), data: Vec::new(), len, gpu: gpu.clone() });
+        }
+        Ok(HostBuf { pin: None, data: vec![0; len.max(1)], len, gpu: gpu.clone() })
+    }
+    fn base(&mut self) -> *mut u8 {
+        self.pin.unwrap_or_else(|| self.data.as_mut_ptr())
     }
     pub fn device_view(&mut self, at: usize, len: usize) -> Result<DevBuf> {
         if at.checked_add(len).is_none_or(|e| e > self.len) {
             return Err(Error(format!("device_view: [{at}, {}) outside {} bytes", at.saturating_add(len), self.len)));
         }
         // SAFETY: in bounds (checked); the buffer outlives the view by the caller's contract.
-        Ok(DevBuf { gpu: self.gpu.clone(), ptr: unsafe { self.data.as_mut_ptr().add(at).cast() }, len, owned: false })
+        Ok(DevBuf { gpu: self.gpu.clone(), ptr: unsafe { self.base().add(at).cast() }, len, owned: false })
     }
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
+        match self.pin {
+            // SAFETY: len bytes were allocated.
+            Some(p) => unsafe { std::slice::from_raw_parts(p, self.len) },
+            None => &self.data[..self.len],
+        }
     }
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data[..self.len]
+        let n = self.len;
+        match self.pin {
+            // SAFETY: len bytes were allocated, and &mut self is exclusive.
+            Some(p) => unsafe { std::slice::from_raw_parts_mut(p, n) },
+            None => &mut self.data[..n],
+        }
     }
 }
 

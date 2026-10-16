@@ -21,9 +21,9 @@ GEN=()
 last=
 for a in $ARCHS; do GEN+=(-gencode "arch=compute_$a,code=sm_$a"); last=$a; done
 GEN+=(-gencode "arch=compute_$last,code=compute_$last")      # PTX of the newest: a newer card JITs it
-FLAGS=(-std=c++17 -O3 --use_fast_math -Xcompiler -fPIC -lineinfo "${GEN[@]}" -Ins -Ins -Idiffusion -I"$SDCPP/include")
+FLAGS=(-std=c++17 -O3 --use_fast_math -Xcompiler -fPIC -lineinfo "${GEN[@]}" -Ins -Ins -Idiffusion -Illm/nemotronh -Illm/nemotronh/third_party -Illm/nemotronh/third_party/ggml -I"$SDCPP/include")
 # --use_fast_math is not on for the numerics that must match a reference: a source names its own flags below
-precise() { case "$1" in diffusion/*) return 0 ;; esac; return 1; }
+precise() { case "$1" in diffusion/*|llm/*) return 0 ;; esac; return 1; }
 
 KINDS="llm image video audio"
 # stable-diffusion.cpp (ggml-cuda), the CUDA implementation the image engines are built on: its source tree (headers)

@@ -622,6 +622,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextcuda-llm-nemotronh"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-gguf",
+ "nextcuda-tok",
+]
+
+[[package]]
 name = "nextcuda-models"
 version = "0.0.0"
 dependencies = [
