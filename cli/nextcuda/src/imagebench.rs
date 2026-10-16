@@ -28,8 +28,8 @@ use crate::image::{load, opt};
 
 const PROMPT: &str = "a lighthouse on a rocky coast at dusk, long exposure, dramatic clouds, photorealistic";
 
-/// (when, gpu, MiB used, watts)
-type Sample = (Instant, usize, f64, f64);
+/// (when, gpu, MiB used, watts, PCIe gen, PCIe width)
+type Sample = (Instant, usize, f64, f64, f64, f64);
 
 /// `nvidia-smi` streaming every 250 ms into a list, until dropped
 struct Sampler {
@@ -40,7 +40,7 @@ struct Sampler {
 impl Sampler {
     fn start() -> Result<Sampler, String> {
         let mut child = Command::new("nvidia-smi")
-            .args(["--query-gpu=index,memory.used,power.draw", "--format=csv,noheader,nounits", "-lms", "250"])
+            .args(["--query-gpu=index,memory.used,power.draw,pcie.link.gen.current,pcie.link.width.current", "--format=csv,noheader,nounits", "-lms", "250"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -51,8 +51,8 @@ impl Sampler {
         std::thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let f: Vec<f64> = line.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect();
-                if f.len() == 3 {
-                    s2.lock().unwrap().push((Instant::now(), f[0] as usize, f[1], f[2]));
+                if f.len() == 5 {
+                    s2.lock().unwrap().push((Instant::now(), f[0] as usize, f[1], f[2], f[3], f[4]));
                 }
             }
         });
@@ -63,20 +63,22 @@ impl Sampler {
         self.samples.lock().unwrap().len()
     }
 
-    /// The window from sample `from`: per GPU (peak MiB, joules, seconds covered)
-    fn window(&self, from: usize) -> Vec<(usize, f64, f64, f64)> {
+    /// The window from sample `from`: per GPU (index, peak MiB, joules, seconds covered, highest PCIe gen, width seen)
+    fn window(&self, from: usize) -> Vec<(usize, f64, f64, f64, f64, f64)> {
         let s = self.samples.lock().unwrap();
-        let mut out: Vec<(usize, f64, f64, f64)> = Vec::new();
+        let mut out: Vec<(usize, f64, f64, f64, f64, f64)> = Vec::new();
         let mut last: Vec<(usize, Instant, f64)> = Vec::new();
-        for (t, g, mem, w) in s.iter().skip(from) {
+        for (t, g, mem, w, gen, width) in s.iter().skip(from) {
             let i = match out.iter().position(|o| o.0 == *g) {
                 Some(i) => i,
                 None => {
-                    out.push((*g, 0.0, 0.0, 0.0));
+                    out.push((*g, 0.0, 0.0, 0.0, 0.0, 0.0));
                     out.len() - 1
                 }
             };
             out[i].1 = out[i].1.max(*mem);
+            out[i].4 = out[i].4.max(*gen);
+            out[i].5 = out[i].5.max(*width);
             if let Some(l) = last.iter_mut().find(|l| l.0 == *g) {
                 let dt = t.duration_since(l.1).as_secs_f64();
                 out[i].2 += (l.2 + w) / 2.0 * dt;
@@ -93,7 +95,7 @@ impl Sampler {
     fn idle(&self) -> Vec<(usize, f64)> {
         let s = self.samples.lock().unwrap();
         let mut v: Vec<(usize, f64)> = Vec::new();
-        for (_, g, m, _) in s.iter().rev().take(16) {
+        for (_, g, m, _, _, _) in s.iter().rev().take(16) {
             if !v.iter().any(|x| x.0 == *g) {
                 v.push((*g, *m));
             }
@@ -170,6 +172,11 @@ pub fn run(cfg: &nextcuda_models::Config, args: &[String]) -> Result<(), String>
     if let Some(n) = opt(args, "--note") {
         md.push_str(&format!("\n{n}\n"));
     }
+    for (i, n) in nextcuda_core::gpus().unwrap_or_default() {
+        if let Some(l) = nextcuda_core::pcie_link(i) {
+            md.push_str(&format!("\nGPU {i} ({n}): PCIe {l} at the start of the run (the link steps down when a card is idle; each row says what it ran at)\n"));
+        }
+    }
     md.push_str("\nStages in seconds; peaks of GPU memory are the model's own (the idle reading before the load taken off); energy and watts are the card's `power.draw` over the picture.\n");
     for model in &models {
         let mut a: Vec<String> = args.to_vec();
@@ -183,8 +190,8 @@ pub fn run(cfg: &nextcuda_models::Config, args: &[String]) -> Result<(), String>
         let after_load = sampler.idle().iter().find(|x| x.0 == gpu).map_or(0.0, |x| x.1);
         md.push_str(&format!("\n## {} ({})\n\nload {load_s:.1} s; GPU memory after the load {:.0} MiB (idle {idle:.0}); engine: {}\n\n", m["id"].as_str().unwrap_or(model),
                              m["title"].as_str().unwrap_or(""), after_load, engine.report().first().cloned().unwrap_or_default()));
-        md.push_str("| size | steps | text encode | step 1 | step (mean of 2..n) | sampler | VAE | total | peak GPU MiB | host RSS MiB | energy J | avg W |\n");
-        md.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        md.push_str("| size | steps | text encode | step 1 | step (mean of 2..n) | sampler | VAE | total | peak GPU MiB | PCIe | host RSS MiB | energy J | avg W |\n");
+        md.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|\n");
         for &(w, h) in &sizes {
             let mut rows: Vec<Value> = Vec::new();
             for r in 0..runs {
@@ -211,11 +218,13 @@ pub fn run(cfg: &nextcuda_models::Config, args: &[String]) -> Result<(), String>
                 let step_mean = if rest.is_empty() { 0.0 } else { rest.iter().sum::<f64>() / rest.len() as f64 };
                 let win = sampler.window(from);
                 let peak = win.iter().find(|x| x.0 == gpu).map_or(0.0, |x| x.1);
+                let (link_gen, link_width) = win.iter().find(|x| x.0 == gpu).map_or((0.0, 0.0), |x| (x.4, x.5));
                 let (joules, secs): (f64, f64) = win.iter().fold((0.0, 0.0), |a, x| (a.0 + x.2, a.1.max(x.3)));
                 let row = json!({
                     "model": m["id"], "size": format!("{w}x{h}"), "steps": steps, "run": r, "cold": r == 0, "load_s": load_s,
                     "text_encode_s": text, "step1_s": first, "step_mean_s": step_mean, "sampler_s": sample, "vae_s": vae, "total_s": total,
                     "peak_gpu_mib": peak, "peak_gpu_model_mib": (peak - idle).max(0.0), "host_rss_peak_mib": host_peak_mib(),
+                    "pcie_gen": link_gen, "pcie_width": link_width, "pcie_max": nextcuda_core::pcie_link(gpu),
                     "energy_j": joules, "avg_w": if secs > 0.0 { joules / secs } else { 0.0 }, "idle_gpu_mib": idle, "gpu": gpu, "gpu_name": gpu_name,
                     "note": opt(args, "--note"),
                 });
@@ -229,7 +238,8 @@ pub fn run(cfg: &nextcuda_models::Config, args: &[String]) -> Result<(), String>
                 let c = cold[k].as_f64().unwrap_or(0.0);
                 format!("{:.p$} ({:.p$})", f(k, &warm), c, p = p)
             };
-            md.push_str(&format!("| {w}x{h} | {steps} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} |\n", cell("text_encode_s", 2), cell("step1_s", 1),
+            let link = format!("g{:.0} x{:.0}", f("pcie_gen", &warm), f("pcie_width", &warm));
+            md.push_str(&format!("| {w}x{h} | {steps} | {} | {} | {} | {} | {} | {} | {} | {link} | {:.0} | {} | {} |\n", cell("text_encode_s", 2), cell("step1_s", 1),
                                  cell("step_mean_s", 2), cell("sampler_s", 1), cell("vae_s", 1), cell("total_s", 1), cell("peak_gpu_model_mib", 0),
                                  host_peak_mib(), cell("energy_j", 0), cell("avg_w", 0)));
         }

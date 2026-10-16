@@ -65,7 +65,8 @@ pub fn load(m: Model, files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, lo
     let max_vram = o.setting("NC_SD_MAX_VRAM").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
     let args = o.setting("NC_SD_ARGS").unwrap_or_default();
     let backend = format!("cuda{}", gpu.index);
-    log(format!("{}: loading on {} ({backend}{})", m.arch, gpu.name, if offload { ", weights offloaded to host memory" } else { "" }));
+    log(format!("{}: loading on {} ({backend}{}{})", m.arch, gpu.name, if offload { ", weights offloaded to host memory" } else { "" },
+                nextcuda_core::pcie_link(gpu.index).map_or(String::new(), |l| format!(", PCIe {l}"))));
     let to_s = |p: &Path| p.to_string_lossy().into_owned();
     let transformer = crate::gguffix::qwen_image_transformer(path("transformer")?, log)?;
     let sd = Sd::load(&to_s(&transformer), &to_s(path("text-encoder")?), files.get("llm-vision").map(|p| to_s(p)).as_deref(), &to_s(path("vae")?),

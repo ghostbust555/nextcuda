@@ -41,9 +41,10 @@ int nsd_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int
 
 /* out [M, N] = x [M, K] . W^T + bias with W quantized (a GGUF type, rows of K values, N rows): W is dequantized into
  * a scratch of the context in slices of rows, each multiplied as it is made - the weights stay in their stored
- * size on the card, and only a slice is ever half. x, out in dt (half or bfloat16) or float32. */
+ * size on the card, and only a slice is ever half. x in dt (half or bfloat16), out in out_dt. `ldo`: the elements
+ * between the rows of out (0: N) - the parts of a fused matrix, each its own type, written side by side. */
 int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int qtype, int64_t N, const float* bias,
-                 void* out, int out_dt);
+                 void* out, int out_dt, int64_t ldo);
 
 /* Row-wise RMS norm, optionally followed by a per-row scale and shift picked from a table:
  *   n   = x[r] / sqrt(mean(x[r]^2) + eps) * weight

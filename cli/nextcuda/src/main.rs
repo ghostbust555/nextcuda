@@ -193,7 +193,8 @@ fn gpus() -> Result<(), String> {
         let g = Gpu::open(*i).map_err(e)?;
         let (total, free) = g.memory().map_err(e)?;
         let units = nextcuda_core::gpu_units(*i).map_or(String::new(), |(u, m)| format!(", {u} compute units at {m} MHz"));
-        println!("GPU {i}: {name}, {:.1} GiB{}{units}", gib(total), free.map_or(String::new(), |f| format!(" ({:.1} GiB free)", gib(f))));
+        let link = nextcuda_core::pcie_link(*i).map_or(String::new(), |l| format!(", PCIe {l}"));
+        println!("GPU {i}: {name}, {:.1} GiB{}{units}{link}", gib(total), free.map_or(String::new(), |f| format!(" ({:.1} GiB free)", gib(f))));
         open.push(g);
     }
     // copies: 256 MiB through pinned memory, each way, checked

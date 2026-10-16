@@ -31,6 +31,18 @@ NVIDIA behind it instead of SYCL. The platform talks to it with the same `/rpc/<
   the 7B single-stream DiT with Qwen3-VL), so it is its own engine crate on the same foundation; it follows 2.1's
   nsd port, which it shares most kernels with.
 
+## Phase 2 progress (the Rust engine on the shared CUDA kernels)
+
+- **Done, checked on the 5070:** `kernels/diffusion/nsd.cu` (cuBLAS linears, a quantized linear that keeps GGUF
+  weights in their stored type and makes a slice of rows half at a time, RMS norm + modulation, RoPE, SwiGLU, gated
+  add, attention for grouped heads, im2col convolutions); `nextcuda image selftest` runs each against host
+  arithmetic (dequant of Q8_0 / Q4_K / Q5_K / Q6_K exact; the rest within 1e-3).
+- **Ported, not yet run:** nextsycl's engine as `image/qwenimage21/src/rust/` - the DiT with its blocks in the type
+  the GGUF stores (mixed-quant files included), the VAE, the sampler's schedule, a text encoder read from a
+  llama.cpp GGUF a layer at a time (`crates/qwen3vl/src/gguf.rs`). Selected with `NC_IMAGE_BACKEND=rust`.
+- **Next:** run it, compare its pictures with the stable-diffusion.cpp engine's for the same prompt, then clock it
+  with `nextcuda image bench` and move the hot kernels into the silo.
+
 ## Clocks (RTX 5070 12 GB, in process through stable-diffusion.cpp, 2026-10-15)
 
 | model | picture | text encoder | sampler | VAE | total |

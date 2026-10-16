@@ -8,6 +8,8 @@
 //! - `Picture`: 8-bit RGB / RGBA pixels, read from and written to PNG.
 //!   RoPE, attention, convolutions - for the engines and the text encoders to compose.
 
+pub mod kernels;
+pub mod kernels_check;
 pub mod lora;
 pub mod picture;
 pub mod samplers;

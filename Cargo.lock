@@ -606,7 +606,9 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-core",
  "nextcuda-diffusion",
+ "nextcuda-gguf",
  "nextcuda-image",
+ "nextcuda-qwen3vl",
  "serde_json",
 ]
 
@@ -627,6 +629,17 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+]
+
+[[package]]
+name = "nextcuda-qwen3vl"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-tok",
+ "serde_json",
 ]
 
 [[package]]

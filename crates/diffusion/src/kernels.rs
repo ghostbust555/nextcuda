@@ -1,0 +1,245 @@
+//! The shared diffusion kernels (`kernels/diffusion/nsd.h`, linked into the image library), bound by name. `Nsd` is
+//! one context on one GPU - around that GPU's own stream, so the buffers nextcuda-core allocates there are the kernels'
+//! to read - with checked calls on raw device pointers (`DevBuf::ptr`). The calls are nextsycl's, so its engines'
+//! Rust code is what runs on them.
+//!
+//! The pointers are device memory the host never dereferences: the kernels read them on the GPU, so the calls are not
+//! `unsafe` fns; what they rest on is the sizes the caller names (each call's doc says them).
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::{Arc, OnceLock};
+
+use nextcuda_core::{Error, Gpu, Result};
+
+/// A buffer's element type, as the kernels name it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Dt {
+    F32 = 0,
+    F16 = 1,
+    BF16 = 2,
+}
+
+type P = *const c_void;
+type M = *mut c_void;
+
+#[allow(clippy::type_complexity)]
+struct Api {
+    last_error: unsafe extern "C" fn() -> *const c_char,
+    create: unsafe extern "C" fn(M) -> M,
+    destroy: unsafe extern "C" fn(M),
+    wait: unsafe extern "C" fn(M) -> c_int,
+    linear: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, c_int) -> c_int,
+    linear_acc: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M) -> c_int,
+    linear_q: unsafe extern "C" fn(M, P, c_int, i64, i64, P, c_int, i64, *const f32, M, c_int, i64) -> c_int,
+    dequant: unsafe extern "C" fn(M, P, c_int, i64, M, c_int) -> c_int,
+    rms_norm_mod: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, f32, *const i32, *const f32, *const f32, M, c_int) -> c_int,
+    rms_rope: unsafe extern "C" fn(M, M, c_int, i64, i64, i64, i64, *const f32, f32, *const f32, c_int) -> c_int,
+    swiglu: unsafe extern "C" fn(M, P, c_int, i64, i64, M, c_int) -> c_int,
+    gate_add: unsafe extern "C" fn(M, M, c_int, i64, i64, P, c_int, *const i32, *const f32) -> c_int,
+    attention_causal: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, i64, M) -> c_int,
+    attention_causal_rows: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, i64, i64, M) -> c_int,
+    attention_qk: unsafe extern "C" fn(M, P, i64, i64, P, P, i64, i64, c_int, i64, i64, M, c_int) -> c_int,
+    conv2d: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, i64, P, i64, i64, *const f32, M) -> c_int,
+    conv3d_ex: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, i64, *const f32, M) -> c_int,
+}
+
+// SAFETY: function pointers into the library, which stays loaded for the process.
+unsafe impl Send for Api {}
+unsafe impl Sync for Api {}
+
+fn api() -> Result<&'static Api> {
+    static API: OnceLock<std::result::Result<Api, String>> = OnceLock::new();
+    API.get_or_init(|| {
+        let lib = nextcuda_core::api().map_err(|e| e.0)?;
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{} is not in the kernel library (an image library, built with kernels/diffusion)", $name));
+                }
+                // SAFETY: the symbol is declared in nsd.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Api {
+            last_error: sym!("nsd_last_error"),
+            create: sym!("nsd_create"),
+            destroy: sym!("nsd_destroy"),
+            wait: sym!("nsd_wait"),
+            linear: sym!("nsd_linear"),
+            linear_acc: sym!("nsd_linear_acc"),
+            linear_q: sym!("nsd_linear_q"),
+            dequant: sym!("nsd_dequant"),
+            rms_norm_mod: sym!("nsd_rms_norm_mod"),
+            rms_rope: sym!("nsd_rms_rope"),
+            swiglu: sym!("nsd_swiglu"),
+            gate_add: sym!("nsd_gate_add"),
+            attention_causal: sym!("nsd_attention_causal"),
+            attention_causal_rows: sym!("nsd_attention_causal_rows"),
+            attention_qk: sym!("nsd_attention_qk"),
+            conv2d: sym!("nsd_conv2d"),
+            conv3d_ex: sym!("nsd_conv3d_ex"),
+        })
+    })
+    .as_ref()
+    .map_err(|e| Error(e.clone()))
+}
+
+/// The kernels' context on one GPU
+pub struct Nsd {
+    ctx: M,
+    k: &'static Api,
+    pub gpu: Arc<Gpu>,
+}
+
+// SAFETY: the context is used through &self from one thread at a time by its engine (the stream is in order).
+unsafe impl Send for Nsd {}
+unsafe impl Sync for Nsd {}
+
+impl Drop for Nsd {
+    fn drop(&mut self) {
+        // SAFETY: made by nsd_create, destroyed once.
+        unsafe { (self.k.destroy)(self.ctx) };
+    }
+}
+
+fn last(k: &Api) -> String {
+    // SAFETY: a C string owned by the library, valid until the next call on this thread.
+    unsafe { CStr::from_ptr((k.last_error)()) }.to_string_lossy().into_owned()
+}
+
+/// A pointer for "none" (a null bias, rows, scale)
+pub fn none() -> P {
+    std::ptr::null()
+}
+
+impl Nsd {
+    /// A context on `gpu`'s own stream
+    pub fn new(gpu: &Arc<Gpu>) -> Result<Nsd> {
+        let k = api()?;
+        // SAFETY: the GPU's handle, alive as long as the GPU (held here).
+        let ctx = unsafe { (k.create)(gpu.raw()) };
+        if ctx.is_null() {
+            return Err(Error(format!("the diffusion kernels' context on {}: {}", gpu.name, last(k))));
+        }
+        Ok(Nsd { ctx, k, gpu: gpu.clone() })
+    }
+
+    fn ok(&self, rc: c_int, what: &str) -> Result<()> {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error(format!("{what}: {}", last(self.k))))
+        }
+    }
+
+    pub fn wait(&self) -> Result<()> {
+        // SAFETY: a live context.
+        self.ok(unsafe { (self.k.wait)(self.ctx) }, "waiting for the GPU")
+    }
+
+    /// out [M, N] = x [M, K] . W^T + bias (float32 [N] or null); x and W in `dt`
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, bias: P, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.linear)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, bias.cast(), out, out_dt as c_int) }, "linear")
+    }
+
+    /// out [M, N] += x [M, K] . W^T, all in `dt`
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_acc(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.linear_acc)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, std::ptr::null(), out) }, "linear (accumulated)")
+    }
+
+    /// out [M, N] = x [M, K] . W^T + bias with W a GGUF-quantized matrix [N, K] of type `qtype` (kept in its stored
+    /// size on the card: a slice of its rows is made half at a time); x in `dt` (half or bfloat16); `ldo`: the row
+    /// stride of out (0: n), for the parts of a fused matrix written side by side
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_q(&self, x: P, dt: Dt, m: usize, k: usize, w: P, qtype: u32, n: usize, bias: P, out: M, out_dt: Dt, ldo: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.linear_q)(self.ctx, x, dt as c_int, m as i64, k as i64, w, qtype as c_int, n as i64, bias.cast(), out, out_dt as c_int, ldo as i64) },
+                "quantized linear")
+    }
+
+    /// `n` values of a GGUF type to `out_dt` (12 Q4_K, 13 Q5_K, 14 Q6_K, 8 Q8_0, 30 BF16, 1 F16, 0 F32)
+    pub fn dequant(&self, src: P, qtype: u32, n: usize, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: src holds n values of the type; out n of out_dt.
+        self.ok(unsafe { (self.k.dequant)(self.ctx, src, qtype as c_int, n as i64, out, out_dt as c_int) }, "dequant")
+    }
+
+    /// RMS norm of [M, C] rows with an optional per-row (1 + scale) and shift taken from tables by `rows`
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_mod(&self, x: P, x_dt: Dt, m: usize, c: usize, weight: P, eps: f32, rows: P, scale: P, shift: P, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.rms_norm_mod)(self.ctx, x, x_dt as c_int, m as i64, c as i64, weight.cast(), eps, rows.cast(), scale.cast(), shift.cast(), out,
+                                                out_dt as c_int) }, "rms norm")
+    }
+
+    /// Per-head RMS norm then rotary positions, in place (rows of stride `stride`, `cs` (cos, sin) per token and pair)
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_rope(&self, x: M, dt: Dt, m: usize, h: usize, d: usize, stride: usize, weight: P, eps: f32, cs: P, rot: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.rms_rope)(self.ctx, x, dt as c_int, m as i64, h as i64, d as i64, stride as i64, weight.cast(), eps, cs.cast(), rot as c_int) },
+                "rms norm + rope")
+    }
+
+    /// out [M, C] = silu(x[:, :C]) * x[:, C:] for x [M, 2C]
+    pub fn swiglu(&self, x: P, x_dt: Dt, m: usize, c: usize, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: x holds M x 2C values, out M x C.
+        self.ok(unsafe { (self.k.swiglu)(self.ctx, x, x_dt as c_int, m as i64, c as i64, out, out_dt as c_int) }, "swiglu")
+    }
+
+    /// x[r] += other[r] * gate[rows[r]] (a plain add with a null gate)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gate_add(&self, x: M, x_dt: Dt, m: usize, c: usize, other: P, other_dt: Dt, rows: P, gate: P) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.gate_add)(self.ctx, x, x_dt as c_int, m as i64, c as i64, other, other_dt as c_int, rows.cast(), gate.cast()) }, "gated add")
+    }
+
+    /// Causal attention of L rows over L keys; Hq query heads over Hkv key/value heads
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_causal(&self, q: P, k: P, v: P, dt: Dt, l: usize, hq: usize, hkv: usize, d: usize, qs: usize, kvs: usize, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.attention_causal)(self.ctx, q, k, v, dt as c_int, l as i64, hq as i64, hkv as i64, d as i64, qs as i64, kvs as i64, out) },
+                "causal attention")
+    }
+
+    /// Causal attention for query rows [row0, row0 + rows) over keys [0, i]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_causal_rows(&self, q: P, k: P, v: P, dt: Dt, row0: usize, rows: usize, hq: usize, hkv: usize, d: usize, qs: usize, kvs: usize, out: M)
+                                 -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.attention_causal_rows)(self.ctx, q, k, v, dt as c_int, row0 as i64, rows as i64, hq as i64, hkv as i64, d as i64, qs as i64,
+                                                        kvs as i64, out) }, "causal attention (rows)")
+    }
+
+    /// Sq query rows over Skv key / value rows, no mask
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_qk(&self, q: P, sq: usize, qs: usize, k: P, v: P, skv: usize, kvs: usize, dt: Dt, h: usize, d: usize, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.attention_qk)(self.ctx, q, sq as i64, qs as i64, k, v, skv as i64, kvs as i64, dt as c_int, h as i64, d as i64, out, out_dt as c_int) },
+                "attention")
+    }
+
+    /// A k x k convolution of N channels-last frames, zero padded
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d(&self, x: P, dt: Dt, n: usize, h: usize, w_: usize, ci: usize, w: P, co: usize, k: usize, bias: P, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.conv2d)(self.ctx, x, dt as c_int, n as i64, h as i64, w_ as i64, ci as i64, w, co as i64, k as i64, bias.cast(), out) }, "conv2d")
+    }
+
+    /// A strided 3-D convolution, no padding: x (T, H, W) channels-last
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv3d_ex(&self, x: P, dt: Dt, thw: (usize, usize, usize), ci: usize, w: P, co: usize, k: (usize, usize, usize), s: (usize, usize, usize), bias: P,
+                     out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.conv3d_ex)(self.ctx, x, dt as c_int, thw.0 as i64, thw.1 as i64, thw.2 as i64, ci as i64, w, co as i64, k.0 as i64, k.1 as i64,
+                                             k.2 as i64, s.0 as i64, s.1 as i64, s.2 as i64, bias.cast(), out) }, "conv3d")
+    }
+}

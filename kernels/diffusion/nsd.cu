@@ -410,7 +410,7 @@ static bool row_geometry(int qtype, int64_t K, int64_t* row_bytes) {
 }
 
 int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int qtype, int64_t N, const float* bias, void* out,
-                 int out_dt) {
+                 int out_dt, int64_t ldo) {
     auto* c = (Ctx*) ctx;
     CU(cudaSetDevice(c->dev));
     int64_t rb = 0;
@@ -427,8 +427,8 @@ int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const v
         dequant_slice_k<<<nb(n * K), 256, 0, c->s>>>((const uint8_t*) w, qtype, r0 * K, n * K, wt, dt);
         LAUNCHED("dequant slice");
         char* o = (char*) out + (size_t) r0 * esz(out_dt);
-        if (int rc = gemm_nt(c, x, dt, M, K, wt, dt, n, o, out_dt, 0.0f, N)) return rc;
-        if (bias) { bias_cols_k<<<nb(M * n), 256, 0, c->s>>>(out, out_dt, M, N, r0, n, bias); LAUNCHED("bias"); }
+        if (int rc = gemm_nt(c, x, dt, M, K, wt, dt, n, o, out_dt, 0.0f, ldo ? ldo : N)) return rc;
+        if (bias) { bias_cols_k<<<nb(M * n), 256, 0, c->s>>>(out, out_dt, M, ldo ? ldo : N, r0, n, bias); LAUNCHED("bias"); }
     }
     return 0;
 }

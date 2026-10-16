@@ -136,6 +136,19 @@ pub fn gpus_weakest_first() -> Result<Vec<usize>> {
     Ok(v.into_iter().map(|x| x.0).collect())
 }
 
+/// GPU `index`'s PCIe link as nvidia-smi gives it: "gen4 x16 (max gen4 x16)". The link drops a generation when the
+/// card is idle (power saving): read it under load for what a copy gets.
+pub fn pcie_link(index: usize) -> Option<String> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=index,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        let f: Vec<&str> = l.split(',').map(str::trim).collect();
+        (f.len() >= 5 && f[0].parse::<usize>().ok() == Some(index)).then(|| format!("gen{} x{} (max gen{} x{})", f[1], f[2], f[3], f[4]))
+    })
+}
+
 /// One GPU.
 pub struct Gpu {
     /// the kernel library and this GPU's handle in it; None: no library (host memory, nvidia-smi)

@@ -14,6 +14,7 @@
 pub mod ffi;
 pub mod gguffix;
 pub mod native;
+pub mod rust;
 pub mod sd;
 pub mod selftest;
 
@@ -31,13 +32,16 @@ pub const ARCH: &str = "qwen-image-2.1";
 
 /// The engine's kernels, each against host arithmetic on `gpu` (`nextcuda image selftest`): the worst error of each
 pub fn selftest(gpu: &Arc<Gpu>) -> Result<Vec<f32>> {
-    selftest::run(gpu)
+    let mut v = selftest::run(gpu)?;
+    // the shared diffusion kernels under it, when the library has them
+    v.extend(nextcuda_diffusion::kernels_check::selftest(gpu)?);
+    Ok(v)
 }
 /// The files it needs; `llm-vision` (the projector an edit's references go through) is read when there is one
 pub const ROLES: &[&str] = &["transformer", "text-encoder", "vae"];
 
 pub const OPTIONS: &[EngineOption] = &[
-    EngineOption { name: "backend", env: "NC_IMAGE_BACKEND", value: "native|python", help: "in process through the library (default when it has stable-diffusion.cpp), or the sd-cli worker", at: At::Load },
+    EngineOption { name: "backend", env: "NC_IMAGE_BACKEND", value: "native|rust|python", help: "native: in process through stable-diffusion.cpp (default); rust: the Rust engine on the shared CUDA kernels; python: the sd-cli worker", at: At::Load },
     EngineOption { name: "sdcpp-bin", env: "NC_SDCPP_BIN", value: "PATH", help: "the stable-diffusion.cpp sd-cli binary (CUDA build)", at: At::Load },
     EngineOption { name: "sdcpp-extra-args", env: "NC_SDCPP_EXTRA_ARGS", value: "ARGS", help: "more arguments for every sd-cli run", at: At::Load },
     EngineOption { name: "alpha", env: "NC_QWEN21_ALPHA", value: "auto|native|rembg", help: "where a transparent picture's alpha comes from", at: At::Load },
@@ -134,6 +138,11 @@ fn find_script(o: &LoadOptions) -> Result<PathBuf> {
 }
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
+    // the Rust engine: the pipeline in Rust over the shared CUDA kernels, no ggml (NC_IMAGE_BACKEND=rust)
+    if o.setting("NC_IMAGE_BACKEND").is_some_and(|v| v == "rust") {
+        let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
+        return Ok(Box::new(rust::RustQwenImage21::load(files, gpu, o, log)?));
+    }
     // in process, when the library has stable-diffusion.cpp (the model stays loaded); else the phase 1 worker
     if sd::available() && o.setting("NC_IMAGE_BACKEND").is_none_or(|v| v != "python") {
         return Ok(Box::new(native::load(native::QWEN_IMAGE_21, files, gpus, o, log)?));
