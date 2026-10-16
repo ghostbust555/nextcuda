@@ -1,0 +1,16 @@
+[package]
+name = "nextcuda-serve"
+description = "The servers: an OpenAI-compatible API over a kind's engine, the prompt cache, telemetry, the HTTP plumbing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-llm.workspace = true
+nextcuda-image.workspace = true
+nextcuda-audio.workspace = true
+nextcuda-tok.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"

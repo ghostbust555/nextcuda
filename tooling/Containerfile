@@ -1,0 +1,23 @@
+# The toolchain image the Rust program and the web front end are built in (build.sh makes it when it is missing).
+#
+# debian:trixie because the GPU hosts run Debian 13: a binary linked here against glibc 2.41 runs there unchanged.
+# Nothing from the repository is copied in - build.sh mounts the checkout at /build. The CUDA kernels are not built
+# here: they need nvcc, which is the GPU host's (kernels/build.sh).
+FROM debian:trixie
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config curl ca-certificates git file nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust, pinned so a build is the same build next month.
+ARG RUST_VERSION=1.98.1
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \
+    && chmod -R a+rX /opt/rustup /opt/cargo
+
+WORKDIR /build

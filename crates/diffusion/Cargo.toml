@@ -1,0 +1,15 @@
+[package]
+name = "nextcuda-diffusion"
+description = "What every diffusion engine (image, video) shares: samplers and schedules by name, the sigma schedules, LoRA references, pictures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-gguf.workspace = true
+png = "0.17"
+# reading pictures people upload for edits (JPEG and WebP besides PNG); CPU decoders only
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# PDF pages as pictures (pure Rust, CPU: the OCR models read pictures); no GPU runtime
+hayro = "0.8"

@@ -1,0 +1,19 @@
+[package]
+name = "nextcuda"
+description = "The command line: info, check, generate, serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-gguf.workspace = true
+nextcuda-core.workspace = true
+nextcuda-llm.workspace = true
+nextcuda-tok.workspace = true
+nextcuda-image.workspace = true
+nextcuda-image-qwenimage21.workspace = true
+nextcuda-video.workspace = true
+nextcuda-audio.workspace = true
+nextcuda-models.workspace = true
+nextcuda-serve.workspace = true
+serde_json.workspace = true

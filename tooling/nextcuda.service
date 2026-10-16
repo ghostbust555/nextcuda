@@ -1,0 +1,19 @@
+[Unit]
+Description=nextcuda control plane (the front door on :8000: the API, jobs, queue, model servers)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nextcuda
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+# the front door listens on every interface (the API needs its bearer token); the model servers it starts stay on
+# 127.0.0.1 and are reached through it
+ExecStart=%h/nextcuda/dist/nextcuda serve --host 0.0.0.0 --port 8000 --serve-host 127.0.0.1
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+# a restart (a deploy) ends the model servers it started with it: they are its children, and reload on the next request
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

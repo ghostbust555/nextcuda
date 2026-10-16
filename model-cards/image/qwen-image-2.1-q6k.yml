@@ -1,0 +1,28 @@
+# Qwen-Image 2.1 Q6_K (text to image, RGBA, edits; stable-diffusion.cpp on CUDA)
+# model card (model-cards/README.md): what `nextcuda models search | pull` offers and what the registry entry gets.
+# Files are stable-diffusion.cpp's (CUDA): the GGUF transformer, Qwen3-VL as a GGUF (+ its projector for edits), the VAE.
+id: qwen-image-2.1-q6k
+kind: image
+arch: qwen-image-2.1
+title: 'Qwen-Image 2.1 Q6_K (text to image, RGBA, edits; stable-diffusion.cpp on CUDA)'
+about: 'The same model with a Q6_K transformer (6.0 GB): for the 12 GB cards that also hold the text encoder'
+gpus: '0'
+vram_gib: 7.5                  # with the weights offloaded to host RAM and staged per graph (--offload-to-cpu)
+defaults:
+  steps: 40
+  cfg: 4.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: qwen-image-21-q6k
+    url: https://huggingface.co/leejet/Qwen-Image-2.1-GGUF/resolve/cc11433936a06e9765f7c0c0b1f0436cfd2b9856/qwen_image_2.1-Q6_K.gguf
+    size: 5996851232
+    sha256: 1c51d1a8e6cf2b215719dea0c4f0f4cbfff9214a1c7571e57913f57d6a9c3c12
+    path: qwen-image-2.1/diffusion_models/qwen_image_2.1-Q6_K.gguf
+  text-encoder: qwen-image-21-llm-q4km
+  llm-vision: qwen-image-21-llm-mmproj
+  vae: qwen-image-21-vae
+guide: guides/qwen-image-2.1.md

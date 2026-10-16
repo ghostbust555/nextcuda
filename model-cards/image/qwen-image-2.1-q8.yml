@@ -1,0 +1,43 @@
+# Qwen-Image 2.1 Q8_0 (text to image, RGBA, edits; stable-diffusion.cpp on CUDA)
+# model card (model-cards/README.md): what `nextcuda models search | pull` offers and what the registry entry gets.
+# Files are stable-diffusion.cpp's (CUDA): the GGUF transformer, Qwen3-VL as a GGUF (+ its projector for edits), the VAE.
+id: qwen-image-2.1-q8
+kind: image
+arch: qwen-image-2.1
+title: 'Qwen-Image 2.1 Q8_0 (text to image, RGBA, edits; stable-diffusion.cpp on CUDA)'
+about: 'Qwen''s 7B single-stream DiT as leejet''s Q8_0 GGUF, the Qwen3-VL 8B text encoder as Q4_K_M with its vision projector, the 64-channel RGBA VAE'
+gpus: '0'
+vram_gib: 9.0                  # with the weights offloaded to host RAM and staged per graph (--offload-to-cpu)
+defaults:
+  steps: 40
+  cfg: 4.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: qwen-image-21-q80
+    url: https://huggingface.co/leejet/Qwen-Image-2.1-GGUF/resolve/cc11433936a06e9765f7c0c0b1f0436cfd2b9856/qwen_image_2.1-Q8_0.gguf
+    size: 7687155744
+    sha256: f8b244b00937f0e444a40dbf7866460871b89b30142594973b6012d1b471dc0a
+    path: qwen-image-2.1/diffusion_models/qwen_image_2.1-Q8_0.gguf
+  text-encoder:
+    key: qwen-image-21-llm-q4km
+    url: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf
+    size: 5027784800
+    sha256: 67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2
+    path: qwen-image-2.1/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
+  llm-vision:
+    key: qwen-image-21-llm-mmproj
+    url: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-F16.gguf
+    size: 1159029824
+    sha256: ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38
+    path: qwen-image-2.1/text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf
+  vae:
+    key: qwen-image-21-vae
+    url: https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/5dc5850eb514a3685f6a03a2641728a8f7549c69/vae/qwen_image_2.1_vae_bf16.safetensors
+    size: 675509688
+    sha256: bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
+    path: qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors
+guide: guides/qwen-image-2.1.md

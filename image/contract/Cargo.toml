@@ -1,0 +1,10 @@
+[package]
+name = "nextcuda-image"
+description = "The image engines' contract: a request, a picture out, the progress, the registry entry an engine provides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true

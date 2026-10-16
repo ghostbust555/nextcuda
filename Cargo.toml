@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+# the layout (docs/architecture.md): the shared foundation (crates/), one group a kind - its contract and one engine
+# crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
+members = [
+    "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion",
+    "llm/contract",
+    "image/contract", "image/qwenimage21",
+    "video/contract",
+    "audio/contract",
+    "glue/models", "glue/serve",
+    "cli/nextcuda",
+]
+
+[workspace.package]
+version = "0.0.0"  # the release version is yy.mmdd.### from git (version.sh), handed in as NS_VERSION
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+nextcuda-sys = { path = "crates/sys" }
+nextcuda-core = { path = "crates/core" }
+nextcuda-gguf = { path = "crates/gguf" }
+nextcuda-tok = { path = "crates/tok" }
+nextcuda-diffusion = { path = "crates/diffusion" }
+nextcuda-llm = { path = "llm/contract" }
+nextcuda-image = { path = "image/contract" }
+nextcuda-image-qwenimage21 = { path = "image/qwenimage21" }
+nextcuda-video = { path = "video/contract" }
+nextcuda-audio = { path = "audio/contract" }
+nextcuda-models = { path = "glue/models" }
+nextcuda-serve = { path = "glue/serve" }
+serde_json = "1"
+
+[profile.release]
+debug = 1

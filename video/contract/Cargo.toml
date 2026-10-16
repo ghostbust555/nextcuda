@@ -1,0 +1,11 @@
+[package]
+name = "nextcuda-video"
+description = "The video engines' contract: a clip request, a clip out, the progress, the registry entry an engine provides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true
+serde_json.workspace = true

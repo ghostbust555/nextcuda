@@ -1,0 +1,27 @@
+# Qwen-Image 2.1 Q4 (realrebelai's GGUF; text to image, RGBA, edits; stable-diffusion.cpp on CUDA)
+# model card (model-cards/README.md): what `nextcuda models search | pull` offers and what the registry entry gets.
+id: qwen-image-2.1-rrq4
+kind: image
+arch: qwen-image-2.1
+title: 'Qwen-Image 2.1 Q4 (realrebelai GGUF, 6.0 GB; stable-diffusion.cpp on CUDA)'
+about: 'The 2.1 transformer as realrebelai''s Q4 GGUF (5.96 GB: the 12 GB cards hold it with room), with the same Qwen3-VL text encoder, projector and VAE as the Q8 card'
+gpus: '0'
+vram_gib: 7.5
+defaults:
+  steps: 40
+  cfg: 4.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: qwen-image-21-rrq4
+    url: https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs/resolve/8d393b750593a72ee040fe7d40611f479ccee679/Qwen-Image-2.1-Q4.gguf
+    size: 5959127264
+    sha256: 51998ad7c068ce7d68e233237537900ffe874ab4d5c72e20758f5f18ceb15b8a
+    path: qwen-image-2.1/diffusion_models/Qwen-Image-2.1-Q4.gguf
+  text-encoder: qwen-image-21-llm-q4km
+  llm-vision: qwen-image-21-llm-mmproj
+  vae: qwen-image-21-vae
+guide: guides/qwen-image-2.1.md

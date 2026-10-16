@@ -1,0 +1,11 @@
+[package]
+name = "nextcuda-audio"
+description = "The audio engines' contract: a request, a waveform out, the progress, the registry entry an engine provides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+# recordings in the common formats (a voice to clone): pure Rust decoders
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "pcm", "wav", "isomp4", "aac"] }
