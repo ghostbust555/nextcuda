@@ -234,6 +234,32 @@ pub fn selftest(gpu: &Arc<Gpu>) -> Result<Vec<f32>> {
         nsd.wait()?;
         out.push(within("linear half", &o2.to_f32()?, &want2, 1e-4)?);
     }
+    // int8 ConvRot: weights prepared from a float matrix (rotated, quantized per row), activations rotated and
+    // quantized on the fly, against the plain float product (error is the two int8 roundings: about a percent)
+    for group in [0usize, 64, 256] {
+        let (m, k, n) = (37usize, 512usize, 48usize);
+        let (x, w) = (data(m * k, 60, 1.0), data(n * k, 61, 0.5));
+        let xq: Vec<f32> = x.iter().map(|v| h(*v)).collect();
+        let mut want = vec![0f32; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                want[r * n + c] = (0..k).map(|i| xq[r * k + i] * w[c * k + i]).sum::<f32>();
+            }
+        }
+        let (dw, dx) = (put_f32(g, &w)?, put_half(g, &x)?);
+        let (q, sc, o) = (DevBuf::new(g, n * k)?, DevBuf::f32(g, n)?, DevBuf::new(g, m * n * 2)?);
+        nsd.int8_prepare(dw.ptr(), 0, 0, n, k, group, q.ptr(), sc.ptr())?;
+        nsd.int8_linear(dx.ptr(), Dt::F16, m, k, q.ptr(), n, sc.ptr(), none(), o.ptr(), Dt::F16, group, 0)?;
+        nsd.wait()?;
+        let got = get_half(&o, m * n)?;
+        // relative to the product's size (the values are of order sqrt(k) x the inputs' spread)
+        let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1.0);
+        let worst = got.iter().zip(&want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale;
+        if !(worst < 0.03) {
+            return Err(Error(format!("int8 linear (group {group}): worst error {worst:.2e} of the largest value, limit 3e-2")));
+        }
+        out.push(worst);
+    }
     // dequant: each GGUF type
     for (name, qt) in [("Q8_0", 8u32), ("Q4_K", 12), ("Q5_K", 13), ("Q6_K", 14)] {
         let (raw, want) = blocks(qt, 6, 10 + qt);

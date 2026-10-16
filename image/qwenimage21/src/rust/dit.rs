@@ -38,6 +38,9 @@ const EPS: f32 = 1e-6;
 /// RoPE: the frame, height and width axes' features (pairs: 8, 28, 28)
 const AXES: [usize; 3] = [16, 56, 56];
 
+/// The ConvRot group: int8 matrices are rotated by the normalized 256 x 256 Hadamard matrix along their inputs
+const GROUP: usize = 256;
+
 /// One stored matrix of a block, kept in its GGUF type on the card (Q8_0, Q6_K, Q5_K, BF16 ...): the 12 GB cards hold
 /// the whole transformer at its stored size (7.3 GB for the Q8_0 file) and a slice of rows is made half at a time
 struct Part {
@@ -67,6 +70,9 @@ struct LoraPair {
 /// weights are quantized, so there is nothing to merge into.
 struct Mat {
     parts: Vec<Part>,
+    /// the matrix as int8 rows (ConvRot: rotated by the Hadamard matrix along the inputs, a scale per row) and the
+    /// parts dropped: `NS_QI_INT8=1`, the card's int8 tensor cores
+    int8: Option<(DevBuf, DevBuf)>,
     n: usize,
     k: usize,
     slots: Vec<Slot>,
@@ -77,11 +83,15 @@ impl Mat {
     /// out [m, n] = x [m, k] (half) . W^T, each part's rows written beside the others'
     fn apply(&self, nsd: &Nsd, x: *const std::ffi::c_void, m: usize, k: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
         let esz = if out_dt == Dt::F32 { 4 } else { 2 };
-        let mut off = 0usize;
-        for p in &self.parts {
-            let o = out.cast::<u8>().wrapping_add(off * esz).cast();
-            nsd.linear_q(x, Dt::F16, m, k, p.w.ptr(), p.qtype, p.rows, none(), o, out_dt, self.n)?;
-            off += p.rows;
+        if let Some((w, s)) = &self.int8 {
+            nsd.int8_linear(x, Dt::F16, m, k, w.ptr(), self.n, s.ptr(), none(), out, out_dt, GROUP, self.n)?;
+        } else {
+            let mut off = 0usize;
+            for p in &self.parts {
+                let o = out.cast::<u8>().wrapping_add(off * esz).cast();
+                nsd.linear_q(x, Dt::F16, m, k, p.w.ptr(), p.qtype, p.rows, none(), o, out_dt, self.n)?;
+                off += p.rows;
+            }
         }
         let act = self.active.lock().unwrap();
         if !act.is_empty() && out_dt == Dt::F16 {
@@ -182,8 +192,8 @@ fn ge(e: nextcuda_gguf::Error) -> Error {
 }
 
 impl Dit {
-    /// The weights from `f`, matrices in the type they are stored in
-    pub fn load(f: &Gguf, nsd: &Nsd, log: &mut dyn FnMut(String)) -> Result<Dit> {
+    /// The weights from `f`, matrices in the type they are stored in; `int8`: the block matrices as int8 ConvRot rows
+    pub fn load(f: &Gguf, nsd: &Nsd, int8: bool, log: &mut dyn FnMut(String)) -> Result<Dit> {
         let gpu = nsd.gpu.clone();
         let t0 = std::time::Instant::now();
         let tensor = |name: &str| f.tensor(name).ok_or_else(|| Error(format!("{}: no tensor {name}", f.paths[0].display())));
@@ -228,7 +238,23 @@ impl Dit {
                     }).collect()
                 }
             };
-            Ok(Mat { parts, n, k, slots: list, active: Mutex::new(Vec::new()) })
+            // int8: the parts' rows rotated and quantized into one matrix [n, k] (one quantization of the activations
+            // serves all of its rows), the stored copies let go
+            let q8 = if int8 {
+                let w = DevBuf::new(&gpu, n * k)?;
+                let sc = DevBuf::f32(&gpu, n)?;
+                let mut off = 0usize;
+                for p in &parts {
+                    nsd.int8_prepare(p.w.ptr(), p.qtype, 0, p.rows, k, GROUP, w.ptr().cast::<u8>().wrapping_add(off * k).cast(), sc.fp().wrapping_add(off).cast())?;
+                    off += p.rows;
+                }
+                nsd.wait()?;
+                Some((w, sc))
+            } else {
+                None
+            };
+            let parts = if q8.is_some() { Vec::new() } else { parts };
+            Ok(Mat { parts, int8: q8, n, k, slots: list, active: Mutex::new(Vec::new()) })
         };
         // a vector (norm weights, a small linear) as float32 on the host, whatever its stored type
         let host_vec = |name: &str| -> Result<Vec<f32>> {
@@ -286,7 +312,7 @@ impl Dit {
             proj_out: single("proj_out.weight")?,
             saved: Mutex::new(Vec::new()),
         };
-        log(format!("qwen-image 2.1: {n_blocks} blocks on {} (as stored) in {:.1} s", gpu.name, t0.elapsed().as_secs_f64()));
+        log(format!("qwen-image 2.1: {n_blocks} blocks on {} ({}) in {:.1} s", gpu.name, if int8 { "int8 ConvRot" } else { "as stored" }, t0.elapsed().as_secs_f64()));
         Ok(dit)
     }
 

@@ -51,6 +51,7 @@ const LATENT_STD: [f32; 64] = [
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "step-profile", env: "NS_QI_PROFILE", value: "0|1", help: "wait after each named step and report where the time goes", at: At::Load },
+    EngineOption { name: "int8", env: "NS_QI_INT8", value: "0|1", help: "the DiT's block matrices in int8 ConvRot: the card's int8 tensor cores (about 3x the half rate on a GeForce)", at: At::Load },
     EngineOption { name: "sigmas", env: "NS_QI_SIGMAS", value: "1,X,...", help: "the noise levels from 1 down (a few-step model's own; its step count)", at: At::Both },
     EngineOption { name: "sigma-shift", env: "NS_QI_SIGMA_SHIFT", value: "dynamic|none", help: "the size's shift on those levels, or as given", at: At::Both },
 ];
@@ -164,7 +165,8 @@ impl RustQwenImage21 {
         }
         let nsd = Nsd::new(gpu)?;
         let te = GgufTextEncoder::load(role(files, "text-encoder")?, gpu, log)?;
-        let dit = dit::Dit::load(&f, &nsd, log)?;
+        let int8 = o.setting("NS_QI_INT8").is_some_and(|v| v == "1");
+        let dit = dit::Dit::load(&f, &nsd, int8, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
         dit.set_loras(&nsd, &base_loras)?;
         Ok(RustQwenImage21 {

@@ -4,6 +4,7 @@
 #include "ns_internal.hpp"
 
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -21,10 +22,14 @@ struct Ctx {
     int dev = 0;
     cudaStream_t s = nullptr;
     cublasHandle_t cb = nullptr;
+    cublasLtHandle_t lt = nullptr;
     // scratch buffers (grown, kept): 0 = score table, 1 = probabilities, 2 = im2col / reordered weights,
-    // 3 = a slice of dequantized weights
-    void* buf[4] = {nullptr, nullptr, nullptr, nullptr};
-    size_t cap[4] = {0, 0, 0, 0};
+    // 3 = a slice of dequantized weights, 4 = the rotated activations, 5 = int8 activations, 6 = int32 accumulators,
+    // 7 = cublasLt's workspace
+    void* buf[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t cap[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // the normalized Hadamard matrix of each group size (16, 64, 256), half, on the card
+    void* had[3] = {nullptr, nullptr, nullptr};
 };
 
 int cuda_fail(cudaError_t e, const char* what) {
@@ -238,6 +243,41 @@ __global__ void rope_k(void* x, int dt, int64_t D, int64_t stride, const float* 
     }
 }
 
+// per row of [M, K] (x already rotated, dt): scale = max|x| / 127, int8 = round(x / scale)
+__global__ void quant_rows_k(const void* x, int dt, int64_t K, int8_t* q, float* scale) {
+    const int64_t r = blockIdx.x;
+    float m = 0.0f;
+    for (int64_t i = threadIdx.x; i < K; i += blockDim.x) m = fmaxf(m, fabsf(get(x, dt, r * K + i)));
+    const float s = fmaxf(block_max(m) / 127.0f, 1e-30f);
+    for (int64_t i = threadIdx.x; i < K; i += blockDim.x) q[r * K + i] = (int8_t) fminf(fmaxf(rintf(get(x, dt, r * K + i) / s), -128.0f), 127.0f);
+    if (threadIdx.x == 0) scale[r] = s;
+}
+
+// out[r, n] = acc[r, n] * xs[r] * ws[n] (+ bias[n]) for rows [r0, r0 + rows) of an out whose rows are ldo apart
+__global__ void i8_epilogue_k(const int32_t* acc, int64_t rows, int64_t N, const float* xs, const float* ws, const float* bias, void* out, int dt,
+                              int64_t ldo, int64_t r0) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * N) return;
+    const int64_t r = i / N, n = i % N;
+    float v = (float) acc[i] * xs[r0 + r] * ws[n];
+    if (bias) v += bias[n];
+    put(out, dt, (r0 + r) * ldo + n, v);
+}
+
+// the normalized regular Hadamard matrix of size g (a power of 4): H4 (x) H4 (x) ... / sqrt(g), as nextsycl's
+__global__ void hadamard_k(__half* h, int g) {
+    const int i = blockIdx.x, j = threadIdx.x;
+    if (j >= g) return;
+    const int H4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
+    int a = i, b = j, sign = 1;
+    for (int sz = 1; sz < g; sz *= 4) {
+        sign *= H4[a % 4][b % 4];
+        a /= 4;
+        b /= 4;
+    }
+    h[i * g + j] = __float2half_rn((float) sign / sqrtf((float) g));
+}
+
 __global__ void swiglu_k(const void* x, int xdt, int64_t C, void* out, int odt, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -364,6 +404,54 @@ int attention(Ctx* c, const void* q, int64_t Sq, int64_t qs, const void* k, cons
     return 0;
 }
 
+// the Hadamard matrix of `group` (16, 64 or 256) on the card, made once
+void* hadamard(Ctx* c, int group) {
+    const int k = group == 16 ? 0 : group == 64 ? 1 : group == 256 ? 2 : -1;
+    if (k < 0) return nullptr;
+    if (!c->had[k]) {
+        if (cudaMalloc(&c->had[k], (size_t) group * group * 2) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+        hadamard_k<<<group, group, 0, c->s>>>((__half*) c->had[k], group);
+    }
+    return c->had[k];
+}
+
+// int8 x int8 -> int32 through cuBLASLt: out [M, N] row-major = xq [M, K] . wq [N, K]^T
+int imma(Ctx* c, const int8_t* xq, int64_t M, int64_t K, const int8_t* wq, int64_t N, int32_t* out) {
+    cublasLtMatmulDesc_t d = nullptr;
+    cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    int rc = 0;
+    const size_t wss = 32ull << 20;
+    void* ws = scratch(c, 7, wss);
+    if (!ws) return fail("int8 linear: the workspace did not fit in memory");
+    do {
+        if (cublasLtMatmulDescCreate(&d, CUBLAS_COMPUTE_32I, CUDA_R_32I) != CUBLAS_STATUS_SUCCESS) { rc = fail("cublasLt: descriptor"); break; }
+        const cublasOperation_t t = CUBLAS_OP_T, n = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof t);
+        cublasLtMatmulDescSetAttribute(d, CUBLASLT_MATMUL_DESC_TRANSB, &n, sizeof n);
+        cublasLtMatrixLayoutCreate(&la, CUDA_R_8I, K, N, K);
+        cublasLtMatrixLayoutCreate(&lb, CUDA_R_8I, K, M, K);
+        cublasLtMatrixLayoutCreate(&lc, CUDA_R_32I, N, M, N);
+        cublasLtMatmulPreferenceCreate(&pref);
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wss, sizeof wss);
+        cublasLtMatmulHeuristicResult_t h;
+        int nr = 0;
+        if (cublasLtMatmulAlgoGetHeuristic(c->lt, d, la, lb, lc, lc, pref, 1, &h, &nr) != CUBLAS_STATUS_SUCCESS || nr == 0) {
+            rc = fail("cublasLt: no int8 algorithm for this shape (K and N must be multiples of 4)");
+            break;
+        }
+        const int32_t one = 1, zero = 0;
+        cublasStatus_t st = cublasLtMatmul(c->lt, d, &one, wq, la, xq, lb, &zero, out, lc, out, lc, &h.algo, ws, wss, c->s);
+        if (st != CUBLAS_STATUS_SUCCESS) rc = blas_fail(st, "cublasLtMatmul (int8)");
+    } while (0);
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (lc) cublasLtMatrixLayoutDestroy(lc);
+    if (lb) cublasLtMatrixLayoutDestroy(lb);
+    if (la) cublasLtMatrixLayoutDestroy(la);
+    if (d) cublasLtMatmulDescDestroy(d);
+    return rc;
+}
+
 }  // namespace
 
 extern "C" {
@@ -380,6 +468,7 @@ void* nsd_create(void* gpu) {
     if (cublasCreate(&c->cb) != CUBLAS_STATUS_SUCCESS) { delete c; fail("nsd_create: cublasCreate failed"); return nullptr; }
     cublasSetStream(c->cb, c->s);
     cublasSetMathMode(c->cb, CUBLAS_DEFAULT_MATH);
+    if (cublasLtCreate(&c->lt) != CUBLAS_STATUS_SUCCESS) { cublasDestroy(c->cb); delete c; fail("nsd_create: cublasLtCreate failed"); return nullptr; }
     return c;
 }
 
@@ -389,6 +478,8 @@ void nsd_destroy(void* ctx) {
     cudaSetDevice(c->dev);
     cudaStreamSynchronize(c->s);
     for (void* b : c->buf) if (b) cudaFree(b);
+    for (void* b : c->had) if (b) cudaFree(b);
+    cublasLtDestroy(c->lt);
     cublasDestroy(c->cb);
     delete c;
 }
@@ -463,6 +554,93 @@ int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const v
         if (int rc = gemm_nt(c, x, dt, M, K, wt, dt, n, o, out_dt, 0.0f, ldo ? ldo : N)) return rc;
         if (bias) { bias_cols_k<<<nb(M * n), 256, 0, c->s>>>(out, out_dt, M, ldo ? ldo : N, r0, n, bias); LAUNCHED("bias"); }
     }
+    return 0;
+}
+
+int nsd_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, const int8_t* w, int64_t N, const float* wscale, const float* bias,
+                    void* out, int out_dt, int group, int64_t ldo) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    if (K % 4 || N % 4) return fail("nsd_int8_linear: K and N must be multiples of 4");
+    if (group && K % group) return fail("nsd_int8_linear: group does not divide K");
+    // rows a pass: the int32 accumulators under ~256 MiB
+    int64_t rows = std::max<int64_t>(64, std::min<int64_t>(M, ((256ll << 20) / 4) / N));
+    rows = std::min(rows, M);
+    // (rows rounded up to 4: the int8 product wants every dimension a multiple of 4; the extra rows are zeros)
+    int8_t* xq = (int8_t*) scratch(c, 5, (size_t) (rows + 4) * K);
+    // the accumulators 256-byte aligned after the row scales (cuBLASLt wants aligned operands)
+    const size_t xs_bytes = ((size_t) M * 4 + 255) / 256 * 256;
+    float* xs = (float*) scratch(c, 6, xs_bytes + (size_t) (rows + 4) * N * 4);
+    if (!xq || !xs) return fail("nsd_int8_linear: the activation buffers did not fit in memory");
+    int32_t* acc = (int32_t*) ((char*) xs + xs_bytes);
+    void* rot = nullptr;
+    void* hmat = nullptr;
+    if (group) {
+        hmat = hadamard(c, group);
+        rot = scratch(c, 4, (size_t) rows * K * 2);
+        if (!hmat || !rot) return fail("nsd_int8_linear: no Hadamard matrix for group " + std::to_string(group) + " (16, 64 or 256)");
+    }
+    for (int64_t r0 = 0; r0 < M; r0 += rows) {
+        const int64_t r = std::min(rows, M - r0);
+        const char* xr = (const char*) x + (size_t) r0 * K * esz(x_dt);
+        const void* src = xr;
+        int sdt = x_dt;
+        if (group) {
+            if (x_dt != NSD_F16) return fail("nsd_int8_linear: the rotation takes half activations");
+            // (r * K / group) rows of `group` times H
+            if (int rc = gemm_nt(c, xr, NSD_F16, r * K / group, group, hmat, NSD_F16, group, rot, NSD_F16, 0.0f)) return rc;
+            src = rot;
+            sdt = NSD_F16;
+        }
+        quant_rows_k<<<(unsigned) r, WG, 0, c->s>>>(src, sdt, K, xq, xs + r0);
+        LAUNCHED("int8 quantize");
+        const int64_t rp = (r + 3) & ~3ll;
+        if (rp > r) CU(cudaMemsetAsync(xq + (size_t) r * K, 0, (size_t) (rp - r) * K, c->s));
+        if (int rc = imma(c, xq, rp, K, w, N, acc)) return rc;
+        i8_epilogue_k<<<nb(r * N), 256, 0, c->s>>>(acc, r, N, xs, wscale, bias, out, out_dt, ldo ? ldo : N, r0);
+        LAUNCHED("int8 epilogue");
+    }
+    return 0;
+}
+
+int nsd_int8_prepare(void* ctx, const void* src, int qtype, int64_t row0, int64_t n, int64_t K, int group, int8_t* q, float* scale) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    int64_t rb = 0;
+    if (!row_geometry(qtype, K, &rb)) return fail("nsd_int8_prepare: a row of " + std::to_string(K) + " values is not whole blocks of GGUF type " + std::to_string(qtype));
+    if (group && K % group) return fail("nsd_int8_prepare: group does not divide K");
+    // a slice of rows a time: float32 [rows, K] and its rotation, about 64 MiB each
+    const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(n, (64ll << 20) / (K * 4)));
+    float* f = (float*) scratch(c, 3, (size_t) rows * K * 4 * 2);
+    if (!f) return fail("nsd_int8_prepare: the slice did not fit in memory");
+    float* g = f + (size_t) rows * K;
+    void* hmat = nullptr;
+    __half* hh = nullptr;
+    if (group) {
+        hmat = hadamard(c, group);
+        if (!hmat) return fail("nsd_int8_prepare: no Hadamard matrix for group " + std::to_string(group));
+    }
+    for (int64_t r = 0; r < n; r += rows) {
+        const int64_t m = std::min(rows, n - r);
+        dequant_slice_k<<<nb(m * K), 256, 0, c->s>>>((const uint8_t*) src, qtype, (row0 + r) * K, m * K, f, NSD_F32);
+        LAUNCHED("int8 prepare: dequant");
+        const float* use = f;
+        if (group) {
+            // float32 rows times H: the rotation in float32, as the reference
+            const float alpha = 1.0f, beta = 0.0f;
+            // H as float32 for this product: made from the half matrix (its values are +-1/sqrt(g), exact in half for
+            // g = 4^k only up to rounding; the float32 copy keeps it)
+            float* hf = (float*) scratch(c, 2, (size_t) group * group * 4);
+            if (!hf) return fail("nsd_int8_prepare: no memory for H");
+            dequant_k<<<nb((int64_t) group * group), 256, 0, c->s>>>((const uint8_t*) hmat, 1, (int64_t) group * group, hf, NSD_F32);
+            BL(cublasGemmEx(c->cb, CUBLAS_OP_T, CUBLAS_OP_N, group, (int) (m * K / group), group, &alpha, hf, CUDA_R_32F, group, f, CUDA_R_32F, group, &beta, g,
+                            CUDA_R_32F, group, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            use = g;
+        }
+        quant_rows_k<<<(unsigned) m, WG, 0, c->s>>>(use, NSD_F32, K, q + (size_t) r * K, scale + r);
+        LAUNCHED("int8 prepare: quantize");
+    }
+    (void) hh;
     return 0;
 }
 

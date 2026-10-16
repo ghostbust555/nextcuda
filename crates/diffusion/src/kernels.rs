@@ -33,6 +33,8 @@ struct Api {
     linear: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, c_int) -> c_int,
     linear_acc: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, i64) -> c_int,
     linear_q: unsafe extern "C" fn(M, P, c_int, i64, i64, P, c_int, i64, *const f32, M, c_int, i64) -> c_int,
+    int8_linear: unsafe extern "C" fn(M, P, c_int, i64, i64, *const i8, i64, *const f32, *const f32, M, c_int, c_int, i64) -> c_int,
+    int8_prepare: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, c_int, *mut i8, *mut f32) -> c_int,
     dequant: unsafe extern "C" fn(M, P, c_int, i64, M, c_int) -> c_int,
     rms_norm_mod: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, f32, *const i32, *const f32, *const f32, M, c_int) -> c_int,
     rms_rope: unsafe extern "C" fn(M, M, c_int, i64, i64, i64, i64, *const f32, f32, *const f32, c_int) -> c_int,
@@ -77,6 +79,8 @@ fn api() -> Result<&'static Api> {
             linear: sym!("nsd_linear"),
             linear_acc: sym!("nsd_linear_acc"),
             linear_q: sym!("nsd_linear_q"),
+            int8_linear: sym!("nsd_int8_linear"),
+            int8_prepare: sym!("nsd_int8_prepare"),
             dequant: sym!("nsd_dequant"),
             rms_norm_mod: sym!("nsd_rms_norm_mod"),
             rms_rope: sym!("nsd_rms_rope"),
@@ -171,6 +175,24 @@ impl Nsd {
         // SAFETY: the caller's buffers hold the sizes named.
         self.ok(unsafe { (self.k.linear_q)(self.ctx, x, dt as c_int, m as i64, k as i64, w, qtype as c_int, n as i64, bias.cast(), out, out_dt as c_int, ldo as i64) },
                 "quantized linear")
+    }
+
+    /// out [M, N] = x [M, K] . W^T with int8 W [N, K] and a scale per row (ConvRot when `group` > 0: the activations
+    /// rotated by the normalized Hadamard matrix a group at a time, quantized per row, the product on the int8
+    /// tensor cores); bias float32 [N] or null; `ldo`: the row stride of out (0: n)
+    #[allow(clippy::too_many_arguments)]
+    pub fn int8_linear(&self, x: P, x_dt: Dt, m: usize, k: usize, w: P, n: usize, wscale: P, bias: P, out: M, out_dt: Dt, group: usize, ldo: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.int8_linear)(self.ctx, x, x_dt as c_int, m as i64, k as i64, w.cast(), n as i64, wscale.cast(), bias.cast(), out, out_dt as c_int,
+                                               group as c_int, ldo as i64) }, "int8 linear")
+    }
+
+    /// Rows [row0, row0 + n) of a [_, K] matrix of GGUF type `qtype` as int8 rows (rotated by H when `group` > 0) with
+    /// a scale each: q int8 [n, K], scale float32 [n]
+    #[allow(clippy::too_many_arguments)]
+    pub fn int8_prepare(&self, src: P, qtype: u32, row0: usize, n: usize, k: usize, group: usize, q: M, scale: M) -> Result<()> {
+        // SAFETY: src holds the rows; q n x k bytes, scale n floats.
+        self.ok(unsafe { (self.k.int8_prepare)(self.ctx, src, qtype as c_int, row0 as i64, n as i64, k as i64, group as c_int, q.cast(), scale.cast()) }, "int8 weights")
     }
 
     /// `n` values of a GGUF type to `out_dt` (12 Q4_K, 13 Q5_K, 14 Q6_K, 8 Q8_0, 30 BF16, 1 F16, 0 F32)

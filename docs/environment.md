@@ -233,6 +233,7 @@ Qwen-Image 2.1 (`image/qwenimage21`).
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |
 | `NS_QI_PROFILE` | off | Debug: set: a GPU wait after each named step, the totals printed (slower; shows where the time goes) | image qwenimage21 |
+| `NC_TE_HOST_CACHE` | 1 | 0: do not keep the streamed text-encoder layers in host RAM (they are re-read from disk for every prompt; saves ~5 GB of RAM) | image qwenimage21 |
 | `NS_QI_SIGMAS` | the model's own schedule | a few-step preset: noise levels from 1 down, comma separated (their count is the steps) (--opt-sigmas; per request too) | image qwenimage21 |
 | `NS_QI_SIGMA_SHIFT` | dynamic | dynamic: the picture size's shift on the NS_QI_SIGMAS levels; none: as given (--opt-sigma-shift; per request too) | image qwenimage21 |
 

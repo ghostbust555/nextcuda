@@ -47,6 +47,23 @@ int nsd_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int
 int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int qtype, int64_t N, const float* bias,
                  void* out, int out_dt, int64_t ldo);
 
+/* A linear layer with int8 weights and activations quantized on the fly - nextsycl's int8_linear (ComfyUI's ConvRot):
+ *
+ *   x_rot = x . H           per group of `group` features, H the normalized regular Hadamard matrix ("ConvRot")
+ *   s_r   = max|x_rot[r]| / 127                          per row, at least 1e-30
+ *   q     = clamp(round(x_rot / s_r), -128, 127)         int8
+ *   acc   = q . W^T                                      int32 - the card's int8 tensor cores
+ *   out   = acc * s_r * wscale + bias                    in out_dt
+ *
+ * x [M, K] in x_dt (half or float32); w int8 [N, K]; wscale float32 [N]; bias float32 [N] or NULL; out [M, N] in
+ * out_dt, its rows `ldo` elements apart (0: N). group = 0: no rotation, else a power of 4, at most 256, dividing K. */
+int nsd_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, const int8_t* w, int64_t N, const float* wscale,
+                    const float* bias, void* out, int out_dt, int group, int64_t ldo);
+/* The weights for it from a matrix of any GGUF type (or half / float32 with qtype 1 / 0): rows [row0, row0 + n) of
+ * src [N_total, K] are dequantized, rotated by H (along K, groups of `group`), and quantized per row into
+ * q int8 [n, K] and scale float32 [n] (scale[r] = max|row| / 127, q = round(row / scale)). */
+int nsd_int8_prepare(void* ctx, const void* src, int qtype, int64_t row0, int64_t n, int64_t K, int group, int8_t* q, float* scale);
+
 /* Row-wise RMS norm, optionally followed by a per-row scale and shift picked from a table:
  *   n   = x[r] / sqrt(mean(x[r]^2) + eps) * weight
  *   out = n * (1 + scale[rows[r]]) + shift[rows[r]]        (or out = n when rows, scale or shift is NULL)
