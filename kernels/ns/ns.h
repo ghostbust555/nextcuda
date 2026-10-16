@@ -46,6 +46,7 @@ int ns_copy_2d(ns_gpu* g, void* dst, size_t dpitch, const void* src, size_t spit
 int ns_mark(ns_gpu* g, int64_t* ticket);
 int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_await(ns_gpu* g, int64_t ticket);
+int ns_stream_copy_batch(ns_gpu* g, void* const* dsts, const void* const* srcs, const size_t* sizes, size_t n, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_stamp(ns_gpu* g, int64_t* ticket);
 int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns);
 int ns_fill(ns_gpu* g, void* dst, uint8_t value, size_t bytes);

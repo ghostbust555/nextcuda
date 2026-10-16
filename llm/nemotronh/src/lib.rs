@@ -275,6 +275,8 @@ pub struct Times {
     pub parts: std::collections::BTreeMap<&'static str, f64>,
 }
 
+type CopyBatch = unsafe extern "C" fn(*mut c_void, *const *mut c_void, *const *const c_void, *const usize, usize, *const i64, i32, i32, *mut i64) -> i32;
+
 /// A Q8_1 copy of rows
 struct Q8 {
     buf: DevBuf,
@@ -356,6 +358,9 @@ pub struct NemotronH {
     /// decode's staging copies on copy lane 1 (NS_NH_COPY_LANE=0: on the GPU's stream), so the experts already in VRAM are
     /// multiplied while the others are copied up (three batches: in VRAM, staged, read from disk)
     copy_lane: bool,
+    /// the core library's ns_stream_copy_batch, if it has it (NS_NH_COPY_BATCH=0: not used): a layer's staging copies in one
+    /// call instead of one each
+    copy_batch: Option<CopyBatch>,
     pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
     /// MoE layers ahead whose misses a guess reads, and how many of each guess's top experts
     pred_ahead: usize,
@@ -712,6 +717,7 @@ impl NemotronH {
     fn stage(&self, c: &mut ExpertCache, m: &Moe, xs: &[usize]) -> Result<Option<i64>> {
         let Some(cap) = c.stage.as_ref().map(|b| b.len) else { return Ok(None) };
         let mut last: Option<i64> = None;
+        let (mut dsts, mut srcs, mut sizes): (Vec<*mut c_void>, Vec<*const c_void>, Vec<usize>) = Default::default();
         let mut done = std::collections::HashSet::new();
         for x in xs {
             if !done.insert(*x) {
@@ -762,7 +768,11 @@ impl NemotronH {
                 // SAFETY: a pinned slot of ex.stride bytes to the staging buffer's [off, off + stride), on the GPU's stream
                 // or on copy lane 1 after the kernels that last read the buffer.
                 let dst = unsafe { c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off) };
-                if self.copy_lane {
+                if self.copy_lane && self.copy_batch.is_some() {
+                    dsts.push(dst.cast());
+                    srcs.push(src as *const c_void);
+                    sizes.push(ex.stride);
+                } else if self.copy_lane {
                     let after: Vec<i64> = if c.stage_done >= 0 { vec![c.stage_done] } else { Vec::new() };
                     let mut tk = 0i64;
                     ffi::check(unsafe { (nextcuda_core::api()?.stream_copy)(self.raw(), dst.cast(), src as *const c_void, ex.stride, after.as_ptr(), after.len() as i32, 1, &mut tk) }, "staging an expert")?;
@@ -772,6 +782,14 @@ impl NemotronH {
                 }
                 c.stage_map.insert(key, off);
             }
+        }
+        if let (Some(f), false) = (self.copy_batch, dsts.is_empty()) {
+            let after: Vec<i64> = if c.stage_done >= 0 { vec![c.stage_done] } else { Vec::new() };
+            let mut tk = 0i64;
+            // SAFETY: dsts[i] is ex.stride bytes of the staging buffer, srcs[i] a pinned slot of sizes[i] bytes; copy lane 1
+            // after the kernels that last read the buffer.
+            ffi::check(unsafe { f(self.raw(), dsts.as_ptr(), srcs.as_ptr(), sizes.as_ptr(), dsts.len(), after.as_ptr(), after.len() as i32, 1, &mut tk) }, "staging experts")?;
+            last = Some(tk);
         }
         Ok(last)
     }
@@ -1173,6 +1191,11 @@ impl NemotronH {
         if let (Some((_, p)), true) = (&cpu, cpu_frac > 0.0) {
             log(format!("nemotronh: decode multiplies {:.0} % of a layer's pinned experts on {} CPU threads (ggml-cpu)", cpu_frac * 100.0, p.threads));
         }
+        let copy_batch: Option<CopyBatch> = match nextcuda_core::api()?.symbol("ns_stream_copy_batch") {
+            p if p.is_null() || std::env::var("NS_NH_COPY_BATCH").is_ok_and(|v| v == "0") => None,
+            // SAFETY: ns.h's declaration of ns_stream_copy_batch is CopyBatch.
+            p => Some(unsafe { std::mem::transmute::<*mut c_void, CopyBatch>(p) }),
+        };
         let io = Io::new(&f, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
         let arena_home = DevBuf::new(&gpu, arena_bytes(resident_rows) as usize)?;
         let arena = Arena::on(arena_home.view(0, arena_home.len)?);
@@ -1184,7 +1207,7 @@ impl NemotronH {
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram"), copy_lane: std::env::var("NS_NH_COPY_LANE").map_or(true, |v| v != "0") })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram"), copy_lane: std::env::var("NS_NH_COPY_LANE").map_or(true, |v| v != "0"), copy_batch })
     }
 
     /// A new conversation of up to `max_ctx` tokens

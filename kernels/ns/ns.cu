@@ -198,6 +198,22 @@ int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const in
     return 0;
 }
 
+// `n` copies (dsts[i] <- srcs[i], sizes[i] bytes) in one call on copy lane `lane`, after the tickets `after`; one ticket
+// after them all (cudaMemcpyBatchAsync: the driver's work for many small copies done once)
+int ns_stream_copy_batch(ns_gpu* g, void* const* dsts, const void* const* srcs, const size_t* sizes, size_t n, const int64_t* after, int ndeps, int lane, int64_t* ticket) {
+    NS_CU(use(g));
+    cudaStream_t s = lane ? g->cq2 : g->cq;
+    for (int i = 0; i < ndeps; ++i) NS_CU(cudaStreamWaitEvent(s, g->ev[after[i] % g->ev.size()], 0));
+    if (n > 0) {
+        cudaMemcpyAttributes a = {};
+        a.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t idx = 0;
+        NS_CU(cudaMemcpyBatchAsync(dsts, srcs, sizes, n, &a, &idx, 1, s));
+    }
+    *ticket = keep(g, s);
+    return 0;
+}
+
 // a timestamp: an event on the GPU's stream (its time is when the work before it ended); its ticket
 int ns_stamp(ns_gpu* g, int64_t* ticket) {
     NS_CU(use(g));
