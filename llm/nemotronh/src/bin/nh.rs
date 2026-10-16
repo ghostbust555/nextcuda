@@ -175,6 +175,8 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
         let t0 = Instant::now();
         let mut logits = m.forward(&mut s, &ids, 1).expect("prompt");
         let pp = t0.elapsed().as_secs_f64();
+        eprintln!("[{n}: prompt times {:?}]", m.times.lock().unwrap());
+        *m.times.lock().unwrap() = Default::default();
         let t1 = Instant::now();
         for _ in 0..new {
             let l = &logits[0];
@@ -183,6 +185,8 @@ fn bench(path: &str, sizes: &str, new: usize, a: &[String]) {
         }
         let dec = t1.elapsed().as_secs_f64();
         let h1 = m.cache_stats();
+        eprintln!("[{n}: decode times {:?}]", m.times.lock().unwrap());
+        *m.times.lock().unwrap() = Default::default();
         let (peak, joules, secs) = {
             let g = smp.lock().unwrap();
             let w = &g[from.min(g.len())..];

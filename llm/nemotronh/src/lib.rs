@@ -280,6 +280,8 @@ pub struct Options {
     pub chunk: usize,
     /// MiB of pinned memory for a prompt pass's misses (part of the pinned budget)
     pub scratch_mib: usize,
+    /// decode passes copy the experts they use from pinned memory into VRAM before the products
+    pub stage: bool,
 }
 
 impl Default for Options {
@@ -291,6 +293,7 @@ impl Default for Options {
             pinned_gib: env("NS_NH_PINNED_GIB").and_then(|v| v.parse().ok()).unwrap_or(14.0),
             reserve_mib: env("NS_NH_RESERVE_MIB").and_then(|v| v.parse().ok()).unwrap_or(1800),
             profile: None,
+            stage: env("NS_NH_STAGE").map_or(true, |v| v != "0"),
             scratch_mib: env("NS_NH_SCRATCH_MIB").and_then(|v| v.parse().ok()).unwrap_or(1024),
             chunk: env("NS_NH_CHUNK").and_then(|v| v.parse().ok()).unwrap_or(512).clamp(1, CHUNK),
         }
@@ -311,6 +314,9 @@ pub struct NemotronH {
     cache: Option<std::sync::Mutex<ExpertCache>>,
     direct: Option<Direct>,
     chunk: usize,
+    /// the largest dense matrix as half (the prompt passes' GEMMs), and the rows from which they are used
+    w16: Option<DevBuf>,
+    dense_gemm_min: usize,
     pub times: std::sync::Mutex<Times>,
     pub load_s: f64,
 }
@@ -344,6 +350,11 @@ struct ExpertCache {
     scratch: Option<(HostBuf, DevBuf)>,
     scratch_used: usize,
     scratch_map: std::collections::HashMap<Key, usize>,
+    /// VRAM room for a decode pass's experts copied from pinned memory (a DMA at the link's speed, then products at VRAM's:
+    /// better than the kernels reading host memory a few words at a time)
+    stage: Option<DevBuf>,
+    stage_used: usize,
+    stage_map: std::collections::HashMap<Key, usize>,
 }
 
 impl NemotronH {
@@ -737,16 +748,39 @@ impl NemotronH {
         } else {
             None
         };
+        // the biggest dense matrix as half
+        let mut big = 0usize;
+        for ly in &layers {
+            let mats: Vec<&Mat> = match &ly.mix {
+                Mix::Mamba(m) => vec![&m.inp, &m.out],
+                Mix::Attn(a) => vec![&a.q, &a.k, &a.v, &a.o],
+                Mix::Moe(m) => vec![&m.to_latent, &m.from_latent, &m.sh_up, &m.sh_down],
+            };
+            for x in mats {
+                if x.ty != GType::F32 {
+                    big = big.max(x.rows * x.cols * 2);
+                }
+            }
+        }
+        let w16 = if big > 0 && o.chunk > 16 { Some(DevBuf::new(&gpu, big)?) } else { None };
+        let hot_budget = hot_budget.saturating_sub(big as u64);
+        let stage_bytes = if o.stage && !pools.is_empty() {
+            pools.iter().map(|q| q.stride).max().unwrap_or(0) * 0 + SMALL * g.used * (layers.iter().filter_map(|ly| match &ly.mix { Mix::Moe(m) if matches!(m.up.home, Home::Cached) => Some(m.up.stride + m.down.stride), _ => None }).max().unwrap_or(0))
+        } else {
+            0
+        };
+        let stage = if stage_bytes > 0 { Some(DevBuf::new(&gpu, stage_bytes)?) } else { None };
+        let hot_budget = hot_budget.saturating_sub(stage_bytes as u64);
         let hot_buf = if hot_budget > 0 && !pools.is_empty() { Some(DevBuf::new(&gpu, hot_budget as usize)?) } else { None };
-        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default() })) };
+        let cache = if pools.is_empty() { None } else { Some(std::sync::Mutex::new(ExpertCache { pools, map: Default::default(), clock: 0, hits: 0, misses: 0, wanted: Default::default(), hot: Default::default(), hot_buf, hot_hits: 0, scratch, scratch_used: 0, scratch_map: Default::default(), stage, stage_used: 0, stage_map: Default::default() })) };
         let direct = Direct::open(&f);
-        let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 19_000))?;
+        let arena = Arena::new(&gpu, (96 << 20) + o.chunk * 700_000 + (o.chunk * g.used * 28_000))?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, direct, chunk: o.chunk, times: Default::default(), load_s })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, direct, chunk: o.chunk, w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -796,6 +830,18 @@ impl NemotronH {
         if w.ty == GType::F32 {
             // SAFETY: w float32 [rows, cols], x [t, cols], y [t, rows].
             return self.op("gemv", || unsafe { (k.gemv_f32)(self.raw(), w.buf.fp(), x.fp(), y.fp(), t as i64, w.rows as i64, w.cols as i64) });
+        }
+        // a pass of many rows: the matrix expanded to half once and multiplied on the tensor cores (the quantized product would read
+        // it again for each eight rows)
+        if t >= self.dense_gemm_min && self.w16.as_ref().is_some_and(|b| b.len >= w.rows * w.cols * 2) && w.ty != GType::F32 {
+            let w16 = self.w16.as_ref().unwrap();
+            let xh = self.arena.bytes(t * w.cols * 2)?;
+            // SAFETY: w's blocks -> half [rows][cols]; x [t][cols] -> half; y [t][rows] = x . w^T.
+            unsafe {
+                self.op("dequant", || (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), (w.rows * w.cols) as i64, w16.ptr()))?;
+                self.op("to half", || (k.to_half)(self.raw(), x.fp(), xh.ptr(), (t * w.cols) as i64))?;
+                return self.op("gemm", || (k.gemm_f16)(self.raw(), w16.ptr(), xh.ptr(), y.fp(), t as i64, w.rows as i64, w.cols as i64));
+            }
         }
         let own;
         let q = match xq {
@@ -883,25 +929,44 @@ impl NemotronH {
         Ok(out)
     }
 
-    /// The device address of expert `x`'s matrix `ex` (of layer `l`; up or down)
-    fn expert_at(&self, ex: &Experts, l: usize, down: bool, x: usize) -> *const c_void {
+    /// The address of expert `x`'s matrix `ex` (of layer `l`; up or down) and whether it is in host memory (a pool's or the
+    /// scratch's slot, which the kernels read over PCIe) rather than VRAM
+    fn expert_src(&self, ex: &Experts, l: usize, down: bool, x: usize) -> (*const c_void, bool) {
         // SAFETY: inside the tensor / the cache (callers' counts).
         unsafe {
             match &ex.home {
-                Home::Vram(b) => b.ptr().cast::<u8>().add(x * ex.stride).cast(),
+                Home::Vram(b) => (b.ptr().cast::<u8>().add(x * ex.stride).cast(), false),
                 Home::Cached => {
                     let c = self.cache.as_ref().unwrap().lock().unwrap();
                     if let Some(&off) = c.hot.get(&(l, x, down)) {
-                        return c.hot_buf.as_ref().unwrap().ptr().cast::<u8>().add(off).cast();
+                        return (c.hot_buf.as_ref().unwrap().ptr().cast::<u8>().add(off).cast(), false);
+                    }
+                    if let Some(&off) = c.stage_map.get(&(l, x, down)) {
+                        return (c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off).cast(), false);
                     }
                     if let Some(&off) = c.scratch_map.get(&(l, x, down)) {
-                        return c.scratch.as_ref().unwrap().1.ptr().cast::<u8>().add(off).cast();
+                        return (c.scratch.as_ref().unwrap().1.ptr().cast::<u8>().add(off).cast(), true);
                     }
                     let (p, sl) = c.map[&(l, x, down)];
-                    c.pools[p].view.ptr().cast::<u8>().add(sl * ex.stride).cast()
+                    (c.pools[p].view.ptr().cast::<u8>().add(sl * ex.stride).cast(), true)
                 }
             }
         }
+    }
+
+    fn expert_at(&self, ex: &Experts, l: usize, down: bool, x: usize) -> *const c_void {
+        self.expert_src(ex, l, down, x).0
+    }
+
+    /// The matrix where the kernels read it at VRAM's speed: in VRAM already, or copied (DMA) into `tmp` first
+    fn expert_dev(&self, ex: &Experts, l: usize, down: bool, x: usize, tmp: &DevBuf) -> Result<*const c_void> {
+        let (p, host) = self.expert_src(ex, l, down, x);
+        if !host {
+            return Ok(p);
+        }
+        // SAFETY: a host slot of ex.stride bytes to the temporary buffer (as large), on the GPU's stream.
+        ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), tmp.ptr(), p, ex.stride) }, "copying an expert")?;
+        Ok(tmp.ptr().cast_const())
     }
 
     /// A latent-MoE layer on h [t, n_embd]: the routed experts in the latent, projected back, plus the shared expert
@@ -945,6 +1010,14 @@ impl NemotronH {
                 ent.push((r, i, x * g.w_scale));
             }
         }
+        if t == 1 {
+            if let Ok(path) = std::env::var("NS_NH_TRACE") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "{} {}", m.layer, ent.iter().map(|x| x.1.to_string()).collect::<Vec<_>>().join(","));
+                }
+            }
+        }
         // the experts' bytes where the kernels can read them: those of a cached layer into slots (the least recently
         // used given up), the misses read from the file on a few threads
         let tf = Instant::now();
@@ -954,6 +1027,8 @@ impl NemotronH {
             let clock = c.clock;
             c.scratch_map.clear();
             c.scratch_used = 0;
+            c.stage_map.clear();
+            c.stage_used = 0;
             let bypass = t > SMALL && c.scratch.is_some();
             // (matrix is down, expert, the pool's host base + slot)
             let mut jobs: Vec<(bool, usize, usize)> = Vec::new();
@@ -1026,6 +1101,30 @@ impl NemotronH {
                 let mut tm = self.times.lock().unwrap();
                 tm.io_s += tio.elapsed().as_secs_f64();
                 tm.io_bytes += nbytes as u64;
+            }
+            // a decode pass: the experts not in VRAM already copied into the staging buffer, then the products read that
+            if t <= SMALL && c.stage.is_some() {
+                let cap = c.stage.as_ref().unwrap().len;
+                let mut done = std::collections::HashSet::new();
+                for (_, x, _) in &ent {
+                    if !done.insert(*x) {
+                        continue;
+                    }
+                    for (down, ex) in [(false, &m.up), (true, &m.down)] {
+                        let key = (m.layer, *x, down);
+                        if c.hot.contains_key(&key) || c.stage_used + ex.stride > cap {
+                            continue;
+                        }
+                        let Some(&(p, sl)) = c.map.get(&key) else { continue };
+                        let src = c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride;
+                        let off = c.stage_used;
+                        c.stage_used += (ex.stride + 255) & !255;
+                        // SAFETY: a pinned slot of ex.stride bytes to the staging buffer's [off, off + stride), on the GPU's stream.
+                        let dst = unsafe { c.stage.as_ref().unwrap().ptr().cast::<u8>().add(off) };
+                        ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.cast(), src as *const c_void, ex.stride) }, "staging an expert")?;
+                        c.stage_map.insert(key, off);
+                    }
+                }
             }
         }
         lap("route+fetch");
@@ -1123,24 +1222,58 @@ impl NemotronH {
             // SAFETY: n_e rows of the latent's Q8_1 gathered in expert order.
             self.op("gather", || unsafe { (k.gather_rows)(self.raw(), latq.buf.ptr(), rb.ptr().cast(), xg.ptr(), lq as i64, n_e as i64) })?;
             let u = self.arena.f32(n_e * g.n_ff_exp)?;
+            // groups of many rows through the tensor cores (the expert dequantized to half, one GEMM); the small ones by the
+            // quantized product
+            let gemm_min: usize = std::env::var("NS_NH_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+            let big = groups.iter().any(|gr| gr.2 >= gemm_min);
+            let w16 = if big { Some(self.arena.bytes(g.latent * g.n_ff_exp * 2)?) } else { None };
+            let xh = if big { Some(self.arena.bytes(n_e * g.latent * 2)?) } else { None };
+            if let Some(xh) = &xh {
+                // SAFETY: n_e rows of the latent, half, in expert order.
+                self.op("gather", || unsafe { (k.gather_half)(self.raw(), lat.fp(), rb.ptr().cast(), xh.ptr(), g.latent as i64, n_e as i64) })?;
+            }
+            let tmpw = self.arena.bytes(m.up.stride.max(m.down.stride))?;
             for &(x, first, n) in &groups {
-                let w = self.expert_at(&m.up, m.layer, false, x);
-                // SAFETY: expert x's up against its n rows of xg, into rows of u.
-                self.op("expert up", || unsafe {
-                    (k.mmvq)(self.raw(), m.up.ty.code() as i32, w, xg.ptr().cast::<u8>().add(first * lq).cast(), u.fp().add(first * g.n_ff_exp), g.latent as i64, g.n_ff_exp as i64, n as i64)
-                })?;
+                let w = self.expert_dev(&m.up, m.layer, false, x, &tmpw)?;
+                if n >= gemm_min {
+                    let (w16, xh) = (w16.as_ref().unwrap(), xh.as_ref().unwrap());
+                    // SAFETY: expert x's up, dequantized to half [n_ff][latent], against n rows of xh, into rows of u.
+                    unsafe {
+                        self.op("dequant up", || (k.dequant_f16)(self.raw(), m.up.ty.code() as i32, w, (g.n_ff_exp * g.latent) as i64, w16.ptr()))?;
+                        self.op("gemm up", || (k.gemm_f16)(self.raw(), w16.ptr(), xh.ptr().cast::<u8>().add(first * g.latent * 2).cast(), u.fp().add(first * g.n_ff_exp), n as i64, g.n_ff_exp as i64, g.latent as i64))?;
+                    }
+                } else {
+                    // SAFETY: expert x's up against its n rows of xg, into rows of u.
+                    self.op("expert up", || unsafe {
+                        (k.mmvq)(self.raw(), m.up.ty.code() as i32, w, xg.ptr().cast::<u8>().add(first * lq).cast(), u.fp().add(first * g.n_ff_exp), g.latent as i64, g.n_ff_exp as i64, n as i64)
+                    })?;
+                }
             }
             lap("expert up");
+            let uh = if big { Some(self.arena.bytes(n_e * g.n_ff_exp * 2)?) } else { None };
+            if let Some(uh) = &uh {
+                // SAFETY: n floats -> half(relu^2).
+                self.op("relu2 half", || unsafe { (k.relu2_half)(self.raw(), u.fp(), uh.ptr(), (n_e * g.n_ff_exp) as i64) })?;
+            }
             // SAFETY: n floats.
             self.op("relu2", || unsafe { (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64) })?;
             let uq8 = self.quantize(u.fp(), g.n_ff_exp, n_e)?;
             let dn = self.arena.f32(n_e * g.latent)?;
             for &(x, first, n) in &groups {
-                let w = self.expert_at(&m.down, m.layer, true, x);
-                // SAFETY: expert x's down against its n rows of uq8, into rows of dn.
-                self.op("expert down", || unsafe {
-                    (k.mmvq)(self.raw(), m.down.ty.code() as i32, w, uq8.buf.ptr().cast::<u8>().add(first * uq).cast(), dn.fp().add(first * g.latent), g.n_ff_exp as i64, g.latent as i64, n as i64)
-                })?;
+                let w = self.expert_dev(&m.down, m.layer, true, x, &tmpw)?;
+                if n >= gemm_min {
+                    let (w16, uh) = (w16.as_ref().unwrap(), uh.as_ref().unwrap());
+                    // SAFETY: expert x's down dequantized to half [latent][n_ff], against n rows of uh, into rows of dn.
+                    unsafe {
+                        self.op("dequant down", || (k.dequant_f16)(self.raw(), m.down.ty.code() as i32, w, (g.latent * g.n_ff_exp) as i64, w16.ptr()))?;
+                        self.op("gemm down", || (k.gemm_f16)(self.raw(), w16.ptr(), uh.ptr().cast::<u8>().add(first * g.n_ff_exp * 2).cast(), dn.fp().add(first * g.latent), n as i64, g.latent as i64, g.n_ff_exp as i64))?;
+                    }
+                } else {
+                    // SAFETY: expert x's down against its n rows of uq8, into rows of dn.
+                    self.op("expert down", || unsafe {
+                        (k.mmvq)(self.raw(), m.down.ty.code() as i32, w, uq8.buf.ptr().cast::<u8>().add(first * uq).cast(), dn.fp().add(first * g.latent), g.n_ff_exp as i64, g.latent as i64, n as i64)
+                    })?;
+                }
             }
             lap("expert down");
             let mo = self.arena.f32(t * g.latent)?;

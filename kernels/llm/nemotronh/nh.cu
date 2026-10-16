@@ -8,6 +8,7 @@
 #include "nh.h"
 
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <cfloat>
 #include <cmath>
 
@@ -86,6 +87,53 @@ __global__ void ssm_k(const float* xbc, int64_t xs, const float* dt, int64_t dts
         if (n == 0) y[t * xd + h * P + p] = acc + dd * xv;
     }
     if (n < N) sp[n] = s;
+}
+
+// the scan for prompt rows: a block a head (P = 64 p, N = 128), 256 threads: thread (p, q) holds 32 of the state's N values of
+// its p in registers; B, C, x and the decays of 16 rows at a time in shared memory; the dot with C is reduced over the four threads
+// of a p by shuffles (no block-wide sums in the recurrence)
+constexpr int TT = 16;
+__global__ void __launch_bounds__(256) ssm_tile_k(const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp, float* S, float* y,
+                                                   int64_t T, int64_t H, int64_t G) {
+    constexpr int P = 64, N = 128;
+    __shared__ float sB[TT][N], sC[TT][N], sx[TT][P], sd[TT], sa[TT];
+    const int64_t h = blockIdx.x, gr = h / (H / G), xd = H * P;
+    const int tid = threadIdx.x, p = tid >> 2, q = tid & 3;
+    float* sp = S + (h * P + p) * N + q * 32;
+    float s[32];
+    for (int i = 0; i < 32; ++i) s[i] = sp[i];
+    const float a = A[h], dd = Dp[h], bias = dt_bias[h];
+    for (int64_t t0 = 0; t0 < T; t0 += TT) {
+        const int tn = (int) min((int64_t) TT, T - t0);
+        __syncthreads();
+        for (int i = tid; i < tn * N; i += 256) {
+            const int r = i / N, n = i % N;
+            const float* row = xbc + (t0 + r) * xs;
+            sB[r][n] = row[xd + gr * N + n];
+            sC[r][n] = row[xd + G * N + gr * N + n];
+        }
+        for (int i = tid; i < tn * P; i += 256) sx[i / P][i % P] = xbc[(t0 + i / P) * xs + h * P + i % P];
+        if (tid < tn) {
+            float d = dt[(t0 + tid) * dts + h] + bias;
+            d = d <= 20.0f ? log1pf(expf(d)) : d;
+            sd[tid] = d;
+            sa[tid] = expf(d * a);
+        }
+        __syncthreads();
+        for (int r = 0; r < tn; ++r) {
+            const float xv = sx[r][p], xdt = xv * sd[r], dA = sa[r];
+            float part = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                s[i] = s[i] * dA + sB[r][q * 32 + i] * xdt;
+                part += s[i] * sC[r][q * 32 + i];
+            }
+            part += __shfl_xor_sync(0xffffffffu, part, 1);
+            part += __shfl_xor_sync(0xffffffffu, part, 2);
+            if (q == 0) y[(t0 + r) * xd + h * P + p] = part + dd * xv;
+        }
+    }
+    for (int i = 0; i < 32; ++i) sp[i] = s[i];
 }
 
 // a block a (row, group of `group` channels)
@@ -214,9 +262,65 @@ __global__ void combine_ids_k(float* out, const float* dn, const int32_t* tp, co
     }
 }
 
+__global__ void relu2_half_k(const float* x, __half* y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = fmaxf(x[i], 0.0f);
+        y[i] = __float2half_rn(v * v);
+    }
+}
+
+// out row j = half(x row rows[j]) (rows of K floats)
+__global__ void gather_half_k(const float* x, const int32_t* rows, __half* out, int64_t K, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * K) out[i] = __float2half_rn(x[(int64_t) rows[i / K] * K + i % K]);
+}
+
+cublasHandle_t cublas_for(ns_gpu* g) {
+    static cublasHandle_t h[16];
+    if (g->dev < 0 || g->dev >= 16) return nullptr;
+    if (!h[g->dev]) {
+        cudaSetDevice(g->dev);
+        if (cublasCreate(&h[g->dev]) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    }
+    cublasSetStream(h[g->dev], g->q);
+    return h[g->dev];
+}
+
 }  // namespace
 
 extern "C" {
+
+int ns_nh_relu2_half(ns_gpu* g, const float* x, void* y, int64_t n) {
+    NS_TRY
+    if (n > 0) relu2_half_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(x, (__half*) y, n);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+int ns_nh_gather_half(ns_gpu* g, const float* x, const int32_t* rows, void* out, int64_t K, int64_t n) {
+    NS_TRY
+    if (n > 0) gather_half_k<<<(unsigned) ((n * K + 255) / 256), 256, 0, g->q>>>(x, rows, (__half*) out, K, n);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+// Y [m][n] (float32) = X [m][k] . W [n][k]^T, W and X half (row-major), accumulated in float32 on the tensor cores
+int ns_nh_gemm_f16(ns_gpu* g, const void* W, const void* X, float* Y, int64_t m, int64_t n, int64_t k) {
+    NS_TRY
+    if (m <= 0) return 0;
+    cublasHandle_t h = cublas_for(g);
+    if (!h) return ns_fail("ns_nh_gemm_f16: no cuBLAS handle");
+    const float one = 1.0f, zero = 0.0f;
+    // column-major: Y^T [n][m] = W [n x k as col-major k x n]^T . X [k x m]
+    const cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) n, (int) m, (int) k, &one, W, CUDA_R_16F, (int) k, X, CUDA_R_16F, (int) k, &zero, Y, CUDA_R_32F, (int) n,
+                                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st != CUBLAS_STATUS_SUCCESS) return ns_fail("ns_nh_gemm_f16: cublasGemmEx failed (" + std::to_string((int) st) + ")");
+    return 0;
+    NS_CATCH
+}
 
 int ns_nh_gather_rows(ns_gpu* g, const void* x, const int32_t* rows, void* out, int64_t row_bytes, int64_t n) {
     NS_TRY
@@ -253,7 +357,8 @@ int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t 
     NS_TRY
     if (T <= 0) return 0;
     if (N % 32 != 0 || N > 256 || H % G != 0) return ns_fail("ns_nh_ssm: d_state a multiple of 32 up to 256, the heads a multiple of the groups");
-    ssm_k<<<(unsigned) (H * P), (unsigned) N, 0, g->q>>>(xbc, xs, dt, dts, dt_bias, A, Dp, S, y, T, H, P, N, G);
+    if (T >= 8 && P == 64 && N == 128) ssm_tile_k<<<(unsigned) H, 256, 0, g->q>>>(xbc, xs, dt, dts, dt_bias, A, Dp, S, y, T, H, G);
+    else ssm_k<<<(unsigned) (H * P), (unsigned) N, 0, g->q>>>(xbc, xs, dt, dts, dt_bias, A, Dp, S, y, T, H, P, N, G);
     NS_LAUNCH_CHECK();
     return 0;
     NS_CATCH

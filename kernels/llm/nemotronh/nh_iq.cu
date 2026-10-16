@@ -49,9 +49,37 @@ __global__ void to_f32_k(int type, const void* src, int64_t n, float* dst) {
     else dst[i] = __uint_as_float(((uint32_t) ((const uint16_t*) src)[i]) << 16);   // BF16
 }
 
+// Q6_K to half, llama.cpp's dequantize_block_q6_K: a block of 64 threads a superblock of 256 values
+__global__ void dq_q6k_k(const void* __restrict__ vx, __half* __restrict__ yy) {
+    const block_q6_K* x = (const block_q6_K*) vx + blockIdx.x;
+    const int tid = threadIdx.x, ip = tid / 32, il = tid - 32 * ip, is = 8 * ip + il / 16;
+    __half* y = yy + (int64_t) blockIdx.x * 256 + 128 * ip + il;
+    const float d = __half2float(x->d);
+    const uint8_t* ql = x->ql + 64 * ip + il;
+    const uint8_t qh = x->qh[32 * ip + il];
+    const int8_t* sc = x->scales + is;
+    y[0] = __float2half_rn(d * sc[0] * ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+    y[32] = __float2half_rn(d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+    y[64] = __float2half_rn(d * sc[4] * ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+    y[96] = __float2half_rn(d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+}
+
+__global__ void to_half_k(const float* x, __half* y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(x[i]);
+}
+
 }  // namespace
 
 extern "C" {
+
+int ns_nh_to_half(ns_gpu* g, const float* x, void* y, int64_t n) {
+    NS_TRY
+    if (n > 0) to_half_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(x, (__half*) y, n);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
 
 size_t ns_nh_row_bytes(int type, int64_t n) {
     return strata::kernels::iq_row_bytes(type, n);
@@ -72,6 +100,21 @@ int ns_nh_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* ds
     if (type == 19 || type == 14) return ns_fail("ns_nh_dequant_f32: IQ1_S and Q6_K have products here, not a dequantizer");
     if (n % 256 != 0 || !strata::kernels::iq_supported(type)) return ns_fail("ns_nh_dequant_f32: a type the products do not take, or n not a multiple of 256");
     strata::kernels::iq_dequant_f32(type, src, n, dst, g->q);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+int ns_nh_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, void* dst) {
+    NS_TRY
+    if (n <= 0) return 0;
+    if (type == 14 && n % 256 == 0) {
+        dq_q6k_k<<<(unsigned) (n / 256), 64, 0, g->q>>>(src, (__half*) dst);
+        NS_LAUNCH_CHECK();
+        return 0;
+    }
+    if (n % 256 != 0 || !strata::kernels::iq_supported(type)) return ns_fail("ns_nh_dequant_f16: a type without a dequantizer here, or n not a multiple of 256");
+    strata::kernels::iq_dequant_f16(type, src, n, (uint16_t*) dst, g->q);
     NS_LAUNCH_CHECK();
     return 0;
     NS_CATCH
