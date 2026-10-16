@@ -361,6 +361,9 @@ pub struct NemotronH {
     /// the core library's ns_stream_copy_batch, if it has it (NS_NH_COPY_BATCH=0: not used): a layer's staging copies in one
     /// call instead of one each
     copy_batch: Option<CopyBatch>,
+    /// small uploads (a batch's expert pointers, the combine's weights, token rows) through a pinned ring, queued without a
+    /// wait (DevBuf::write syncs the stream after each: the host could not run ahead of the GPU); a wrap syncs once first
+    ring: std::sync::Mutex<(HostBuf, usize)>,
     pred: std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
     /// MoE layers ahead whose misses a guess reads, and how many of each guess's top experts
     pred_ahead: usize,
@@ -384,6 +387,16 @@ struct Pool {
     stride: usize,
     owner: Vec<Option<Key>>,
     used: Vec<u64>,
+    /// (used, slot), least recently used first: a victim without a scan of every slot
+    lru: std::collections::BTreeSet<(u64, usize)>,
+}
+
+impl Pool {
+    fn touch(&mut self, sl: usize, clock: u64) {
+        self.lru.remove(&(self.used[sl], sl));
+        self.used[sl] = clock;
+        self.lru.insert((clock, sl));
+    }
 }
 
 /// VRAM slots of one matrix size in the hot buffer (from `base`): who holds each, and when it was last wanted
@@ -447,7 +460,7 @@ impl ExpertCache {
             if self.reading.remove(&key) && failed {
                 if let Some((p, sl)) = self.map.remove(&key) {
                     self.pools[p].owner[sl] = None;
-                    self.pools[p].used[sl] = 0;
+                    self.pools[p].touch(sl, 0);
                 }
             }
         }
@@ -456,7 +469,7 @@ impl ExpertCache {
     /// The least recently used slot of pool p not being read into
     fn victim(&self, p: usize) -> Option<usize> {
         let q = &self.pools[p];
-        (0..q.used.len()).filter(|i| !q.owner[*i].is_some_and(|k| self.reading.contains(&k))).min_by_key(|i| q.used[*i])
+        q.lru.iter().map(|x| x.1).find(|i| !q.owner[*i].is_some_and(|k| self.reading.contains(&k)))
     }
 }
 
@@ -651,7 +664,7 @@ impl NemotronH {
                     continue;
                 }
                 if let Some(&(p, sl)) = c.map.get(&key) {
-                    c.pools[p].used[sl] = clock;
+                    c.pools[p].touch(sl, clock);
                     continue;
                 }
                 let p = c.pools.iter().position(|q| q.stride == ex.stride).unwrap();
@@ -663,7 +676,7 @@ impl NemotronH {
                     c.map.remove(&old);
                 }
                 c.pools[p].owner[sl] = Some(key);
-                c.pools[p].used[sl] = clock;
+                c.pools[p].touch(sl, clock);
                 c.map.insert(key, (p, sl));
                 c.misses += 1;
                 c.reading.insert(key);
@@ -1147,7 +1160,7 @@ impl NemotronH {
             let mut hb = HostBuf::new(&gpu, n * stride)?;
             let view = hb.device_view(0, n * stride)?;
             log(format!("nemotronh: expert cache: {n} slots of {:.2} MiB ({:.1} GiB of {:.1} GiB)", stride as f64 / 1048576.0, gib((n * stride) as u64), gib(bytes)));
-            pools.push(Pool { _host: hb, view, stride, owner: vec![None; n], used: vec![0; n] });
+            pools.push(Pool { _host: hb, view, stride, owner: vec![None; n], used: vec![0; n], lru: (0..n).map(|i| (0, i)).collect() });
         }
         let scratch = if o.scratch_mib > 0 && !pools.is_empty() {
             let mut hb = HostBuf::new(&gpu, o.scratch_mib << 20)?;
@@ -1196,6 +1209,7 @@ impl NemotronH {
             // SAFETY: ns.h's declaration of ns_stream_copy_batch is CopyBatch.
             p => Some(unsafe { std::mem::transmute::<*mut c_void, CopyBatch>(p) }),
         };
+        let ring = std::sync::Mutex::new((HostBuf::new(&gpu, 8 << 20)?, 0usize));
         let io = Io::new(&f, std::env::var("NS_NH_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
         let arena_home = DevBuf::new(&gpu, arena_bytes(resident_rows) as usize)?;
         let arena = Arena::on(arena_home.view(0, arena_home.len)?);
@@ -1207,7 +1221,7 @@ impl NemotronH {
         log(format!("nemotronh: loaded {:.1} GiB onto {} in {load_s:.0} s ({} layers: {} Mamba-2, {} MoE, {} attention)", gib(loaded.get()), gpu.name, g.layers, g.count(Kind::Mamba),
                     g.count(Kind::Moe), g.count(Kind::Attn)));
         let _ = o;
-        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram"), copy_lane: std::env::var("NS_NH_COPY_LANE").map_or(true, |v| v != "0"), copy_batch })
+        Ok(NemotronH { g, file: f, gpu, k, layers, embd, output_norm, output, arena, cache, io, inflight: Default::default(), chunk, resident_rows, borrow_bytes, arena_home, lent: Default::default(), predict: std::env::var("NS_NH_PREDICT").map_or(true, |v| v != "0"), pred: Default::default(), pred_ahead: std::env::var("NS_NH_PRED_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1), pred_k: std::env::var("NS_NH_PRED_K").ok().and_then(|v| v.parse().ok()).unwrap_or(22), w16, dense_gemm_min: std::env::var("NS_NH_DENSE_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16), times: Default::default(), load_s, cpu, cpu_frac, dyn_vram: std::env::var("NS_NH_DYN_VRAM").is_ok_and(|v| v == "1"), overlap: std::env::var("NS_NH_OVERLAP").map_or(true, |v| v != "0"), pre_k: std::env::var("NS_NH_PRE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_skip: std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(8), tail_vram: std::env::var("NS_NH_TAIL_TIER").is_ok_and(|v| v == "vram"), copy_lane: std::env::var("NS_NH_COPY_LANE").map_or(true, |v| v != "0"), copy_batch, ring })
     }
 
     /// A new conversation of up to `max_ctx` tokens
@@ -1282,6 +1296,26 @@ impl NemotronH {
         self.op("mmvq", || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), q.buf.ptr(), y.fp(), w.cols as i64, w.rows as i64, t as i64) })
     }
 
+    /// `src` into the front of `dst`, queued on the GPU's stream from the pinned ring (no wait)
+    fn up(&self, dst: &DevBuf, src: &[u8]) -> Result<()> {
+        dst.bounds(0, src.len())?;
+        let mut r = self.ring.lock().unwrap();
+        if src.len() > r.0.len / 4 || std::env::var("NS_NH_RING").is_ok_and(|v| v == "0") {
+            return dst.write(0, src);
+        }
+        if r.1 + src.len() > r.0.len {
+            // everything queued from the ring so far done before it is written again
+            self.gpu.sync()?;
+            r.1 = 0;
+        }
+        let off = r.1;
+        r.1 = (off + src.len() + 255) & !255;
+        r.0.as_mut_slice()[off..off + src.len()].copy_from_slice(src);
+        let p = r.0.as_slice()[off..].as_ptr();
+        // SAFETY: src.len() pinned bytes of the ring, not written again before a sync, into dst (in bounds, checked).
+        ffi::check(unsafe { (nextcuda_core::api()?.copy_to)(self.raw(), dst.ptr(), p.cast(), src.len()) }, "an upload")
+    }
+
     fn rms(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<()> {
         // SAFETY: rows of c floats.
         self.op("rms", || unsafe { (self.k.rms_norm)(self.raw(), x.fp(), w.fp(), y.fp(), rows as i64, c as i64, self.g.eps) })
@@ -1304,7 +1338,7 @@ impl NemotronH {
             self.file.read_into(&self.embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
         }
         let src = self.arena.bytes(raw.len())?;
-        src.write(0, &raw)?;
+        self.up(&src, &raw)?;
         let x = self.arena.f32(tokens.len() * g.n_embd)?;
         // SAFETY: the rows' blocks -> float32.
         self.op("embedding", || unsafe { (self.k.dequant_f32)(self.raw(), self.embd.ty.code() as i32, src.ptr(), (tokens.len() * g.n_embd) as i64, x.fp()) })?;
@@ -1553,7 +1587,7 @@ impl NemotronH {
                         continue;
                     }
                     if let Some(&(p, sl)) = c.map.get(&key) {
-                        c.pools[p].used[sl] = clock;
+                        c.pools[p].touch(sl, clock);
                         c.hits += 1;
                         continue;
                     }
@@ -1571,7 +1605,7 @@ impl NemotronH {
                         c.map.remove(&old);
                     }
                     c.pools[p].owner[sl] = Some(key);
-                    c.pools[p].used[sl] = clock;
+                    c.pools[p].touch(sl, clock);
                     c.map.insert(key, (p, sl));
                     c.misses += 1;
                     jobs.push((down, *x, c.pools[p]._host.as_slice().as_ptr() as usize + sl * ex.stride));
@@ -1692,7 +1726,7 @@ impl NemotronH {
                 ptrs.extend_from_slice(&(j as i32).to_le_bytes());
             }
             let pb = self.arena.bytes(ptrs.len())?;
-            pb.write(0, &ptrs)?;
+            self.up(&pb, &ptrs)?;
             let (up_p, down_p) = (pb.ptr().cast_const(), unsafe { pb.ptr().cast::<u8>().add(nb * 8).cast_const() });
             let (rows_p, seq_p) = unsafe { (pb.ptr().cast::<u8>().add(nb * 16).cast::<i32>().cast_const(), pb.ptr().cast::<u8>().add(nb * 16 + nb * 4).cast::<i32>().cast_const()) };
             // SAFETY: the batch's rows of u [n_e][n_ff] and dn [n_e][latent], from entry b0.
@@ -1726,8 +1760,8 @@ impl NemotronH {
         }
         let ws: Vec<f32> = ent.iter().map(|x| x.2).collect();
         let (tpb, wb) = (self.arena.bytes((t + 1) * 4)?, self.arena.bytes(n_e * 4)?);
-        tpb.write(0, &tp.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-        wb.write(0, &ws.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        self.up(&tpb, &tp.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        self.up(&wb, &ws.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
         let mo = self.arena.f32(t * g.latent)?;
         // SAFETY: mo [t, latent], dn [entries, latent], the token pointers and weights as named in nh.h.
         self.op("moe combine", || unsafe { (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), tpb.ptr().cast(), wb.fp(), t as i64, g.latent as i64) })?;
@@ -1763,10 +1797,10 @@ impl NemotronH {
             }
             let bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
             let (rb, tb, ib, wb) = (self.arena.bytes(n_e * 4)?, self.arena.bytes((t + 1) * 4)?, self.arena.bytes(n_e * 4)?, self.arena.bytes(n_e * 4)?);
-            rb.write(0, &bytes(&rows))?;
-            tb.write(0, &bytes(&tp))?;
-            ib.write(0, &bytes(&ids))?;
-            wb.write(0, &ws.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+            self.up(&rb, &bytes(&rows))?;
+            self.up(&tb, &bytes(&tp))?;
+            self.up(&ib, &bytes(&ids))?;
+            self.up(&wb, &ws.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
             // SAFETY: arithmetic only.
             let (lq, uq) = unsafe { ((k.q8_1_bytes)(g.latent as i64, 1), (k.q8_1_bytes)(g.n_ff_exp as i64, 1)) };
             let xg = self.arena.bytes(n_e * lq)?;
