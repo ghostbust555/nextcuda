@@ -25,8 +25,7 @@ nextcuda audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextcuda_audio::AudioKind> {
-    // Breeze TTS 2 runs on CUDA; Qwen3-TTS and VoxCPM2 are nextsycl's entries, not ported yet (loading says so:
-    // docs/PHASES.md); MiniMax Music 3 is not here
+    // nextsycl's speech engines on CUDA; MiniMax Music 3 is not here yet
     vec![nextcuda_audio_breezetts2::kind(), nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind()]
 }
 
@@ -225,8 +224,16 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
         let e = nextcuda_audio_breezetts2::BreezeTts2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextcuda_audio_breezetts2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextcuda_audio_qwen3tts::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
+        let e = nextcuda_audio_qwen3tts::Qwen3Tts::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextcuda_audio_qwen3tts::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextcuda_audio_voxcpm2::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,prefill,patches,vae").split(',').collect();
+        let e = nextcuda_audio_voxcpm2::VoxCpm2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextcuda_audio_voxcpm2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {} only here (the other speech engines are not ported yet)", nextcuda_audio_breezetts2::ARCH));
+        return Err(format!("check knows {}, {} and {}", nextcuda_audio_breezetts2::ARCH, nextcuda_audio_qwen3tts::ARCH, nextcuda_audio_voxcpm2::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())

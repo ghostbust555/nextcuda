@@ -1,10 +1,16 @@
 [package]
 name = "nextcuda-audio-qwen3tts"
-description = "Qwen3-TTS (12 Hz, 1.7B): the registry entry, files and options as nextsycl's; the engine not ported to CUDA yet"
+description = "Qwen3-TTS on Intel Arc (SYCL): speech from text in nine built-in voices, a voice designed from a description, or a voice cloned from a recording - the talker, its code predictor and the 12 Hz codec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 nextcuda-core.workspace = true
+nextcuda-codec12hz.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-tok.workspace = true
 nextcuda-audio.workspace = true
+serde_json.workspace = true
+unicode-normalization = "0.1"

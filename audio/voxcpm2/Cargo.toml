@@ -1,10 +1,14 @@
 [package]
 name = "nextcuda-audio-voxcpm2"
-description = "VoxCPM2 (2B, 48 kHz): the registry entry, files and options as nextsycl's; the engine not ported to CUDA yet"
+description = "VoxCPM2 on Intel Arc (SYCL): tokenizer-free speech in 30 languages at 48 kHz - voices designed from a description, cloned from a recording, or continued from one; MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-tok.workspace = true
 nextcuda-audio.workspace = true
+serde_json.workspace = true
