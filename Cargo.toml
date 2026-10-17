@@ -5,7 +5,7 @@ resolver = "2"
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl", "crates/mesh", "crates/codec12hz",
     "llm/contract", "llm/nemotronh",
-    "image/contract", "image/qwenimage21",
+    "image/contract", "image/qwenimage21", "image/paddleocrvl", "image/unlimitedocr", "image/olmocr2",
     "video/contract",
     "model3d/contract",
     "audio/contract", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
@@ -31,6 +31,9 @@ nextcuda-llm = { path = "llm/contract" }
 nextcuda-llm-nemotronh = { path = "llm/nemotronh" }
 nextcuda-image = { path = "image/contract" }
 nextcuda-image-qwenimage21 = { path = "image/qwenimage21" }
+nextcuda-image-paddleocrvl = { path = "image/paddleocrvl" }
+nextcuda-image-unlimitedocr = { path = "image/unlimitedocr" }
+nextcuda-image-olmocr2 = { path = "image/olmocr2" }
 nextcuda-video = { path = "video/contract" }
 nextcuda-model3d = { path = "model3d/contract" }
 nextcuda-audio = { path = "audio/contract" }

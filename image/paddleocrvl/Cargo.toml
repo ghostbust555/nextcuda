@@ -1,0 +1,13 @@
+[package]
+name = "nextcuda-image-paddleocrvl"
+description = "PaddleOCR-VL (Baidu PaddlePaddle): a SigLIP NaViT vision tower at the page's own size and an ERNIE-4.5 0.3B decoder that reads pages, tables, formulas, charts and seals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-image.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-tok.workspace = true

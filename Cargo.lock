@@ -554,7 +554,10 @@ dependencies = [
  "nextcuda-core",
  "nextcuda-gguf",
  "nextcuda-image",
+ "nextcuda-image-olmocr2",
+ "nextcuda-image-paddleocrvl",
  "nextcuda-image-qwenimage21",
+ "nextcuda-image-unlimitedocr",
  "nextcuda-llm",
  "nextcuda-llm-nemotronh",
  "nextcuda-models",
@@ -667,6 +670,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextcuda-image-olmocr2"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-image",
+ "nextcuda-tok",
+]
+
+[[package]]
+name = "nextcuda-image-paddleocrvl"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-image",
+ "nextcuda-tok",
+]
+
+[[package]]
 name = "nextcuda-image-qwenimage21"
 version = "0.0.0"
 dependencies = [
@@ -676,6 +701,17 @@ dependencies = [
  "nextcuda-image",
  "nextcuda-qwen3vl",
  "serde_json",
+]
+
+[[package]]
+name = "nextcuda-image-unlimitedocr"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-image",
+ "nextcuda-tok",
 ]
 
 [[package]]

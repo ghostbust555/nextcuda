@@ -1,0 +1,13 @@
+[package]
+name = "nextcuda-image-olmocr2"
+description = "olmOCR-2 (allenai, a Qwen2.5-VL-7B fine-tune): pages to Markdown with tables as HTML and equations as LaTeX"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-image.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-tok.workspace = true

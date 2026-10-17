@@ -21,7 +21,8 @@ nextcuda image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextcuda_image::ImageKind> {
-    vec![nextcuda_image_qwenimage21::kind(), nextcuda_image_qwenimage21::kind_2512()]
+    vec![nextcuda_image_qwenimage21::kind(), nextcuda_image_qwenimage21::kind_2512(), nextcuda_image_unlimitedocr::kind(), nextcuda_image_paddleocrvl::kind(),
+         nextcuda_image_olmocr2::kind()]
 }
 
 pub(crate) fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -161,6 +162,20 @@ fn ocr(cfg: &Config, args: &[String]) -> Result<(), String> {
     if pages.is_empty() {
         return Err(USAGE.into());
     }
+    // the views as the model sees them, written as float32 planes (a check of the preprocessing) - no model needed
+    if let Some(dir) = opt(args, "--dump-views") {
+        let seen = nextcuda_image_unlimitedocr::prep::see(&pages, !args.iter().any(|a| a == "--no-tiles"));
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let put = |name: String, v: &[f32]| std::fs::write(Path::new(dir).join(name), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        for (i, t) in seen.tiles.iter().enumerate() {
+            put(format!("tile-{i}.f32"), &t.planes).map_err(|e| e.to_string())?;
+        }
+        for (i, g) in seen.globals.iter().enumerate() {
+            put(format!("global-{i}.f32"), &g.planes).map_err(|e| e.to_string())?;
+        }
+        println!("grid {}x{}: {} tiles, {} global views", seen.grid.0, seen.grid.1, seen.tiles.len(), seen.globals.len());
+        return Ok(());
+    }
     let (_, e) = load(cfg, args)?;
     if !e.reads() {
         return Err(format!("{} makes pictures; an OCR model reads them (--model)", e.arch()));
@@ -279,8 +294,44 @@ fn pics_size(saved: &[String]) -> (u32, u32) {
 }
 
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
-    let _ = (cfg, args);
-    Err("image check: the stage checks compare a SYCL engine with its reference dumps; nextcuda has none yet".into())
+    let dir = Path::new(args.first().ok_or(USAGE)?);
+    nextcuda_core::use_kind("image");
+    let (m, files) = model(cfg, opt(args, "--model"))?;
+    if nextcuda_image_unlimitedocr::ARCHS.contains(&m["arch"].as_str().unwrap_or("")) {
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextcuda_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextcuda_image_unlimitedocr::UnlimitedOcr::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+        let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(64);
+        let worst = nextcuda_image_unlimitedocr::check::run(&e, dir, n, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
+    if nextcuda_image_paddleocrvl::ARCHS.contains(&m["arch"].as_str().unwrap_or("")) {
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextcuda_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextcuda_image_paddleocrvl::PaddleOcrVl::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+        let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(64);
+        let pic = opt(args, "--picture").map(|p| nextcuda_image::Picture::read_png(Path::new(p))).transpose()?;
+        let worst = nextcuda_image_paddleocrvl::check::run(&e, dir, pic.as_ref(), n, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
+    if nextcuda_image_olmocr2::ARCHS.contains(&m["arch"].as_str().unwrap_or("")) {
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextcuda_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextcuda_image_olmocr2::OlmOcr::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+        let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(32);
+        let pic = opt(args, "--picture").map(|p| nextcuda_image::Picture::read_png(Path::new(p))).transpose()?;
+        let worst = nextcuda_image_olmocr2::check::run(&e, dir, pic.as_ref(), n, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
+    let _ = cfg;
+    Err(format!("check knows the OCR engines here ({}, {}, {}); Qwen-Image's stage checks are nextsycl's (docs/PHASES.md)",
+                nextcuda_image_unlimitedocr::ARCHS.join("/"), nextcuda_image_paddleocrvl::ARCHS.join("/"), nextcuda_image_olmocr2::ARCHS.join("/")))
 }
 
 /// The LoRAs registered for the model's architecture
