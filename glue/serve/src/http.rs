@@ -185,6 +185,29 @@ pub fn forward_body(mut client: impl Write, upstream: &Target, req: &Request, bo
     Ok(())
 }
 
+/// `forward` to another path: the request line names `target` (a path with its query) instead of the one received,
+/// and the connection closes after the answer (which is copied back as it arrives, streamed answers included)
+pub fn forward_to(mut client: impl Write, upstream: &Target, req: &Request, target: &str) -> Result<(), String> {
+    let head = String::from_utf8_lossy(&req.head);
+    let mut lines = head.split("\r\n").filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or("");
+    let version = first.rsplit(' ').next().filter(|v| v.starts_with("HTTP/")).unwrap_or("HTTP/1.1");
+    let mut out = format!("{} {target} {version}\r\n", req.method);
+    for l in lines {
+        let k = l.split(':').next().unwrap_or("").trim();
+        if k.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        out.push_str(l);
+        out.push_str("\r\n");
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    let mut up = Conn::connect(upstream).map_err(|e| format!("{upstream} does not answer ({e})"))?;
+    up.write_all(out.as_bytes()).and_then(|_| up.write_all(&req.body)).and_then(|_| up.flush()).map_err(|e| e.to_string())?;
+    std::io::copy(&mut up, &mut client).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// `call_for` that keeps the answer whatever its status: (status, body)
 pub fn call_status(t: &Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<(u16, Value), String> {
     let (status, mut r) = send(t, method, path, body)?;
@@ -404,6 +427,27 @@ pub fn call(t: &Target, method: &str, path: &str, body: Option<&Value>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_to_names_the_new_path_and_keeps_the_rest() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let up = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let got = read_request(&mut c).unwrap();
+            c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+            (got.method, got.target, String::from_utf8_lossy(&got.head).to_string(), got.body)
+        });
+        let raw = b"POST /open/m/v1/images/generations?x=1 HTTP/1.1\r\nHost: box:8000\r\nConnection: keep-alive\r\nContent-Length: 4\r\n\r\n{\"a\"";
+        let req = read_request(&raw[..]).unwrap();
+        let mut answer = Vec::new();
+        forward_to(&mut answer, &Target::Tcp(format!("127.0.0.1:{port}")), &req, "/v1/images/generations?x=1").unwrap();
+        let (method, target, head, body) = up.join().unwrap();
+        assert_eq!((method.as_str(), target.as_str()), ("POST", "/v1/images/generations?x=1"));
+        assert!(head.contains("Host: box:8000") && head.contains("Connection: close") && !head.contains("keep-alive"));
+        assert_eq!(body, b"{\"a\"");
+        assert!(String::from_utf8_lossy(&answer).ends_with("ok"));
+    }
 
     #[test]
     fn base64_round_trips_and_multipart_splits() {

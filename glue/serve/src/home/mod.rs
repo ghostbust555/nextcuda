@@ -294,7 +294,7 @@ impl Home {
         match (req.method.as_str(), p) {
             ("GET", "/") | ("GET", "/index.html") => self.page(&mut s),
             ("GET", p) if p.starts_with("/ui/") || p.starts_with("/static/") => self.asset(&mut s, p),
-            ("GET", p) if p.starts_with("/open/") => self.open(&mut s, &req, &p["/open/".len()..]),
+            (_, p) if p.starts_with("/open/") => self.open(&mut s, &req, &p["/open/".len()..]),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req, false);
@@ -323,10 +323,15 @@ impl Home {
     }
 
     /// A model's own page (an image or audio model's web front end, which only its running server has): the model is
-    /// started when it is not up - the same as its first request - and the browser sent to it. A disabled model has
-    /// none to open. The video studio and the chat page are always up.
-    fn open(&self, s: &mut Conn, req: &http::Request, id: &str) {
-        let id = id.trim_end_matches('/');
+    /// started when it is not up - the same as its first request - and the page and everything it asks for passed
+    /// through from here (/open/<id>/...). A disabled model has none to open. The video studio and the chat page are
+    /// always up, on the network, and the browser is sent to them.
+    fn open(&self, s: &mut Conn, req: &http::Request, rest: &str) {
+        // `<id>` alone, `<id>/` the page, `<id>/<path>` what the page asks its server for
+        let (id, sub) = match rest.split_once('/') {
+            Some((id, sub)) => (id, Some(sub)),
+            None => (rest, None),
+        };
         let m = match registry::find(&self.o.cfg, id) {
             Ok(Some(m)) => m,
             _ => return http::respond(s, 404, &err(format!("no model {id}"))),
@@ -335,13 +340,25 @@ impl Home {
             return http::respond(s, 409, &err(format!("{id} is disabled: enable it to open its page")));
         }
         let kind = registry::kind_of(&m).to_string();
-        let port = match kind.as_str() {
-            "image" | "audio" => {
-                match self.ensure(id) {
-                    Ok(l) => l.port,
-                    Err((c, e)) => return http::respond(s, c, &err(e)),
-                }
+        if matches!(kind.as_str(), "image" | "audio") {
+            // An image or audio model's server listens on 127.0.0.1 only (it checks no token), so its page is served
+            // through here, under /open/<id>/, and the page asks for everything relative to that. It used to be a
+            // redirect to the server's own port, which a browser on another machine could not reach (2026-10-17).
+            let Some(sub) = sub else {
+                return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"",
+                                           &format!("Location: /open/{id}/\r\nCache-Control: no-cache\r\n"));
+            };
+            let lease = match self.ensure(id) {
+                Ok(l) => l,
+                Err((c, e)) => return http::respond(s, c, &err(e)),
+            };
+            let query = &req.target[req.path.len().min(req.target.len())..];
+            if let Err(e) = http::forward_to(&mut *s, &lease, req, &format!("/{sub}{query}")) {
+                eprintln!("open {id}: {e}");
             }
+            return;
+        }
+        let port = match kind.as_str() {
             "video" => self.o.ports.video,
             _ => self.o.ports.chat_ui,
         };

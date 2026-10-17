@@ -2,7 +2,8 @@
  *  only. 150 dpi (a letter page: 1275 x 1650), as the reference tests render them. */
 import type { Page } from "./types.js";
 
-const BASE = "/ui/vendor/pdfjs/";
+// against the page, not this module: the page may be on its server's port or under the front door's /open/<id>/
+const BASE = new URL("ui/vendor/pdfjs/", document.baseURI).href;
 export const DPI = 150;
 
 interface Viewport { width: number; height: number }
