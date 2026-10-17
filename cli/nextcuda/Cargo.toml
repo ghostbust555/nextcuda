@@ -17,6 +17,7 @@ nextcuda-image-paddleocrvl.workspace = true
 nextcuda-image-unlimitedocr.workspace = true
 nextcuda-image-olmocr2.workspace = true
 nextcuda-video.workspace = true
+nextcuda-video-h3.workspace = true
 nextcuda-audio.workspace = true
 nextcuda-model3d.workspace = true
 nextcuda-mesh.workspace = true

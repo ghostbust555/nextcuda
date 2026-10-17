@@ -127,12 +127,13 @@ pub fn kind() -> VideoKind {
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> nextcuda_video::Result<Box<dyn VideoEngine>> {
     let denoiser = files.get("denoiser").ok_or_else(|| nextcuda_video::Error(format!("{ARCH}: no denoiser file")))?;
-    let gpu = gpus.first().map_or(0, |g| g.index);
     let threads = o.setting("H3_THREADS").and_then(|v| v.parse().ok()).unwrap_or(8);
     let t0 = std::time::Instant::now();
-    // its own context on the GPU (H3's device), as each worker process had
-    let dev = device::Device::open_index(gpu).map_err(ve)?;
-    let e = jobs::Engine::load_on(dev, denoiser, None, threads, log).map_err(ve)?;
+    // its own context on each GPU (H3's device), as each worker process had; given two, the denoiser's blocks and
+    // the text encoder are split over them (nextcuda's 12 GB pair: models that fit, nothing streamed)
+    let idx: Vec<usize> = if gpus.is_empty() { vec![0] } else { gpus.iter().map(|g| g.index).collect() };
+    let devs = idx.iter().map(|i| device::Device::open_index(*i)).collect::<Result<Vec<_>>>().map_err(ve)?;
+    let e = jobs::Engine::load_cards(devs, denoiser, None, threads, log).map_err(ve)?;
     Ok(Box::new(H3 { e, files: files.clone(), load_s: t0.elapsed().as_secs_f64() }))
 }
 

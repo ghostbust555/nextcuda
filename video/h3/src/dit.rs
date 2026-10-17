@@ -177,10 +177,10 @@ impl Block {
 /// What a step fixes for every block: each token's table row, the position rotations, and every block's tables.
 pub struct Step {
     pub tokens: usize,
-    /// int32 [S]
-    rows: Tensor,
-    /// float32 [S, rot_dim / 2, 2]: (cos, sin)
-    cs: Tensor,
+    /// int32 [S], on each of the model's cards
+    rows: Vec<Tensor>,
+    /// float32 [S, rot_dim / 2, 2]: (cos, sin), on each card
+    cs: Vec<Tensor>,
     /// per block: shift_a, scale_a, gate_a, shift_m, scale_m, gate_m
     tables: Vec<[Tensor; 6]>,
 }
@@ -219,19 +219,23 @@ impl Step {
         }
         let cs = rotations(positions, inv_freq);
         let row_bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // a model on one card is on `dev`; split, each block's tables go to its own card
+        let devs: Vec<Arc<Device>> = if model.devs.len() > 1 { model.devs.clone() } else { vec![dev.clone()] };
         let mut tables = Vec::with_capacity(model.blocks.len());
-        for b in &model.blocks {
+        for (i, b) in model.blocks.iter().enumerate() {
+            let on = &devs[model.dev_of.get(i).copied().unwrap_or(0).min(devs.len() - 1)];
             let t = b.tables(cfg, t_emb);
             let mut dev_t = Vec::with_capacity(6);
             for v in &t {
-                dev_t.push(Tensor::from_bytes(dev, DType::F32, &[r, cfg.hidden], &f32_bytes(v))?);
+                dev_t.push(Tensor::from_bytes(on, DType::F32, &[r, cfg.hidden], &f32_bytes(v))?);
             }
             tables.push(dev_t.try_into().map_err(|_| Error("six tables per block".into()))?);
         }
+        let cs_bytes = f32_bytes(&cs);
         Ok(Step {
             tokens,
-            rows: Tensor::from_bytes(dev, DType::I32, &[tokens], &row_bytes)?,
-            cs: Tensor::from_bytes(dev, DType::F32, &[tokens, cfg.rot_dim / 2, 2], &f32_bytes(&cs))?,
+            rows: devs.iter().map(|d| Tensor::from_bytes(d, DType::I32, &[tokens], &row_bytes)).collect::<Result<_>>()?,
+            cs: devs.iter().map(|d| Tensor::from_bytes(d, DType::F32, &[tokens, cfg.rot_dim / 2, 2], &cs_bytes)).collect::<Result<_>>()?,
             tables,
         })
     }
@@ -284,9 +288,12 @@ pub struct Blocks {
     pub blocks: Vec<Block>,
     pub load_seconds: f64,
     pub load_bytes: u64,
-    /// the k-quant form's (`None` for int8): which, and the bfloat16 buffer each matrix is expanded into
+    /// the k-quant form's (`None` for int8): which, and the bfloat16 buffer each matrix is expanded into (one a card)
     pub kquant: Option<GType>,
-    wbuf: Option<Tensor>,
+    wbuf: Vec<Option<Tensor>>,
+    /// the cards the blocks are on (one, unless `load_split`), and each block's card (an index into `devs`)
+    pub devs: Vec<Arc<Device>>,
+    pub dev_of: Vec<usize>,
 }
 
 impl Blocks {
@@ -319,14 +326,88 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf: vec![wbuf], devs: vec![dev.clone()], dev_of: vec![0; n] })
+    }
+
+    /// The bytes of block `i`'s matrices in the checkpoint
+    fn block_bytes(ck: &Checkpoint, prefix: &str, i: usize) -> u64 {
+        LINEARS.iter().flat_map(|l| [format!("{prefix}.{i}.{l}.weight"), format!("{prefix}.{i}.{l}.weight_scale")])
+            .filter_map(|n| ck.get(&n).ok().map(|e| e.bytes as u64)).sum()
+    }
+
+    /// All the blocks over several cards (nextcuda: a 12 GB pair holds what one 32 GB card did): the first card takes
+    /// blocks while it has the room beyond `reserve[d]` bytes kept for the run's buffers, then the next. Fails when
+    /// they do not fit - nothing is streamed.
+    pub fn load_split(devs: &[Arc<Device>], ck: &Checkpoint, reserve: &[u64], threads: usize) -> Result<Blocks> {
+        let cfg = Config::from_checkpoint(ck)?;
+        let n = cfg.blocks;
+        if devs.len() < 2 {
+            return Self::load_from(devs.first().ok_or("no card for the denoiser")?, ck, "blocks", cfg, threads);
+        }
+        let kquant = ck.kquant_of("blocks.0.mlp.fc1.weight");
+        // the expansion buffer each card needs beside its blocks (the widest matrix, bfloat16)
+        let widest: u64 = LINEARS.iter().filter_map(|l| ck.get(&format!("blocks.0.{l}.weight")).ok()).map(|e| e.shape.iter().product::<usize>() as u64 * 2).max().unwrap_or(0);
+        let mut room: Vec<u64> = devs.iter().enumerate()
+            .map(|(d, dev)| dev.mem_cap().saturating_sub(dev.mem_used()).saturating_sub(reserve.get(d).copied().unwrap_or(0)).saturating_sub(if kquant.is_some() { widest } else { 0 }))
+            .collect();
+        let mut dev_of = Vec::with_capacity(n);
+        let mut d = 0;
+        for i in 0..n {
+            let b = Self::block_bytes(ck, "blocks", i);
+            while d < devs.len() && b > room[d] {
+                d += 1;
+            }
+            if d == devs.len() {
+                let total: u64 = (0..n).map(|j| Self::block_bytes(ck, "blocks", j)).sum();
+                return Err(Error(format!("the denoiser's blocks ({:.1} GiB) do not fit on {}: block {i} has no card (a smaller quantization, or fewer seconds)",
+                                         total as f64 / 1073741824.0, devs.iter().map(|d| d.name()).collect::<Vec<_>>().join(" + "))));
+            }
+            room[d] -= b;
+            dev_of.push(d);
+        }
+        let mut blocks: Vec<Option<Block>> = (0..n).map(|_| None).collect();
+        let (mut seconds, mut bytes) = (0f64, 0u64);
+        for (di, dev) in devs.iter().enumerate() {
+            let mine: Vec<usize> = (0..n).filter(|i| dev_of[*i] == di).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let wanted = |name: &str| -> bool {
+                let Some(rest) = name.strip_prefix("blocks.") else { return false };
+                let Some((idx, tail)) = rest.split_once('.') else { return false };
+                idx.parse::<usize>().is_ok_and(|i| mine.contains(&i)) && LINEARS.iter().any(|l| tail == format!("{l}.weight") || tail == format!("{l}.weight_scale"))
+            };
+            let mut loaded = load::load(dev, ck, threads, wanted).ctx(format!("loading the denoiser's blocks onto {}", dev.name()))?;
+            seconds += loaded.seconds;
+            bytes += loaded.bytes;
+            for i in &mine {
+                blocks[*i] = Some(Block::assemble(dev, ck, "blocks", *i, &mut loaded.tensors).ctx(format!("block {i}"))?);
+            }
+        }
+        let blocks: Vec<Block> = blocks.into_iter().map(|b| b.ok_or("a block was not placed")).collect::<std::result::Result<_, _>>()?;
+        let wbuf = devs.iter().enumerate().map(|(di, dev)| -> Result<Option<Tensor>> {
+            match kquant {
+                Some(_) if dev_of.contains(&di) => {
+                    let most = blocks.iter().zip(&dev_of).filter(|(_, d)| **d == di).flat_map(|(b, _)| [&b.qkv, &b.out_proj, &b.fc1, &b.fc2])
+                        .map(|w| { let (n, k) = w.size(); n * k }).max().unwrap_or(0);
+                    Ok(Some(Tensor::new(dev, DType::BF16, &[most]).ctx("the buffer the k-quant matrices expand into")?))
+                }
+                _ => Ok(None),
+            }
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Blocks { cfg, blocks, load_seconds: seconds, load_bytes: bytes, kquant, wbuf, devs: devs.to_vec(), dev_of })
+    }
+
+    /// Block `i`'s card (an index into `devs`)
+    pub fn card_of(&self, i: usize) -> usize {
+        self.dev_of.get(i).copied().unwrap_or(0)
     }
 
     /// `out = linear(x)` with one of the blocks' matrices.
-    fn mm(&self, w: &Weight, x: &Tensor, out: &Tensor) -> Result<()> {
+    fn mm(&self, w: &Weight, x: &Tensor, out: &Tensor, card: usize) -> Result<()> {
         match w {
             Weight::I8(l) => l.forward(x, out),
-            Weight::K(l) => l.forward(x, out, self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?),
+            Weight::K(l) => l.forward(x, out, self.wbuf.get(card).and_then(Option::as_ref).ok_or("a k-quant matrix without its expansion buffer")?),
         }
     }
 
@@ -335,6 +416,8 @@ impl Blocks {
     pub fn block(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, lora: Option<&crate::lora::BlockLora>, mut tap: Option<Tap>) -> Result<()> {
         let cfg = &self.cfg;
         let b = &self.blocks[index];
+        let card = self.card_of(index);
+        let (rows, cs) = (&step.rows[card.min(step.rows.len() - 1)], &step.cs[card.min(step.cs.len() - 1)]);
         let [shift_a, scale_a, gate_a, shift_m, scale_m, gate_m] = &step.tables[index];
         let mut tap = |name: &str, t: &Tensor| -> Result<()> {
             match tap.as_mut() {
@@ -343,34 +426,34 @@ impl Blocks {
             }
         };
         // attention half
-        ops::rms_norm_mod(x, &b.norm1, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_a, shift: shift_a }), &s.h)?;
+        ops::rms_norm_mod(x, &b.norm1, cfg.norm_eps, Some(&Mod { rows: rows, scale: scale_a, shift: shift_a }), &s.h)?;
         tap("h1", &s.h)?;
-        self.mm(&b.qkv, &s.h, &s.qkv)?;
+        self.mm(&b.qkv, &s.h, &s.qkv, card)?;
         side(lora, 0, &s.h, &s.qkv, &s.lora)?;
         tap("qkv", &s.qkv)?;
         let w = cfg.heads * cfg.head_dim;
         let part = |i: usize| Rows { t: &s.qkv, offset: i * w, stride: 3 * w, tokens: step.tokens, heads: cfg.heads, dim: cfg.head_dim };
-        ops::rms_rope(part(0), &b.q_norm, cfg.qk_eps, &step.cs, cfg.rot_dim)?;
-        ops::rms_rope(part(1), &b.k_norm, cfg.qk_eps, &step.cs, cfg.rot_dim)?;
+        ops::rms_rope(part(0), &b.q_norm, cfg.qk_eps, cs, cfg.rot_dim)?;
+        ops::rms_rope(part(1), &b.k_norm, cfg.qk_eps, cs, cfg.rot_dim)?;
         tap("qkv_rotated", &s.qkv)?;
         ops::attention(part(0), part(1), part(2), &s.att)?;
         tap("att", &s.att)?;
-        self.mm(&b.out_proj, &s.att, &s.proj)?;
+        self.mm(&b.out_proj, &s.att, &s.proj, card)?;
         side(lora, 1, &s.att, &s.proj, &s.lora)?;
         tap("attn_out", &s.proj)?;
-        ops::gate_add(x, &s.proj, &step.rows, gate_a)?;
+        ops::gate_add(x, &s.proj, rows, gate_a)?;
         tap("x1", x)?;
         // MLP half
-        ops::rms_norm_mod(x, &b.norm2, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_m, shift: shift_m }), &s.h)?;
+        ops::rms_norm_mod(x, &b.norm2, cfg.norm_eps, Some(&Mod { rows: rows, scale: scale_m, shift: shift_m }), &s.h)?;
         tap("h2", &s.h)?;
-        self.mm(&b.fc1, &s.h, &s.fc1)?;
+        self.mm(&b.fc1, &s.h, &s.fc1, card)?;
         side(lora, 2, &s.h, &s.fc1, &s.lora)?;
         tap("fc1", &s.fc1)?;
         ops::swiglu(&s.fc1, &s.act)?;
-        self.mm(&b.fc2, &s.act, &s.proj)?;
+        self.mm(&b.fc2, &s.act, &s.proj, card)?;
         side(lora, 3, &s.act, &s.proj, &s.lora)?;
         tap("mlp", &s.proj)?;
-        ops::gate_add(x, &s.proj, &step.rows, gate_m)?;
+        ops::gate_add(x, &s.proj, rows, gate_m)?;
         tap("x2", x)
     }
 }

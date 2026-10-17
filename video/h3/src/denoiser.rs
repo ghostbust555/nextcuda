@@ -393,6 +393,8 @@ pub struct Denoiser<'a> {
     text_tags: Option<Vec<i32>>,
     x: Tensor,
     scratch: Scratch,
+    /// the stream and the scratch on each further card the blocks are split over (nextcuda: `Blocks::load_split`)
+    tail: Vec<(Tensor, Scratch)>,
     /// LoRAs on the blocks, if any
     pub lora: Option<&'a crate::lora::LoraSet>,
     /// the keyframes' rows, embedded once: (first row in the sequence, rows)
@@ -503,9 +505,16 @@ impl<'a> Denoiser<'a> {
             return Err(Error("text_tags: one modality (0, 1 or 2) per text token".into()));
         }
         let s = layout.tokens();
+        if blocks.devs.len() > 1 && !blocks.devs[0].same(&dev) {
+            return Err(Error("the text tokens must be on the first card of the split denoiser".into()));
+        }
+        let tail = blocks.devs.iter().skip(1)
+            .map(|d| -> Result<(Tensor, Scratch)> { Ok((Tensor::new(d, DType::BF16, &[s, cfg.hidden])?, Scratch::new(d, cfg, s, DType::BF16)?)) })
+            .collect::<Result<_>>()?;
         Ok(Denoiser {
             x: Tensor::new(&dev, DType::BF16, &[s, cfg.hidden])?,
             scratch: Scratch::new(&dev, cfg, s, DType::BF16)?,
+            tail,
             blocks,
             outer,
             shape,
@@ -667,10 +676,26 @@ impl<'a> Denoiser<'a> {
             }
             None => None,
         };
+        if !self.tail.is_empty() && (self.lora.is_some() || control.is_some()) {
+            return Err(Error("LoRAs and the ControlNet run on a denoiser on one card only (this one is split over the cards)".into()));
+        }
+        // the stream to card `to` from card `from` (through host memory: a step's rows, twice a step when split)
+        let move_to = |from: usize, to: usize, x0: &Tensor, tail: &[(Tensor, Scratch)]| -> Result<()> {
+            let src = if from == 0 { x0 } else { &tail[from - 1].0 };
+            let dst = if to == 0 { x0 } else { &tail[to - 1].0 };
+            dst.buf.write(0, &src.to_bytes()?)
+        };
+        let mut card = 0;
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
             let lora = self.lora.and_then(|l| l.blocks.get(i));
-            self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
+            let c = self.blocks.card_of(i);
+            if c != card {
+                move_to(card, c, &self.x, &self.tail)?;
+                card = c;
+            }
+            let (x, sc) = if card == 0 { (&self.x, &self.scratch) } else { (&self.tail[card - 1].0, &self.tail[card - 1].1) };
+            self.blocks.block(i, x, &step, sc, lora, None)?;
             if let (Some(c), Some(cs)) = (control, cstep.as_ref()) {
                 if let Some(k) = c.net.at.iter().position(|l| *l == i) {
                     if k == 0 {
@@ -682,6 +707,9 @@ impl<'a> Denoiser<'a> {
             }
         }
 
+        if card != 0 {
+            move_to(card, 0, &self.x, &self.tail)?;
+        }
         // final layer, per stream, in chunks of rows
         let (shift, scale) = o.final_tables(&cfg, &t_emb);
         let r = ts.values.len();

@@ -572,6 +572,7 @@ dependencies = [
  "nextcuda-serve",
  "nextcuda-tok",
  "nextcuda-video",
+ "nextcuda-video-h3",
  "serde_json",
 ]
 

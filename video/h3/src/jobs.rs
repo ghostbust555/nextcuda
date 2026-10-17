@@ -24,10 +24,19 @@ pub fn gib(bytes: u64) -> f64 {
 }
 
 /// The loaded engine: the GPU, the checkpoint, the denoiser's blocks and the small parts around them on the GPU.
+///
+/// nextcuda: the blocks are held lazily (`blocks`), and on more than one card they are split over the cards
+/// (`dit::Blocks::load_split`). A split engine gives the cards to the text encoder for an encode - the blocks
+/// released, the encoder resident over the cards, then freed (`encode_pieces_on`) - so each stage holds a model that
+/// fits, and nothing is streamed.
 pub struct Engine {
     pub dev: Arc<Device>,
+    /// every card the engine may use (`dev` first)
+    pub devs: Vec<Arc<Device>>,
     pub ck: Checkpoint,
-    pub model: dit::Blocks,
+    pub cfg: dit::Config,
+    model: std::sync::Mutex<Option<Arc<dit::Blocks>>>,
+    count: Option<usize>,
     pub outer: Outer,
     pub threads: usize,
 }
@@ -40,13 +49,47 @@ impl Engine {
 
     /// The same, on a GPU already opened.
     pub fn load_on(dev: Arc<Device>, path: &Path, count: Option<usize>, threads: usize, log: &mut dyn FnMut(String)) -> Result<Engine> {
+        Engine::load_cards(vec![dev], path, count, threads, log)
+    }
+
+    /// On several cards: the blocks split over them, loaded when first needed (one card: loaded now, as before)
+    pub fn load_cards(devs: Vec<Arc<Device>>, path: &Path, count: Option<usize>, threads: usize, log: &mut dyn FnMut(String)) -> Result<Engine> {
+        let dev = devs.first().cloned().ok_or("no card for the engine")?;
         let ck = Checkpoint::open(path)?;
-        log(format!("device : {}", dev.name()));
-        let model = dit::Blocks::load(&dev, &ck, count, threads)?;
-        log(format!("blocks : {} loaded, {:.2} GiB in {:.1} s", model.blocks.len(), gib(model.load_bytes), model.load_seconds));
+        log(format!("device : {}", devs.iter().map(|d| d.name()).collect::<Vec<_>>().join(" + ")));
         let outer = Outer::load(&dev, &ck)?;
-        denoiser::check_fits(&model.cfg, &outer)?;
-        Ok(Engine { dev, ck, model, outer, threads })
+        let mut cfg = dit::Config::from_checkpoint(&ck)?;
+        cfg.blocks = count.unwrap_or(cfg.blocks).min(cfg.blocks);
+        denoiser::check_fits(&cfg, &outer)?;
+        let e = Engine { dev, devs, ck, cfg, model: std::sync::Mutex::new(None), count, outer, threads };
+        if e.devs.len() == 1 {
+            let m = e.blocks()?;
+            log(format!("blocks : {} loaded, {:.2} GiB in {:.1} s", m.blocks.len(), gib(m.load_bytes), m.load_seconds));
+        }
+        Ok(e)
+    }
+
+    /// The denoiser's blocks, loaded if they are not (split over the cards when there are several)
+    pub fn blocks(&self) -> Result<Arc<dit::Blocks>> {
+        let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = m.as_ref() {
+            return Ok(b.clone());
+        }
+        let b = if self.devs.len() > 1 {
+            // room kept on each card for a clip's buffers beside its blocks (the stream, the scratch, the tables)
+            let reserve: Vec<u64> = self.devs.iter().map(|_| 2u64 << 30).collect();
+            dit::Blocks::load_split(&self.devs, &self.ck, &reserve, self.threads)?
+        } else {
+            dit::Blocks::load(&self.dev, &self.ck, self.count, self.threads)?
+        };
+        let b = Arc::new(b);
+        *m = Some(b.clone());
+        Ok(b)
+    }
+
+    /// The blocks off the cards (an encode on a split engine needs them); the next `blocks` loads them again
+    pub fn release(&self) {
+        *self.model.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn inv_freq(&self) -> Result<Vec<f32>> {
@@ -109,14 +152,15 @@ fn columns(v: &[f32], stride: usize, from: usize, width: usize) -> Vec<f32> {
 /// The denoiser's blocks against a dump of the reference pipeline (reference/h3x.py, H3X_DUMP_BLOCK): the host-side
 /// tables, every stage of block 0, then the stream after later blocks. Fails when the result drifts.
 pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value> {
+    let model = e.blocks()?;
     let dump = Checkpoint::open(dump_path)?;
-    let mut cfg = e.model.cfg;
+    let mut cfg = e.cfg;
     for (key, eps) in [("norm_eps", &mut cfg.norm_eps), ("qk_eps", &mut cfg.qk_eps)] {
         if let Some(v) = dump.metadata.get(key) {
             *eps = v.parse().map_err(|_| Error(format!("the dump's {key} is not a number: {v}")))?;
         }
     }
-    if cfg.norm_eps != e.model.cfg.norm_eps || cfg.qk_eps != e.model.cfg.qk_eps {
+    if cfg.norm_eps != e.cfg.norm_eps || cfg.qk_eps != e.cfg.qk_eps {
         return Err(Error("the dump was made with other norm constants than the loaded model".into()));
     }
     let f32s = |name: &str| -> Result<Vec<f32>> { crate::dtype::bytes_to_f32(&dump.read(name)?, dump.get(name)?.dtype) };
@@ -134,7 +178,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     ctl.say(format!("dump   : {tokens} tokens, {} timestep rows", t_emb.len() / cfg.t_dim));
 
     ctl.say("host side, against the reference:".into());
-    let tables = e.model.blocks[0].tables(&cfg, &t_emb);
+    let tables = model.blocks[0].tables(&cfg, &t_emb);
     let mut worst = 0f64;
     for (t, name) in tables.iter().zip(["shift_msa", "scale_msa", "gate_msa", "shift_mlp", "scale_mlp", "gate_mlp"]) {
         worst = worst.max(reference::compare(t, &f32s(&format!("b0.{name}"))?).0);
@@ -146,7 +190,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     report(ctl, "position rotations (cos, sin)", &cs, &want_cs);
 
     let dev = &e.dev;
-    let step = dit::Step::new(dev, &e.model, &rows, &positions, &inv_freq, &t_emb)?;
+    let step = dit::Step::new(dev, &model, &rows, &positions, &inv_freq, &t_emb)?;
     let scratch = dit::Scratch::new(dev, &cfg, tokens, DType::BF16)?;
     let x_in = dump.read("x_in")?;
     let x = Tensor::from_bytes(dev, DType::BF16, &[tokens, cfg.hidden], &x_in)?;
@@ -168,16 +212,16 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
             worst_cos = worst_cos.min(c);
             Ok(())
         };
-        e.model.block(0, &x, &step, &scratch, None, Some(&mut tap))?;
+        model.block(0, &x, &step, &scratch, None, Some(&mut tap))?;
     }
 
     ctl.say("the stream after later blocks:".into());
-    let last = e.model.blocks.len() - 1;
+    let last = e.cfg.blocks - 1;
     let mut after = Vec::new();
     for i in 1..=last {
         ctl.check_at(dev)?;
         ctl.step(i, 2 * (last + 1));
-        e.model.block(i, &x, &step, &scratch, None, None)?;
+        model.block(i, &x, &step, &scratch, None, None)?;
         let key = if dump.metadata.get("last_block").is_some_and(|l| *l == i.to_string()) { "out.last".to_string() } else { format!("out.{i}") };
         if dump.entries.contains_key(&key) {
             let c = report(ctl, &format!("after block {i}"), &x.to_f32()?, &f32s(&key)?).1;
@@ -193,7 +237,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     for i in 0..=last {
         ctl.check_at(dev)?;
         ctl.step(last + 1 + i, 2 * (last + 1));
-        e.model.block(i, &x, &step, &scratch, None, None)?;
+        model.block(i, &x, &step, &scratch, None, None)?;
     }
     dev.wait()?;
     let s = t0.elapsed().as_secs_f64();
@@ -208,13 +252,14 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
 /// The block stack on made-up tokens at a chosen sequence length: what one denoiser step costs, and where.
 /// `blocks`: run only the first that many (all the loaded ones when `None`).
 pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut Ctl) -> Result<Value> {
-    let cfg = e.model.cfg;
+    let model = e.blocks()?;
+    let cfg = e.cfg;
     let dev = &e.dev;
     let mut rng = Rng::new(0);
     let rows: Vec<i32> = (0..tokens).map(|i| if i < tokens / 20 { 1 } else { 0 }).collect();
     let positions: Vec<f64> = (0..tokens * 3).map(|_| (rng.uniform() * 64.0) as f64).collect();
     let t_emb: Vec<f32> = (0..cfg.t_dim).map(|_| rng.normal()).collect();
-    let step = dit::Step::new(dev, &e.model, &rows, &positions, &e.inv_freq()?, &t_emb)?;
+    let step = dit::Step::new(dev, &model, &rows, &positions, &e.inv_freq()?, &t_emb)?;
     let scratch = dit::Scratch::new(dev, &cfg, tokens, DType::BF16)?;
     // made-up input: a million random values repeated (drawing all 250 million at 47k tokens took the slow host
     // half a minute, during which a cancel could not get through)
@@ -222,17 +267,17 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
     let xb: Vec<u8> = pattern.iter().copied().cycle().take(tokens * cfg.hidden * 2).collect();
     ctl.check()?;
     let x = Tensor::from_bytes(dev, DType::BF16, &[tokens, cfg.hidden], &xb)?;
-    let n = blocks.unwrap_or(e.model.blocks.len()).min(e.model.blocks.len());
+    let n = blocks.unwrap_or(e.cfg.blocks).min(e.cfg.blocks);
 
     // warm-up: the first call of each kernel shape compiles it
-    e.model.block(0, &x, &step, &scratch, None, None)?;
+    model.block(0, &x, &step, &scratch, None, None)?;
     dev.wait()?;
     x.buf.write(0, &xb)?;
     let t0 = Instant::now();
     for i in 0..n {
         ctl.check_at(dev)?;
         ctl.step(i, 2 * n);
-        e.model.block(i, &x, &step, &scratch, None, None)?;
+        model.block(i, &x, &step, &scratch, None, None)?;
     }
     dev.wait()?;
     let total = t0.elapsed().as_secs_f64();
@@ -263,7 +308,7 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
             if let Some(p) = ctl.progress.as_mut() {
                 p(n + i, 2 * n);
             }
-            e.model.block(i, &x, &step, &scratch, None, Some(&mut tap))?;
+            model.block(i, &x, &step, &scratch, None, Some(&mut tap))?;
         }
     }
     let sum: f64 = stages.iter().map(|s| s.1).sum();
@@ -300,12 +345,13 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
 /// text conditioning, starting noise and schedule; every step's denoised estimate compared with the reference's,
 /// then the finished latents. `out`: where to write the latents (for the reference's decoders).
 pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+    let model = e.blocks()?;
     let t_all = Instant::now();
     let dump = Checkpoint::open(dump_path)?;
     let f32s = |name: &str| -> Result<Vec<f32>> { crate::dtype::bytes_to_f32(&dump.read(name)?, dump.get(name)?.dtype) };
     let meta = |k: &str, d: f32| -> f32 { dump.metadata.get(k).and_then(|v| v.parse().ok()).unwrap_or(d) };
     let schedule = Schedule { shift_video: meta("shift", 12.0), shift_audio: meta("audio_shift", 3.0), audio_scale: meta("audio_scale", 4.0) };
-    if e.model.blocks.len() != e.model.cfg.blocks {
+    if e.cfg.blocks != e.cfg.blocks {
         return Err(Error("denoise needs every block loaded".into()));
     }
     let vs = &dump.get("noise.video")?.shape; // [1, C, T, H, W]
@@ -328,7 +374,7 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     let text = {
         let refiner = TextRefiner::load(&e.dev, &e.ck, e.threads)?;
         let ctx = Tensor::from_bytes(&e.dev, DType::BF16, &[l, text_dim], &denoiser::bf16_bytes(&f32s("context")?))?;
-        let t = refiner.run(&e.model.cfg, &ctx, None)?;
+        let t = refiner.run(&e.cfg, &ctx, None)?;
         e.dev.wait()?;
         t
     };
@@ -408,9 +454,9 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
             cond.refs.push(r);
         }
     }
-    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
+    let mut d = Denoiser::new(&model, &e.outer, text, tags, shape, schedule, &cond)?;
     let steps = sigmas.len() - 1;
-    let nblocks = e.model.blocks.len();
+    let nblocks = e.cfg.blocks;
     ctl.say(format!("tokens : {}", d.tokens()));
     let mut per_step = Vec::new();
     let mut worst = 1f64;
@@ -811,6 +857,70 @@ pub fn encode_pieces(dev: &Arc<Device>, threads: usize, pieces: &[Piece], files:
     let ctx = r?;
     let secs = t0.elapsed().as_secs_f64();
     ctl.say(format!("encoded: {} x {} in {secs:.1} s (layers from {})", ids.len(), enc.hidden, enc.source.lock().map(|s| s.clone()).unwrap_or_default()));
+    Ok((ctx, presented, enc.hidden, secs))
+}
+
+/// `encode_pieces` for an engine: on one card, as it is; split over cards, the prompt's conditioning from the cache
+/// of earlier encodes when it has it (the same tokens, pictures and embeddings, the same text encoder file), else the
+/// blocks released and the text encoder resident over the cards for this encode (nextcuda: nothing streamed).
+pub fn encode_pieces_on(e: &Engine, pieces: &[Piece], files: &TeFiles, ctl: &mut Ctl) -> Result<(Vec<f32>, crate::vision::Presented, usize, f64)> {
+    if e.devs.len() < 2 {
+        return encode_pieces(&e.dev, e.threads, pieces, files, ctl);
+    }
+    let tok = crate::tokenizer::Tokenizer::load(files.tokenizer)?;
+    let presented = crate::vision::present(pieces, &tok, files.visual, files.embeddings, e.dev.index, &mut |l| ctl.say(l))?;
+    ctl.say(format!("prompt : {} tokens", presented.ids.len()));
+    // the cache key: the encoder file (path, size, mtime) and everything the encoder reads
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let meta = std::fs::metadata(files.te)?;
+    (files.te, meta.len(), meta.modified().ok()).hash(&mut h);
+    presented.ids.hash(&mut h);
+    for s in &presented.seen {
+        (s.at, s.grid, s.tokens.len()).hash(&mut h);
+        s.tokens.iter().for_each(|v| v.to_bits().hash(&mut h));
+        s.deep.iter().flatten().for_each(|v| v.to_bits().hash(&mut h));
+    }
+    for (at, rows) in &presented.embeds {
+        at.hash(&mut h);
+        rows.iter().for_each(|v| v.to_bits().hash(&mut h));
+    }
+    let dir = std::env::var("H3_PROMPT_CACHE").map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache/nextcuda/h3-prompts"));
+    let file = dir.join(format!("{:016x}.f32", h.finish()));
+    let enc = crate::te::TextEncoder::open(files.te)?;
+    if let Ok(b) = std::fs::read(&file) {
+        if b.len() == presented.ids.len() * enc.hidden * 4 {
+            ctl.say(format!("encoded: {} x {} from the prompt cache ({})", presented.ids.len(), enc.hidden, file.display()));
+            let ctx = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            return Ok((ctx, presented, enc.hidden, 0.0));
+        }
+    }
+    let t0 = Instant::now();
+    e.release();
+    let r = enc.load_resident(&e.devs, e.threads)?;
+    let place: Vec<String> = r.placement().iter().filter(|p| p.1 > 0).map(|(n, l, b)| format!("{l} layers ({:.1} GiB) on {n}", gib(*b))).collect();
+    ctl.say(format!("te     : {} layers, hidden {}, resident: {} in {:.1} s", enc.layers, enc.hidden, place.join(", "), t0.elapsed().as_secs_f64()));
+    let cancel = ctl.cancel;
+    let layers = enc.layers;
+    let mut progress = ctl.progress.take();
+    let out = enc.encode_resident(&r, &presented.ids, &presented.seen, &presented.embeds, &mut |i| {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error("cancelled".into()));
+        }
+        if let Some(p) = progress.as_mut() {
+            p(i, layers);
+        }
+        Ok(())
+    });
+    ctl.progress = progress;
+    drop(r); // the cards back for the blocks
+    let ctx = out?;
+    let secs = t0.elapsed().as_secs_f64();
+    ctl.say(format!("encoded: {} x {} in {secs:.1} s (resident over the cards)", presented.ids.len(), enc.hidden));
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&file, ctx.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    }
     Ok((ctx, presented, enc.hidden, secs))
 }
 
@@ -1239,12 +1349,13 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         }
     }
     pieces.push(Piece::Text(c.prompt.clone()));
-    let (ctx, presented, hidden, te_secs) = encode_pieces(&e.dev, e.threads, &pieces, &c.te, ctl)?;
+    let (ctx, presented, hidden, te_secs) = encode_pieces_on(e, &pieces, &c.te, ctl)?;
     let ids = &presented.ids;
     ctl.check()?;
+    let model = e.blocks()?;
     let mut lora: Option<crate::lora::LoraSet> = None;
     for (p, strength) in &c.lora {
-        let l = crate::lora::LoraSet::load(&e.dev, &Checkpoint::open(p)?, *strength, e.model.blocks.len(), 2)?;
+        let l = crate::lora::LoraSet::load(&e.dev, &Checkpoint::open(p)?, *strength, e.cfg.blocks, 2)?;
         if l.max_rank > crate::dit::MAX_LORA_RANK {
             return Err(Error(format!("LoRA rank {} is over {}", l.max_rank, crate::dit::MAX_LORA_RANK)));
         }
@@ -1258,7 +1369,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let text = {
         let refiner = TextRefiner::load(&e.dev, &e.ck, e.threads)?;
         let t = Tensor::from_bytes(&e.dev, DType::BF16, &[ids.len(), hidden], &denoiser::bf16_bytes(&ctx))?;
-        let r = refiner.run(&e.model.cfg, &t, lora.as_ref().map(|l| l.refiner.as_slice()))?;
+        let r = refiner.run(&e.cfg, &t, lora.as_ref().map(|l| l.refiner.as_slice()))?;
         e.dev.wait()?;
         r
     };
@@ -1285,7 +1396,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
                     f => s * (1.0 - f) / (1.0 + (s - 1.0) * (1.0 - f)),
                 }
             };
-            let net = crate::control::Control::load(&e.dev, &Checkpoint::open(p)?, e.model.cfg, c.inputs.control_strength,
+            let net = crate::control::Control::load(&e.dev, &Checkpoint::open(p)?, e.cfg, c.inputs.control_strength,
                                                     (at(c.inputs.control_range.0), at(c.inputs.control_range.1)), e.threads)?;
             ctl.say(format!("control: {} blocks after layers {:?}, strength {}, loaded in {:.1} s", net.at.len(), net.at, c.inputs.control_strength,
                             t0.elapsed().as_secs_f64()));
@@ -1294,7 +1405,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     };
     // vision blocks run on the video tables (tag 0), the rest on the text ones
     let tags = presented.has_vision().then(|| presented.tags.clone());
-    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
+    let mut d = Denoiser::new(&model, &e.outer, text, tags, shape, schedule, &cond)?;
     d.lora = lora.as_ref();
     if let (Some(net), Some((h, ch))) = (control.as_ref(), hint.as_ref()) {
         d.set_control(net, h, *ch)?;
@@ -1317,7 +1428,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         ctl.say(format!("sampler: {} on the {} schedule ({} levels)", c.sampler.name(), c.schedule.name(), sigmas.len()));
     }
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
-    let nblocks = e.model.blocks.len();
+    let nblocks = e.cfg.blocks;
     let steps = c.steps;
     let t0 = Instant::now();
     let (v, a) = {

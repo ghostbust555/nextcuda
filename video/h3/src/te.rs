@@ -405,3 +405,201 @@ impl TextEncoder {
         out
     }
 }
+
+/// The text encoder resident on the cards (nextcuda): every layer's matrices uploaded once, each layer on the first
+/// card with the room, so a 12 GB pair holds the 18 GB file between them for the encode - no layer streamed (the
+/// user's rule for the silo: models that fit, split across the cards when one is not enough). The denoiser is not
+/// loaded beside it; the engine frees one before loading the other.
+pub struct Resident {
+    devs: Vec<Arc<Device>>,
+    layers: Vec<RLayer>,
+}
+
+struct RLayer {
+    dev: usize,
+    blob: Buf,
+    mats: Vec<GEntry>,
+    offs: Vec<usize>,
+    norms: [Tensor; 4],
+}
+
+impl Resident {
+    /// (card name, layers, bytes) for the job's log
+    pub fn placement(&self) -> Vec<(String, usize, u64)> {
+        self.devs.iter().enumerate().map(|(d, dev)| {
+            let ls: Vec<&RLayer> = self.layers.iter().filter(|l| l.dev == d).collect();
+            (dev.name(), ls.len(), ls.iter().map(|l| l.blob.len() as u64).sum())
+        }).collect()
+    }
+}
+
+/// A card's working room for an encode beside its layers: the matrix expansion buffer (gate and up together, half)
+/// and a long prompt's activations
+fn te_work(te: &TextEncoder) -> u64 {
+    (2 * te.ffn * te.hidden * 2) as u64 + (1u64 << 30)
+}
+
+impl TextEncoder {
+    /// Uploads every layer, filling the cards in order; fails when they cannot hold it
+    pub fn load_resident(&self, devs: &[Arc<Device>], threads: usize) -> Result<Resident> {
+        if devs.is_empty() {
+            return Err(Error("no card for the text encoder".into()));
+        }
+        let work = te_work(self);
+        let room: Vec<u64> = devs.iter().map(|d| d.mem_cap().saturating_sub(d.mem_used()).saturating_sub(work)).collect();
+        let mut used = vec![0u64; devs.len()];
+        let mut layers = Vec::with_capacity(self.layers);
+        let mut d = 0;
+        for i in 0..self.layers {
+            let mats = self.layer_mats(i)?;
+            let bytes: usize = mats.iter().map(|e| e.bytes).sum();
+            while d < devs.len() && used[d] + bytes as u64 > room[d] {
+                d += 1;
+            }
+            if d == devs.len() {
+                let total: u64 = (0..self.layers).map(|j| self.layer_mats(j).map(|m| m.iter().map(|e| e.bytes as u64).sum::<u64>()).unwrap_or(0)).sum();
+                return Err(Error(format!("the text encoder ({:.1} GiB) does not fit on {} (room {:.1} GiB beside the work buffers): layer {i} has no card",
+                                         total as f64 / 1073741824.0, devs.iter().map(|d| d.name()).collect::<Vec<_>>().join(" + "),
+                                         room.iter().sum::<u64>() as f64 / 1073741824.0)));
+            }
+            let offs: Vec<usize> = mats.iter().scan(0, |o, e| { let a = *o; *o += e.bytes; Some(a) }).collect();
+            let ranges: Vec<(u64, usize)> = mats.iter().map(|e| (e.offset, e.bytes)).collect();
+            let host: Vec<u8> = read_ranges(&self.file.path, &ranges, threads)?.concat();
+            let blob = devs[d].alloc(bytes.max(1)).ctx(format!("text encoder layer {i}"))?;
+            blob.write(0, &host)?;
+            let n = self.read_norms(i)?;
+            let norms = [f32_tensor(&devs[d], &n[0])?, f32_tensor(&devs[d], &n[1])?, f32_tensor(&devs[d], &n[2])?, f32_tensor(&devs[d], &n[3])?];
+            used[d] += bytes as u64;
+            layers.push(RLayer { dev: d, blob, mats, offs, norms });
+        }
+        Ok(Resident { devs: devs.to_vec(), layers })
+    }
+
+    /// `encode` on the resident layers: the same arithmetic, the stream moving to the next card where its layers start
+    pub fn encode_resident(&self, r: &Resident, tokens: &[u32], vision: &[crate::vision::Seen], embeds: &[(usize, Vec<f32>)],
+                           tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+        let l = tokens.len();
+        let (c, hq, hkv, ffn) = (self.hidden, self.heads, self.kv_heads, self.ffn);
+        let (wq, wkv) = (hq * HEAD_DIM, hkv * HEAD_DIM);
+        let emb = self.file.get("model.embed_tokens.weight")?;
+        if emb.ty != GType::BF16 || emb.shape[1] != c {
+            return Err(Error("the token embedding is expected as bfloat16 [vocab, hidden]".into()));
+        }
+        let f = File::open(&self.file.path)?;
+        let mut x0 = Vec::with_capacity(l * c);
+        let mut row = vec![0u8; c * 2];
+        for t in tokens {
+            if *t as usize >= emb.shape[0] {
+                return Err(Error(format!("token id {t} is outside the vocabulary")));
+            }
+            f.read_exact_at(&mut row, emb.offset + (*t as u64) * (c as u64 * 2)).ctx("reading the token embedding")?;
+            x0.extend(row.chunks_exact(2).map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]]))));
+        }
+        for v in vision {
+            let n = v.grid.0 * v.grid.1;
+            if v.tokens.len() != n * c || v.at + n > l {
+                return Err(Error(format!("a vision block of {} values for {n} tokens of {c} at {} (of {l})", v.tokens.len(), v.at)));
+            }
+            x0[v.at * c..(v.at + n) * c].copy_from_slice(&v.tokens);
+        }
+        for (at, rows) in embeds {
+            if rows.len() % c != 0 || at * c + rows.len() > l * c {
+                return Err(Error(format!("an embedding of {} values at token {at} (of {l}, {c} wide)", rows.len())));
+            }
+            x0[at * c..at * c + rows.len()].copy_from_slice(rows);
+        }
+        let depths = vision.iter().map(|v| v.deep.len()).max().unwrap_or(0);
+        let deep_host: Vec<Vec<f32>> = (0..depths)
+            .map(|k| {
+                let mut d = vec![0f32; l * c];
+                for v in vision.iter().filter(|v| v.deep.len() > k) {
+                    d[v.at * c..v.at * c + v.deep[k].len()].copy_from_slice(&v.deep[k]);
+                }
+                d
+            })
+            .collect();
+        let cs_host: Vec<f32> = if vision.is_empty() {
+            let inv: Vec<f32> = (0..HEAD_DIM / 2).map(|j| 1.0 / THETA.powf((2 * j) as f32 / HEAD_DIM as f32)).collect();
+            (0..l).flat_map(|p| inv.iter().flat_map(move |f| [(p as f32 * f).cos(), (p as f32 * f).sin()])).collect()
+        } else {
+            crate::vision::rope_table(&crate::vision::positions(l, vision), HEAD_DIM, THETA)
+        };
+        let dt = DType::F16;
+        // each card's working buffers, made when its first layer comes
+        struct Work {
+            h: Tensor, q: Tensor, k: Tensor, v: Tensor, att: Tensor, o: Tensor, gu: Tensor, act: Tensor, w: Tensor, cs: Tensor,
+        }
+        let make = |dev: &Arc<Device>| -> Result<Work> {
+            Ok(Work {
+                h: Tensor::new(dev, dt, &[l, c])?, q: Tensor::new(dev, dt, &[l, wq])?, k: Tensor::new(dev, dt, &[l, wkv])?, v: Tensor::new(dev, dt, &[l, wkv])?,
+                att: Tensor::new(dev, dt, &[l, wq])?, o: Tensor::new(dev, dt, &[l, c])?, gu: Tensor::new(dev, dt, &[l, 2 * ffn])?, act: Tensor::new(dev, dt, &[l, ffn])?,
+                w: Tensor::new(dev, dt, &[2 * ffn * c])?,
+                cs: Tensor::from_bytes(dev, DType::F32, &[l, HEAD_DIM / 2, 2], &cs_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?,
+            })
+        };
+        let mut cur = r.layers.first().map_or(0, |l| l.dev);
+        let mut work = make(&r.devs[cur])?;
+        let mut x = Tensor::from_bytes(&r.devs[cur], dt, &[l, c], &f16_bytes(&x0))?;
+        for (i, layer) in r.layers.iter().enumerate() {
+            tick(i)?;
+            if layer.dev != cur {
+                // the stream to the next card (a prompt's rows: a few MB through host memory)
+                let bytes = x.to_bytes()?;
+                cur = layer.dev;
+                drop(work);
+                work = make(&r.devs[cur])?;
+                x = Tensor::from_bytes(&r.devs[cur], dt, &[l, c], &bytes)?;
+            }
+            let dev = &r.devs[cur];
+            let d = dev.clone();
+            let w = &work;
+            let lin = |input: &Tensor, n: usize, kk: usize, out: &Tensor| -> Result<()> {
+                // SAFETY: device buffers of this card; input [l, kk], w holds at least [n, kk], out [l, n].
+                let rc = unsafe { (d.api.linear)(d.ctx, input.buf.ptr(), dt.kernel_code()?, l as i64, kk as i64, w.w.buf.ptr(), n as i64, std::ptr::null(), out.buf.ptr(), dt.kernel_code()?) };
+                d.check(rc)
+            };
+            let expand = |j: usize, at: usize| -> Result<()> {
+                let e = &layer.mats[j];
+                let code = e.ty.quant_code().ok_or_else(|| Error(format!("{}: type {:?} is not a k-quant", e.name, e.ty)))?;
+                // SAFETY: the layer's blob holds e.bytes of k-quant blocks at its offset; w has room for at + elements.
+                let rc = unsafe {
+                    (d.api.dequant)(d.ctx, layer.blob.ptr().cast::<u8>().add(layer.offs[j]).cast(), code, e.elements() as i64,
+                                    w.w.buf.ptr().cast::<u8>().add(at * 2).cast(), dt.kernel_code()?)
+                };
+                d.check(rc)
+            };
+            let [ln1, ln2, qn, kn] = &layer.norms;
+            ops::rms_norm_mod(&x, ln1, EPS, None, &w.h)?;
+            expand(0, 0)?;
+            lin(&w.h, wq, c, &w.q)?;
+            expand(1, 0)?;
+            lin(&w.h, wkv, c, &w.k)?;
+            expand(2, 0)?;
+            lin(&w.h, wkv, c, &w.v)?;
+            ops::rms_rope(Rows { t: &w.q, offset: 0, stride: wq, tokens: l, heads: hq, dim: HEAD_DIM }, qn, EPS, &w.cs, HEAD_DIM)?;
+            ops::rms_rope(Rows { t: &w.k, offset: 0, stride: wkv, tokens: l, heads: hkv, dim: HEAD_DIM }, kn, EPS, &w.cs, HEAD_DIM)?;
+            // SAFETY: q [l, wq], k and v [l, wkv], att [l, wq], all half on this card.
+            let rc = unsafe {
+                (d.api.attention_causal)(d.ctx, w.q.buf.ptr(), w.k.buf.ptr(), w.v.buf.ptr(), dt.kernel_code()?, l as i64, hq as i64, hkv as i64, HEAD_DIM as i64,
+                                         wq as i64, wkv as i64, w.att.buf.ptr())
+            };
+            d.check(rc)?;
+            expand(3, 0)?;
+            lin(&w.att, c, wq, &w.o)?;
+            ops::add(&x, &w.o)?;
+            ops::rms_norm_mod(&x, ln2, EPS, None, &w.h)?;
+            expand(4, 0)?;
+            expand(5, ffn * c)?;
+            lin(&w.h, 2 * ffn, c, &w.gu)?;
+            ops::swiglu(&w.gu, &w.act)?;
+            expand(6, 0)?;
+            lin(&w.act, c, ffn, &w.o)?;
+            ops::add(&x, &w.o)?;
+            if let Some(dh) = deep_host.get(i) {
+                let dt_ = Tensor::from_bytes(dev, DType::F16, &[l, c], &f16_bytes(dh))?;
+                ops::add(&x, &dt_)?;
+            }
+        }
+        x.to_f32()
+    }
+}

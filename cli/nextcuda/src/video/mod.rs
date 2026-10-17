@@ -32,7 +32,7 @@ in the service's container: nextcuda video daemon --socket PATH --model ID [--en
 
 /// The video engines this program has (video/<arch>)
 pub fn engines() -> Vec<VideoKind> {
-    Vec::new() // nextcuda has no video engine yet
+    vec![nextcuda_video_h3::kind()]
 }
 
 pub(crate) fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -70,8 +70,14 @@ pub fn kind_and_options(m: &Value) -> Result<(&'static VideoKind, LoadOptions), 
     Ok((k, o))
 }
 
-/// The engine of entry `m`, loaded on GPU `gpu`
-pub fn load(m: &Value, files: &ModelFiles, gpu: usize, log: &mut dyn FnMut(String)) -> Result<Box<dyn VideoEngine>, String> {
+/// `--gpu 0` or `--gpu 0,1` (H3 splits its denoiser and text encoder over two cards)
+pub fn gpu_list(args: &[String]) -> Option<Vec<usize>> {
+    let v: Vec<usize> = opt(args, "--gpu")?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The engine of entry `m`, loaded on GPUs `gpus` (the first leads)
+pub fn load(m: &Value, files: &ModelFiles, gpus: &[usize], log: &mut dyn FnMut(String)) -> Result<Box<dyn VideoEngine>, String> {
     nextcuda_core::use_kind("video");
     let (k, o) = kind_and_options(m)?;
     // the engine's own variables (the kernels read them with getenv): set before anything opens the GPU
@@ -80,8 +86,8 @@ pub fn load(m: &Value, files: &ModelFiles, gpu: usize, log: &mut dyn FnMut(Strin
             std::env::set_var(var, v);
         }
     }
-    let g = nextcuda_core::Gpu::open(gpu).map_err(|e| e.0)?;
-    (k.load)(files, &[g], &o, log).map_err(|e| e.0)
+    let gs = gpus.iter().map(|i| nextcuda_core::Gpu::open(*i)).collect::<Result<Vec<_>, _>>().map_err(|e| e.0)?;
+    (k.load)(files, &gs, &o, log).map_err(|e| e.0)
 }
 
 /// A job's spec from the command line: `{"kind": <kind>}`, then --json (text, or @FILE), then every --KEY VALUE that
@@ -125,11 +131,11 @@ pub fn spec(kind: &str, args: &[String], own: &[&str]) -> Result<Value, String> 
 /// `job <kind> --here`: load the engine, run the job, print its result
 fn job_here(cfg: &Config, kind: &str, args: &[String]) -> Result<(), String> {
     let (m, files) = model(cfg, opt(args, "--model"))?;
-    let gpu: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let gpus = gpu_list(args).unwrap_or_else(|| vec![0]);
     let spec = spec(kind, args, &["model", "gpu", "here"])?;
     let t0 = std::time::Instant::now();
     let mut log = |l: String| eprintln!("{l}");
-    let e = load(&m, &files, gpu, &mut log)?;
+    let e = load(&m, &files, &gpus, &mut log)?;
     if !e.jobs().contains(&kind) {
         return Err(format!("{}: no job {kind} (it runs {})", e.arch(), e.jobs().join(", ")));
     }
@@ -231,7 +237,8 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
-    let gpu: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).ok_or("worker needs --gpu N")?;
+    let gpus = gpu_list(args).ok_or("worker needs --gpu N (or N,M: one worker over two cards)")?;
+    let gpu = gpus[0];
     let id = opt(args, "--model").ok_or("worker needs --model ID")?;
     let (mut m, files) = model(cfg, Some(id))?;
     if let Some(t) = opt(args, "--threads") {
@@ -288,7 +295,7 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
         eprintln!("[worker] {l}");
         emit(json!({"event": "engine", "state": "loading", "line": l}));
     };
-    let e: Arc<Box<dyn VideoEngine>> = Arc::new(load(&m, &files, gpu, &mut log)?);
+    let e: Arc<Box<dyn VideoEngine>> = Arc::new(load(&m, &files, &gpus, &mut log)?);
     let stats = e.device_stats();
     emit(json!({"event": "ready", "info": {"gpu": gpu, "model": id, "arch": e.arch(), "load_seconds": e.load_seconds(),
                                            "gib_in_use": stats.map(|s| gib(s.0)), "gib_cap": stats.map(|s| gib(s.1))}}));
