@@ -3,11 +3,11 @@ resolver = "2"
 # the layout (docs/architecture.md): the shared foundation (crates/), one group a kind - its contract and one engine
 # crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
 members = [
-    "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl", "crates/mesh", "crates/codec12hz",
+    "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl", "crates/mesh", "crates/codec12hz", "crates/remover",
     "llm/contract", "llm/nemotronh",
     "image/contract", "image/qwenimage21", "image/paddleocrvl", "image/unlimitedocr", "image/olmocr2",
     "video/contract",
-    "model3d/contract",
+    "model3d/contract", "model3d/trellis2", "model3d/hunyuan3d", "model3d/unirig", "model3d/rignet", "model3d/animateanymesh",
     "audio/contract", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
     "glue/models", "glue/serve",
     "cli/nextcuda",
@@ -27,6 +27,7 @@ nextcuda-diffusion = { path = "crates/diffusion" }
 nextcuda-qwen3vl = { path = "crates/qwen3vl" }
 nextcuda-mesh = { path = "crates/mesh" }
 nextcuda-codec12hz = { path = "crates/codec12hz" }
+nextcuda-remover = { path = "crates/remover" }
 nextcuda-llm = { path = "llm/contract" }
 nextcuda-llm-nemotronh = { path = "llm/nemotronh" }
 nextcuda-image = { path = "image/contract" }
@@ -36,6 +37,11 @@ nextcuda-image-unlimitedocr = { path = "image/unlimitedocr" }
 nextcuda-image-olmocr2 = { path = "image/olmocr2" }
 nextcuda-video = { path = "video/contract" }
 nextcuda-model3d = { path = "model3d/contract" }
+nextcuda-model3d-trellis2 = { path = "model3d/trellis2" }
+nextcuda-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }
+nextcuda-model3d-unirig = { path = "model3d/unirig" }
+nextcuda-model3d-rignet = { path = "model3d/rignet" }
+nextcuda-model3d-animateanymesh = { path = "model3d/animateanymesh" }
 nextcuda-audio = { path = "audio/contract" }
 nextcuda-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextcuda-audio-qwen3tts = { path = "audio/qwen3tts" }

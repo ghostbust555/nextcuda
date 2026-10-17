@@ -83,6 +83,9 @@ Where the program, its libraries, its models and its sockets are.
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_API_TOKEN` | made once, kept in serve.json beside the registry | the front door API's bearer token; `audio voices design` uses it to call the front door | serve, cli (audio) |
+| `NS_MODEL3D_PORT` | 8088 | the 3D server's port, as the front door reaches it | serve |
+| `NS_MODEL3D_PORT2` | 8098 | the second 3D server's port (`model3d start --slot 1`), as `NS_AUDIO_PORT2` | serve |
+| `NS_MODEL_DIRS` | none | more models folders, one a drive, comma-separated: a model moved to that drive (`system.move`, `nextcuda models move`) goes there, else to `<mount>/nextcuda-models`; NS_MODELS is the first models folder | serve (drives), cli (drives, models move) |
 | `NEXTCUDA_HOME` | ~/nextcuda | where tooling/open-webui.sh finds serve.json (the front door's token) | tooling (open-webui.sh) |
 | `OWUI_PORT` | 3000 | the port tooling/open-webui.sh publishes Open WebUI on | tooling (open-webui.sh) |
 | `OWUI_IMAGE` | ghcr.io/open-webui/open-webui:main | the Open WebUI image tooling/open-webui.sh runs | tooling (open-webui.sh) |
@@ -266,6 +269,9 @@ Qwen-Image 2.1 (`image/qwenimage21`).
 | `NC_TE_HOST_CACHE` | 1 | 0: do not keep the streamed text-encoder layers in host RAM (they are re-read from disk for every prompt; saves ~5 GB of RAM) | image qwenimage21 |
 | `NS_QI_SIGMAS` | the model's own schedule | a few-step preset: noise levels from 1 down, comma separated (their count is the steps) (--opt-sigmas; per request too) | image qwenimage21 |
 | `NS_QI_SIGMA_SHIFT` | dynamic | dynamic: the picture size's shift on the NS_QI_SIGMAS levels; none: as given (--opt-sigma-shift; per request too) | image qwenimage21 |
+| `NS_HI_*` | - | every NS_HI_ setting in nextcuda.conf is passed to the image server | cli (image serve) |
+| `NS_HI_GUIDANCE` | apg | the HunyuanImage base model's guidance: apg (the pipeline's MIX_mode_0: CFG through step 5, or 38 when the negative quotes text, then adaptive projected guidance) or cfg (plain CFG every step) (--opt-guidance; per request too) | image hunyuanimage21 |
+| `NS_HI_PROFILE` | off | Debug: set: a GPU wait after each named step of the DiT, the totals printed after the picture (slower; shows where the time goes) | image hunyuanimage21 |
 
 ## Video
 
@@ -322,6 +328,29 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
+
+## 3D
+
+The `model3d` kind (meshes from pictures, rigging, animation) and its engines' settings, `NS_M3D_*`.
+
+| Variable | Default | What it does | Read by |
+|---|---|---|---|
+| `NS_MODEL3D_OUT` | ~/.local/share/nextcuda/model3d | where meshes (GLB, with their picture and settings beside them) and 3D uploads are kept | cli (model3d), serve |
+| `NS_M3D_*` | - | every NS_M3D_ setting in nextcuda.conf is passed to the 3D server | cli (model3d serve) |
+| `NS_M3D_HY_TOKENS` | 3072 (2mini), 4096 (2.1) | the shape's latent tokens (Tencent's turbo example samples the turbo decoder's 512: coarser) (--opt-tokens) | model3d hunyuan3d |
+| `NS_M3D_HY_DECODE` | fast | fast: the grid decoded coarse to fine, only near the surface (FlashVDM's hierarchical decoding); dense: every point (--opt-decode) | model3d hunyuan3d |
+| `NS_M3D_HY_CHUNK` | by the decoder's width | points the shape decoder queries at once (--opt-chunk) | model3d hunyuan3d |
+| `NS_M3D_HY_PAINT` | 1 | 0: 2.1 loads without its paint model (no textures; ~6.5 GiB less) even when the paint files are there (--opt-paint) | model3d hunyuan3d |
+| `NS_M3D_HY_PAINT_STEPS` | 15 | the texture's UniPC steps (--opt-paint-steps) | model3d hunyuan3d |
+| `NS_M3D_AAM_PROFILE` | off | Debug: set: AnimateAnyMesh waits for the GPU after each named step of the flow and prints the totals (slower; shows where the time goes) | model3d animateanymesh |
+| `NS_M3D_AAM_TRAJ` | max(512, vertices / 8) | AnimateAnyMesh: the trajectory tokens DyMeshVAE samples (more: finer motion, slower) (--opt-traj; per request too) | model3d animateanymesh |
+| `NS_M3D_UNIRIG_BEAMS` | 15 | UniRig: the skeleton decoder's beams, sampled as UniRig's inference (1: greedy, the same skeleton every time) (--opt-beams; per request too) | model3d unirig |
+| `NS_M3D_UNIRIG_PROFILE` | off | Debug: set: UniRig waits for the GPU after each named step and prints the totals (slower; shows where the time goes) | model3d unirig |
+| `NS_M3D_RIGNET_FACES` | 4000 | RigNet: the triangles the mesh is decimated to before rigging (the weights go back to every vertex of the input) (--opt-faces; per request too) | model3d rignet |
+| `NS_M3D_RIGNET_BANDWIDTH` | the learned 0.0429 | RigNet: the joints' mean-shift bandwidth (smaller: more, closer joints) (--opt-bandwidth; per request too) | model3d rignet |
+| `NS_M3D_RIGNET_THRESHOLD` | 1e-5 | RigNet: the joints' density threshold (lower: more joints) (--opt-threshold; per request too) | model3d rignet |
+| `NS_M3D_T2_PROFILE` | off | TRELLIS.2 / Pixal3D: set: each stage's time and the card's memory on stderr, and the run's peak (the card's free memory watched every 50 ms) (--opt-profile) | model3d trellis2 |
+| `NS_M3D_T2_RESIDENT` | off | TRELLIS.2 / Pixal3D: set: every model stays loaded after its stage (faster repeats; ~11 GiB of weights on the card) - by default each stage loads its model and drops it after (--opt-resident) | model3d trellis2 |
 
 ## Diffusion kernels: `NSD_*`
 

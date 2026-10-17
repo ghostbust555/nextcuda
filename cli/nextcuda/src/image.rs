@@ -70,6 +70,8 @@ fn model(cfg: &Config, id: Option<&str>) -> Result<(Value, ModelFiles), String> 
     if models::kind_of(&m) != "image" {
         return Err(format!("{} is a {} model, not an image one", m["id"].as_str().unwrap_or("?"), models::kind_of(&m)));
     }
+    // not while its files move to another drive (nextcuda models move)
+    crate::drives::not_moving(cfg, m["id"].as_str().unwrap_or(""))?;
     let files: ModelFiles = m["files"].as_object().into_iter().flatten().filter_map(|(r, p)| Some((r.clone(), PathBuf::from(p.as_str()?)))).collect();
     Ok((m, files))
 }
@@ -435,7 +437,7 @@ fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_QI_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NSD_")) {
+    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NS_HI_")).chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
     a.extend([ce.image.clone(), "bash".into(), "-c".into(),

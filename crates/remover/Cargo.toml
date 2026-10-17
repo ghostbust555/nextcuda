@@ -1,0 +1,11 @@
+[package]
+name = "nextcuda-remover"
+description = "The background remover every 3D engine shares: BiRefNet (Swin-L, its deformable decoder) on the GPU, and the object picture preparation (cut out, cropped, squared, premultiplied)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true

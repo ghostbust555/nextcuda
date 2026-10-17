@@ -25,7 +25,7 @@ FLAGS=(-std=c++17 -O3 --use_fast_math -Xcompiler -fPIC -lineinfo "${GEN[@]}" -In
 # --use_fast_math is not on for the numerics that must match a reference: a source names its own flags below
 precise() { case "$1" in diffusion/*|llm/*|audio/*) return 0 ;; esac; return 1; }
 
-KINDS="llm image video audio"
+KINDS="llm image video audio model3d"
 # stable-diffusion.cpp (ggml-cuda), the CUDA implementation the image engines are built on: its source tree (headers)
 # and a shared build of it (-DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON), copied beside the libraries
 sources() {

@@ -1,0 +1,15 @@
+[package]
+name = "nextcuda-model3d-hunyuan3d"
+description = "Hunyuan3D 2.1 (shape and PBR paint) and Hunyuan3D-2mini-turbo (fast shape): meshes from a picture on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-mesh.workspace = true
+nextcuda-model3d.workspace = true
+nextcuda-remover.workspace = true
+serde_json.workspace = true

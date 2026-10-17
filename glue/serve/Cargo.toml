@@ -11,6 +11,7 @@ nextcuda-diffusion.workspace = true
 nextcuda-llm.workspace = true
 nextcuda-image.workspace = true
 nextcuda-audio.workspace = true
+nextcuda-model3d.workspace = true
 nextcuda-tok.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

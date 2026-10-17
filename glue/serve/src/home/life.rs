@@ -5,7 +5,7 @@
 //!   loads on Open WebUI's request and unloads after the idle time; enabled = listed by the switcher. A box with
 //!   neither (the front door alone): this page starts the chat server itself (`nextcuda llm start ID`) for the model
 //!   a request names, stopping the one before it.
-//! - image, audio: a server each (`nextcuda image|audio start ID --gpu N --idle-exit S`), started on the first
+//! - image, audio, model3d: a server each (`nextcuda image|audio|model3d start ID --gpu N --idle-exit S`), started on the first
 //!   request for an enabled model on the first of its cards with room, swapped when a request names another (after the
 //!   one running), ending itself when idle. A second (`--slot 1`, NS_IMAGE_PORT2 / NS_AUDIO_PORT2) holds another model,
 //!   or a second copy of a model enabled on two cards: started when a request finds its copy with work and its other
@@ -60,9 +60,17 @@ fn listening(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
 }
 
-/// An image or audio model: it loads whole on one card (the first of its cards with room)
+/// An image, audio or 3D model: it loads whole on one card (the first of its cards with room)
 fn one_card(m: &Value) -> bool {
-    matches!(registry::kind_of(m), "image" | "audio")
+    matches!(registry::kind_of(m), "image" | "audio" | "model3d")
+}
+
+/// A chat model whose model card spreads one copy over every card (`gpus: all`; its title says "both GPUs"): it
+/// does not fit on fewer, so its cards are not a choice (an image or audio model's `all` is where its copies may go)
+pub(crate) fn spans_all(m: &Value, model_cards: &[Value]) -> bool {
+    registry::kind_of(m) == "llm"
+        && model_cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|id| !id.is_empty() && c["id"] == id.as_str()))
+            .is_some_and(|c| s(c, "gpus") == "all")
 }
 
 /// The cards processes of model `id` hold memory on, in the named cards
@@ -141,6 +149,14 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             if speech("design") {
                 c.push("voice_design");
             }
+            // a cloned voice steered by an instruction (a recording and instructions together)
+            if speech("direction") {
+                c.push("voice_direction");
+            }
+            // vocal events inline in the text ("(laugh)", "[笑]")
+            if speech("events") {
+                c.push("vocal_events");
+            }
             let mut methods = vec!["audio.speak"];
             if speech("design") {
                 methods.push("audio.voices.design");
@@ -148,6 +164,32 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             (c, methods)
         }
         "audio" => (vec!["song", "lyrics", "instrumental"], vec!["audio.generate"]),
+        "model3d" => {
+            // what its card says it does (`does`): generate (meshes from pictures), texture, views (several), rig, animate
+            let does = |c: &str| m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == c));
+            let mut c = Vec::new();
+            let mut methods = Vec::new();
+            if does("generate") {
+                c.extend(["mesh", "image_to_3d", "glb"]);
+                if does("texture") {
+                    c.push("texture");
+                }
+                if does("views") {
+                    c.push("multi_view");
+                }
+                methods.push("model3d.generate");
+            }
+            if does("rig") {
+                c.extend(["rig", "skeleton", "skin_weights"]);
+            }
+            if does("animate") {
+                c.extend(["animate", "text_to_motion"]);
+            }
+            if does("rig") || does("animate") {
+                methods.push("model3d.rig");
+            }
+            (c, methods)
+        }
         "video" => {
             let mut c = vec!["text_to_video", "image_to_video", "sound", "chain", "first_last_frame", "voice_reference"];
             if s(m, "id").contains("ref2va") {
@@ -185,6 +227,7 @@ impl Home {
         match kind {
             "image" => self.o.ports.image,
             "audio" => self.o.ports.audio,
+            "model3d" => self.o.ports.model3d,
             "video" => self.o.ports.video,
             _ => self.o.ports.switch,
         }
@@ -255,6 +298,7 @@ impl Home {
             "video" => card_mb.saturating_sub(4096),
             "image" => files * 105 / 100 + 4096,
             "audio" => files * 110 / 100 + 2048,
+            "model3d" => files * 110 / 100 + 6144,
             _ => files / gpus.len() as u64 + 2048,
         };
         (gpus.iter().map(|g| (*g, per.min(cap))).collect(), false)
@@ -299,12 +343,13 @@ impl Home {
         all.iter().filter(|x| registry::kind_of(x) == "llm" && cur.ends_with(&s(x, "id"))).max_by_key(|x| s(x, "id").len()).map(|x| s(x, "id"))
     }
 
-    /// The kind's servers' ports, the first's first (image and audio have a second when its port is set)
+    /// The kind's servers' ports, the first's first (image, audio and model3d have a second when its port is set)
     pub(crate) fn slots(&self, kind: &str) -> Vec<u16> {
         let p = &self.o.ports;
         match kind {
             "image" => [p.image, p.image2].into_iter().filter(|x| *x != 0).collect(),
             "audio" => [p.audio, p.audio2].into_iter().filter(|x| *x != 0).collect(),
+            "model3d" => [p.model3d, p.model3d2].into_iter().filter(|x| *x != 0).collect(),
             _ => vec![self.port_of(kind)],
         }
     }
@@ -324,7 +369,7 @@ impl Home {
     /// the video daemon's GPUs, the chat server's cards
     pub(crate) fn work_slots(&self, all: &[Value], cards: &Value) -> Vec<Value> {
         let mut v = Vec::new();
-        for kind in ["image", "audio"] {
+        for kind in ["image", "audio", "model3d"] {
             if !all.iter().any(|m| registry::kind_of(m) == kind && m["enabled"] != false) {
                 continue;
             }
@@ -387,9 +432,12 @@ impl Home {
         let chat = if need("llm") { (self.chat_loaded(all), self.chat_mode()) } else { (None, (None, None)) };
         let image = if need("image") { self.servers("image") } else { Vec::new() };
         let audio = if need("audio") { self.servers("audio") } else { Vec::new() };
+        let m3d = if need("model3d") { self.servers("model3d") } else { Vec::new() };
+        let slots_of = |k: &str| -> &Vec<Slot> { match k { "image" => &image, "audio" => &audio, _ => &m3d } };
         let video = if need("video") { self.video_daemon() } else { None };
         // the model cards, read once: for the headroom of entries registered before cards carried it
-        let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) { Vec::new() } else { self.o.cfg.cards() };
+        // and whether a chat model spans every card
+        let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) && !need("llm") { Vec::new() } else { self.o.cfg.cards() };
         all.iter().filter(|m| registry::kind_of(m) != "lora").map(|m| {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
             let enabled = m["enabled"] != false;
@@ -405,8 +453,8 @@ impl Home {
             let mut state = match kind.as_str() {
                 "llm" if chat.0.as_deref() == Some(id.as_str()) => "loaded",
                 "llm" if chat.1 .1.as_deref() == Some(id.as_str()) => "loading",
-                "image" | "audio" => {
-                    let mine: Vec<&Slot> = if kind == "image" { &image } else { &audio }.iter().filter(|x| x.model.as_deref() == Some(id.as_str())).collect();
+                "image" | "audio" | "model3d" => {
+                    let mine: Vec<&Slot> = slots_of(&kind).iter().filter(|x| x.model.as_deref() == Some(id.as_str())).collect();
                     if mine.iter().any(|x| x.busy && !x.loading) {
                         "busy"
                     } else if mine.iter().any(|x| !x.loading) {
@@ -432,12 +480,13 @@ impl Home {
             }
             let (caps, methods) = capabilities(m);
             json!({"id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
+                   "spans": spans_all(m, &mc),
                    "capabilities": caps, "methods": methods,
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
                    "headroom_mb": headroom.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "headroom_given": headroom_given,
-                   "page": match kind.as_str() { "image" | "audio" => json!(if kind == "image" { &image } else { &audio }.iter()
+                   "page": match kind.as_str() { "image" | "audio" | "model3d" => json!(slots_of(&kind).iter()
                                                       .find(|x| x.model.as_deref() == Some(id.as_str())).map_or(self.port_of(&kind), |x| x.port)),
                                                   "video" => json!(self.o.ports.video), _ => json!(self.o.ports.chat_ui) }})
         }).collect()
@@ -484,6 +533,9 @@ impl Home {
     /// Enable `id` on cards `gpus` (a list; none: as it was)
     pub(crate) fn enable(self: &Arc<Self>, id: &str, gpus: Option<&Value>) -> Result<String, (u16, String)> {
         let m = self.entry(id)?;
+        if let Some(why) = self.moving_why(id) {
+            return Err((409, why));
+        }
         let n = self.ncards();
         let gpus: Option<Vec<usize>> = gpus.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|g| g as usize).collect());
         if let Some(g) = &gpus {
@@ -521,10 +573,13 @@ impl Home {
             return Err((400, format!("gpus {g:?}: one or more of 0..{}", n - 1)));
         }
         let kind = registry::kind_of(&m).to_string();
-        let old = self.gpus_of(&m);
         let mut g = g;
         g.sort();
         g.dedup();
+        if g.len() < n && spans_all(&m, &self.o.cfg.cards()) {
+            return Err((400, format!("{id} is spread over every card (its model card: gpus all): it does not run on fewer")));
+        }
+        let old = self.gpus_of(&m);
         if old == g {
             return Ok(json!({"model": id, "gpus": g, "changed": false}));
         }
@@ -576,6 +631,9 @@ impl Home {
         if m["enabled"] == false {
             return Err((409, format!("{id} is disabled: enable it first")));
         }
+        if let Some(why) = self.moving_why(id) {
+            return Err((409, why));
+        }
         if self.loading.lock().unwrap().insert(id.to_string(), now()).is_some() {
             return Ok(());
         }
@@ -594,8 +652,11 @@ impl Home {
     /// Load `id` and return when it answers
     pub(crate) fn load(&self, id: &str) -> Result<(), (u16, String)> {
         let m = self.entry(id)?;
+        if let Some(why) = self.moving_why(id) {
+            return Err((409, why));
+        }
         match registry::kind_of(&m) {
-            "image" | "audio" => self.ensure(id).map(|_| ()),
+            "image" | "audio" | "model3d" => self.ensure(id).map(|_| ()),
             "video" => self.video_apply(false).map_err(|e| (500, e)),
             _ => {
                 let all = self.models();
@@ -624,7 +685,7 @@ impl Home {
         let m = self.entry(id)?;
         let kind = registry::kind_of(&m);
         match kind {
-            "image" | "audio" => {
+            "image" | "audio" | "model3d" => {
                 let _g = self.kind_lock[kind].lock().unwrap();
                 for x in self.servers(kind).iter().filter(|x| x.model.as_deref() == Some(id)) {
                     self.exec(format!("{kind} stop ({id})"), &[kind.into(), "stop".into(), "--slot".into(), x.slot.to_string()]).map_err(|e| (500, e))?;
@@ -645,7 +706,7 @@ impl Home {
         }
     }
 
-    /// The image or audio server holding `id`, started (or swapped to it) when it does not: where to send its requests
+    /// The image, audio or 3D server holding `id`, started (or swapped to it) when it does not: where to send its requests
     pub(crate) fn ensure(&self, id: &str) -> Result<Lease<'_>, (u16, String)> {
         self.ensure_for(id, None)
     }
@@ -655,7 +716,7 @@ impl Home {
     pub(crate) fn ensure_for(&self, id: &str, job: Option<&str>) -> Result<Lease<'_>, (u16, String)> {
         let m = self.entry(id)?;
         let kind = registry::kind_of(&m);
-        if !matches!(kind, "image" | "audio") {
+        if !matches!(kind, "image" | "audio" | "model3d") {
             return Err((400, format!("{id} is a {kind} model")));
         }
         if m["enabled"] == false {
@@ -666,6 +727,15 @@ impl Home {
         loop {
             if job.is_some_and(|j| self.job_cancelled(j)) {
                 return Err((499, format!("cancelled while it waited for {id}")));
+            }
+            // its files moving to another drive: it waits for the move like for room
+            if let Some(why) = self.moving_why(id) {
+                self.note(job, "waiting", &why);
+                if t0.elapsed() > limit {
+                    return Err((409, why));
+                }
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
             }
             let why = match self.place(&m, id, kind, job)? {
                 Ok(lease) => return Ok(lease),
@@ -830,7 +900,7 @@ impl Home {
             let mb = p["vram_mb"].as_u64().unwrap_or(0);
             let model = p["model_id"].as_str().or(p["model"].as_str()).unwrap_or("?").to_string();
             match p["kind"].as_str() {
-                Some(k @ ("image" | "audio")) => {
+                Some(k @ ("image" | "audio" | "model3d")) => {
                     let Some(port) = p["port"].as_str().and_then(|x| x.parse::<u16>().ok()) else { continue };
                     let Some(x) = self.servers(k).into_iter().find(|x| x.port == port) else { continue };
                     if !x.busy && !x.loading && inflight(port) == 0 {
@@ -1087,5 +1157,26 @@ impl Home {
             args.extend(["--gpu".into(), g.to_string()]);
         }
         self.exec(format!("video start ({})", want.join(", ")), &args).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chat_model_split_over_every_card_has_no_choice_of_cards() {
+        let cards = vec![
+            json!({"id": "glm-5.3-flash-uncensored", "kind": "llm", "gpus": "all"}),
+            json!({"id": "qwen3.8-27b-q8", "kind": "llm", "gpus": "0"}),
+            json!({"id": "breeze-tts-2", "kind": "audio", "gpus": "all"}),
+        ];
+        // the registry entry may say one card (set before): the model card decides
+        assert!(spans_all(&json!({"id": "glm-5.3-flash-uncensored", "kind": "llm", "gpus": "0"}), &cards));
+        // a variant registered under its own id, its card named by `catalog`
+        assert!(spans_all(&json!({"id": "glm-128k", "catalog": "glm-5.3-flash-uncensored", "kind": "llm"}), &cards));
+        assert!(!spans_all(&json!({"id": "qwen3.8-27b-q8", "kind": "llm"}), &cards), "a one-card chat model");
+        assert!(!spans_all(&json!({"id": "breeze-tts-2", "kind": "audio"}), &cards), "an audio model's all is where its copies may go");
+        assert!(!spans_all(&json!({"id": "my-own", "kind": "llm", "gpus": "all"}), &cards), "no model card: a choice");
     }
 }

@@ -14,7 +14,9 @@ mod bench;
 mod client;
 mod container;
 mod native;
+mod drives;
 mod audio;
+mod model3d;
 mod host;
 mod image;
 mod imagebench;
@@ -38,13 +40,13 @@ pub const VERSION: &str = match option_env!("NS_VERSION") {
     None => "dev",
 };
 
-const USAGE: &str = "nextcuda - language, image, video and audio models on Intel Arc GPUs (Rust + SYCL)
+const USAGE: &str = "nextcuda - language, image, video, audio and 3D models on Intel Arc GPUs (Rust + SYCL)
 
 every kind:
   nextcuda models [list] [--json]           the registry (NS_REGISTRY): every model this machine serves, its kind
   nextcuda models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
                       [--no-tools] [--no-tasks] [--disabled]
-  nextcuda models search [TEXT] [--kind llm|image|video|audio|lora]     the catalog of supported models
+  nextcuda models search [TEXT] [--kind llm|image|video|audio|model3d|lora]     the catalog of supported models
   nextcuda models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
                                 its files downloaded (resumed when run again; each checked by SHA-256) or linked
                                 (the same file already here; --from DIR: copies elsewhere on the machine), registered
@@ -52,6 +54,11 @@ every kind:
                                 a file outside the catalog (every shard of a split file); then added
   nextcuda models remove <id> [--files]     --files: its files deleted too
   nextcuda models enable <id> | disable <id>
+  nextcuda models move <id> --to <drive | mount> [--yes]   its files to another drive: copied, read back (SHA-256),
+                                the registry repointed, the old files removed (those another model names stay);
+                                the front door's job when it is up; --cancel stops the move under way
+  nextcuda drives [--json]      the drives the models are on: device, PCIe link, mount, size, free, models, read speed
+  nextcuda drives measure <drive>   its read speed: 4 GiB of model files past the page cache (O_DIRECT), kept
   nextcuda gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
   nextcuda maintenance [on|off|status] [--message TEXT] [--eta MINUTES] [--unload]
                                 the front door's maintenance mode: callers told, new work refused, queues waiting
@@ -61,6 +68,9 @@ every kind:
   nextcuda gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]
                                 GPU telemetry (VRAM from the DRM clients, busy %, power, temperatures, the PCIe link)
                                 into a JSON file, as root
+  nextcuda maintenance [on|off|status] [--message TEXT] [--eta MINUTES] [--unload]
+                                the front door's maintenance mode: callers told, new work refused, queues waiting;
+                                on prints the bypass key (header X-Maintenance-Bypass) for testing meanwhile
   nextcuda version
 
 language models (nextcuda llm ...; the names without `llm` still work):
@@ -113,6 +123,14 @@ audio (nextcuda audio ...):
   nextcuda audio check <dump dir> [--stages ar,dit,voc,chunks]    the engine against a reference's dumps
   nextcuda audio engines        the architectures this build serves
   nextcuda audio selftest [--gpu N]  the audio kernel library, an engine's own symbol, a kernel on the GPU
+
+3D (nextcuda model3d ... or nextcuda 3d ...):
+  nextcuda model3d gen PICTURE [PICTURE:SIDE]... [--model ID] [--texture] [--seed N] [--faces N] [--out FILE.glb]
+                                a mesh from a picture or several views (TRELLIS.2, Hunyuan3D, Pixal3D), in this process
+  nextcuda model3d rig MESH.glb [--model ID] [--prompt \"the motion\"]   a skeleton and skin weights, or motion
+  nextcuda model3d serve [MODEL] [--wfe] [--port 8088] [--out DIR]    the 3D API (/v1/model3d/generate, /rig) in a container
+  nextcuda model3d tool decimate|remesh|uv|convert IN OUT [...]       the CPU mesh tools (no GPU)
+  nextcuda model3d engines | selftest [--gpu N]
 
 settings (environment, or NAME=value lines in nextcuda.conf beside the repository or ~/.config/nextcuda.conf):
   NS_MODELS        host directory with the model files, seen as /models                  (required for start)
@@ -905,8 +923,11 @@ fn main() -> ExitCode {
         Some("image") => image::cmd(&cfg, &args[1..], |r| selftest("image", r, nextcuda_image_qwenimage21::selftest)),
         Some("video") => video::cmd(&cfg, &args[1..], |_r| Err("selftest: nextcuda has no video engine yet".to_string())),
         Some("audio") => audio::cmd(&cfg, &args[1..], |_r| Err("selftest: nextcuda has no audio engine yet".to_string())),
+        Some("model3d" | "3d") => model3d::cmd(&cfg, &args[1..], |_r| Err("selftest: the 3D engines are checked by model3d check (their reference dumps)".to_string())),
         // the llm commands' names from before the kinds (nextcuda start = nextcuda llm start, ...)
         Some("start") => service::start(&cfg, rest),
+        Some("models") if rest.first().is_some_and(|a| a == "move") => drives::move_cmd(&cfg, rest),
+        Some("drives") => drives::cmd(&cfg, rest),
         Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| {
             let all = engines();
             let k = nextcuda_llm::kind_for(&all, g)?;

@@ -334,10 +334,6 @@ fn fresh_seed(id: u64) -> u64 {
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
 
-fn respond(s: &mut Conn, code: u16, body: &Value) {
-    http::respond(s, code, body)
-}
-
 /// The token runs that begin a user turn in this tokenizer's prompts: each of nextcuda_tok::USER_TURNS whose leading
 /// special token the vocabulary has (a marker of another model's template would only match plain text)
 pub fn user_turn_marks(tok: &Tokenizer) -> Vec<Vec<u32>> {
@@ -350,6 +346,10 @@ pub fn user_turn_marks(tok: &Tokenizer) -> Vec<Vec<u32>> {
 /// Where in `ids` one of `marks` begins
 pub fn turn_starts(ids: &[u32], marks: &[Vec<u32>]) -> Vec<usize> {
     (0..ids.len()).filter(|&i| marks.iter().any(|m| !m.is_empty() && ids[i..].starts_with(m))).collect()
+}
+
+fn respond(s: &mut Conn, code: u16, body: &Value) {
+    http::respond(s, code, body)
 }
 
 fn now() -> u64 {

@@ -560,7 +560,15 @@ dependencies = [
  "nextcuda-image-unlimitedocr",
  "nextcuda-llm",
  "nextcuda-llm-nemotronh",
+ "nextcuda-mesh",
+ "nextcuda-model3d",
+ "nextcuda-model3d-animateanymesh",
+ "nextcuda-model3d-hunyuan3d",
+ "nextcuda-model3d-rignet",
+ "nextcuda-model3d-trellis2",
+ "nextcuda-model3d-unirig",
  "nextcuda-models",
+ "nextcuda-remover",
  "nextcuda-serve",
  "nextcuda-tok",
  "nextcuda-video",
@@ -751,6 +759,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextcuda-model3d-animateanymesh"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-model3d",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-model3d-hunyuan3d"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-mesh",
+ "nextcuda-model3d",
+ "nextcuda-remover",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-model3d-rignet"
+version = "0.0.0"
+dependencies = [
+ "miniz_oxide 0.8.9",
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-model3d",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-model3d-trellis2"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-model3d",
+ "nextcuda-remover",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-model3d-unirig"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-model3d",
+ "serde_json",
+]
+
+[[package]]
 name = "nextcuda-models"
 version = "0.0.0"
 dependencies = [
@@ -772,6 +839,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextcuda-remover"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+]
+
+[[package]]
 name = "nextcuda-serve"
 version = "0.0.0"
 dependencies = [
@@ -780,6 +856,7 @@ dependencies = [
  "nextcuda-diffusion",
  "nextcuda-image",
  "nextcuda-llm",
+ "nextcuda-model3d",
  "nextcuda-tok",
  "serde_json",
  "sha2",
