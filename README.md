@@ -113,6 +113,7 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
 | `qwen-image-2.1-rrq4` | [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs): a Q8_0 / Q6_K / Q5_K mix | `qwen-image-2.1` | 11.9 GiB | served, checked |
 | `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B Q4_K_M, its VAE and the Lightning 4-step LoRA | `qwen-image-2512` | 17.7 GiB | served, checked |
 | `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | `nemotron_h_moe` | 43.0 GiB | served (one 12 GB card, experts streamed) |
+| `breeze-tts-2` | Breeze TTS 2 (~3B, CrispASR's Q8_0 GGUF) with Qwen3-TTS's 12 Hz codec: English and Chinese speech - voices designed, cloned (recording + transcript) or directed; vocal events; weights and outputs non-commercial | `breeze-tts-2` | 4.0 GiB | served, checked |
 
 The model cards are in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256).
 `nextcuda models pull <id> [--from DIR]...` downloads what is missing or hard-links a file already on the machine,
@@ -213,10 +214,31 @@ and `cli/nextcuda/tests/architecture.rs` checks them on every `cargo test`, with
 `./build.sh` builds the program in a debian:trixie toolchain image (its glibc is the GPU host's) and the web front
 end; `kernels/build.sh` builds the CUDA libraries with `nvcc` for the 3060 (sm_86) and the 5070 (sm_120).
 
+## Speech: Breeze TTS 2
+
+nextsycl's engine (`audio/breezetts2`) and the 12 Hz codec (`crates/codec12hz`), unchanged, over the audio kernel
+library: the music engine's decode kernels (`kernels/audio/minimaxmusic3/mm3.cu`: the small-batch product, the cached
+attention; the codec's convolutions as an unfolding and one cuBLAS GEMM a tile, float32), the codec's
+(`kernels/audio/qwen3tts/q3t.cu`) and Breeze's own (`kernels/audio/breezetts2/bz2.cu`) - CUDA ports with nextsycl's
+names and arithmetic. No Python.
+
+```sh
+nextcuda models pull breeze-tts-2
+nextcuda audio gen "(sigh) Welcome aboard." --model breeze-tts-2 --instructions "a calm adult male narrator" --out a.wav
+nextcuda audio check <reference dump dir> --model breeze-tts-2        # reference/breezetts2/ref.py makes the dumps
+```
+
+- **Checked** (2026-10-17) against upstream's own code in float32 on the CPU (`reference/breezetts2/ref.py`, a designed
+  voice, guidance 4): token ids identical; with the Q8_0 file the text encoder 6.6e-3, the prompt rows 9.5e-3, the
+  backbone's logits 4.7e-3 and the depth decoder's 9.1e-3 (teacher forced: 1 of 60 first codes picks otherwise), the
+  codec 1.4e-6 - nextsycl's numbers for the same file. Takes made here transcribe word for word (Whisper small).
+- **Speed** (RTX 5070): 5.5 GiB loaded in 4 s; 26 frames a second with guidance (2.1x real time; the B70: 22); through
+  the front door, 12.7 s of designed speech in 6.5 s.
+
 ## What is not here yet
 
-Video (H3), speech and music, OCR and 3D: their contracts are in the tree and the control plane routes them, but no
-engine of ours runs them; of the llm engines only Nemotron-H is here (no MTP drafts yet). The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
+Video (H3), music, OCR, 3D and the other speech engines (Qwen3-TTS, VoxCPM2): their contracts are in the tree and the
+control plane routes them (or answers not_implemented), but no engine of ours runs them yet; of the llm engines only Nemotron-H is here (no MTP drafts yet). The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
 engine behind the same contracts (`docs/PHASES.md`); the python worker of phase 1 stays as a fallback until then.
 
 ## Clocking it
