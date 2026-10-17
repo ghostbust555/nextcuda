@@ -6,6 +6,7 @@ arch: minimax-h3
 title: 'MiniMax H3 (int8 ConvRot denoiser: the fastest; text, pictures, a voice to video with sound)'
 about: the 50-block FL2VA DiT in ComfyUI's int8 ConvRot (int8 GEMMs), the Qwen3-VL 32B text encoder (Q4_K_M), video and audio VAEs, the latent upscaler
 gpus: '0'
+# nextcuda: too large for two 12 GB cards whole (the denoiser alone is over 20 GB); use q4km or q6k there
 defaults:
   steps: 8
   seconds: 2.0

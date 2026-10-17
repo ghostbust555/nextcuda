@@ -281,6 +281,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 |---|---|---|---|
 | `H3_*` | - | every H3_ setting in nextsycl.conf is passed to the video daemon's container (and set before the GPU opens) | cli (video serve), video |
 | `H3_STALL_S` | 1200 | the studio's watchdog: a running job that writes nothing this many seconds is stopped | studio |
+| `H3_PROMPT_CACHE` | ~/.cache/nextcuda/h3-prompts | nextcuda: where encoded prompts are kept (a prompt seen before skips the text encoder) | video h3 |
 | `H3_TE_PIN` | 1 | 0: no pinned host copy of the text encoder between clips (two pinned layer slots instead) (--opt-te-pin) | video h3 |
 | `H3_TE_PIN_LOCK` | /tmp/h3-te-pin.lock | the lock file that lets one worker a host hold the pinned text-encoder copy | video h3 |
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |

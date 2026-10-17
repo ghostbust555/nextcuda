@@ -6,6 +6,7 @@ arch: minimax-h3
 title: 'MiniMax H3 Ref2VA (int8 ConvRot: reference pictures, clips and sounds to video)'
 about: the 50-block Ref2VA DiT in ComfyUI's int8 ConvRot - the one trained for <Picture i> / <Video k> / <Audio j> references; the same text encoder (with its vision tower), VAEs and upscaler
 gpus: '0'
+# nextcuda: too large for two 12 GB cards whole (the denoiser alone is over 20 GB); use q4km or q6k there
 defaults:
   steps: 8
   seconds: 2.0

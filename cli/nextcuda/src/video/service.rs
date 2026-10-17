@@ -100,6 +100,50 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     // the --opt-NAMEs the engine takes at load: checked here, passed as the variables they set
     let (_, opts) = super::kind_and_options(&m)?;
 
+    // no container program asked for: the daemon is this program, as a process (as the image and audio servers)
+    if crate::native::native(cfg) {
+        if crate::native::running(cfg, ENGINE) {
+            println!("the video engine is already running");
+            return client::status(&["--no-stream".into()], &|| String::new());
+        }
+        let out = out_dir(cfg);
+        std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        std::fs::create_dir_all(cfg.socket_dir()).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(socket(cfg));
+        let mut a: Vec<String> = vec!["video".into(), "daemon".into(), "--socket".into(), socket(cfg).to_string_lossy().into_owned(), "--model".into(), id.clone(),
+                                      "--idle".into(), cfg.or("NS_VIDEO_IDLE", "600")];
+        for o in &others {
+            a.extend(["--engine".into(), o.clone()]);
+        }
+        for g in &gpus {
+            a.extend(["--gpu".into(), g.clone()]);
+        }
+        for g in &shared {
+            a.extend(["--shared-gpu".into(), g.clone()]);
+        }
+        if let Some(lock) = cfg.get("NS_VIDEO_GPU_LOCK") {
+            a.extend(["--gpu-lock".into(), lock]);
+        }
+        if let Some(sw) = cfg.get("NS_VIDEO_LLM_SWITCHER") {
+            a.extend(["--llm-switcher".into(), sw]);
+        }
+        // a model split over the cards (its card's split: true - nextcuda's H3 on a 12 GB pair): one worker over them
+        if m["split"] == true {
+            a.push("--span".into());
+        }
+        // the child inherits these: the registry, the engine's own settings
+        std::env::set_var("NS_REGISTRY", models::registry(cfg));
+        for (k, v) in cfg.with_prefix("NSD_").into_iter().chain(cfg.with_prefix("H3_")) {
+            std::env::set_var(k, v);
+        }
+        for (k, v) in &opts.settings {
+            std::env::set_var(k, v);
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        crate::native::launch(cfg, ENGINE, "0", &exe, &a, false)?;
+        wait_until("the video engine", 60, || socket_ready(cfg))?;
+        return client::status(&["--no-stream".into()], &|| String::new());
+    }
     let ce = Ce::new(cfg)?;
     if ce.running(ENGINE) {
         println!("the video engine is already running");
@@ -185,6 +229,20 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
 
 /// `nextcuda video stop`: the running jobs stop at their next step boundary, the engines unload, the daemon ends
 pub fn stop(cfg: &Config) -> Result<(), String> {
+    if crate::native::native(cfg) {
+        if crate::native::running(cfg, ENGINE) {
+            let _ = client::post("/engine/shutdown", None);
+            let t0 = Instant::now();
+            while crate::native::running(cfg, ENGINE) && t0.elapsed() < Duration::from_secs(150) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            crate::native::stop(cfg, ENGINE, 150);
+            println!("video engine: stopped");
+        } else {
+            println!("video engine: not running");
+        }
+        return Ok(());
+    }
     let ce = Ce::new(cfg)?;
     if ce.running(ENGINE) {
         let _ = client::post("/engine/shutdown", None);

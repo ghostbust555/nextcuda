@@ -209,6 +209,7 @@ fn daemon(cfg: &Config, args: &[String]) -> Result<(), String> {
         gpu_lock: opt(args, "--gpu-lock").map(PathBuf::from),
         llm_switcher: opt(args, "--llm-switcher").map(str::to_string),
         threads: opt(args, "--threads").map_or(Ok(8), |v| num(v, "--threads"))?,
+        span: args.iter().any(|a| a == "--span"),
     })
     .map_err(|e| e.0)
 }
@@ -269,19 +270,21 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
             cancel.store(true, Ordering::SeqCst);
         });
     }
-    // the card's room first: the denoiser and 8 GiB of work (the card's size at most)
+    // the cards' room first: the denoiser and 8 GiB of work (95% of the cards at most: the driver keeps some); a split
+    // model counts every card it spans
     nextcuda_core::use_kind("video");
     let den: u64 = files.get("denoiser").and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
     {
-        // one context to ask the card with, let go before the engine opens its own
-        let g = nextcuda_core::Gpu::open(gpu).map_err(|e| e.0)?;
-        let total = g.memory().map_or(u64::MAX, |(t, _)| t);
-        let need = (den + (8u64 << 30)).min(total);
+        // one context per card to ask with, let go before the engine opens its own
+        let gs = gpus.iter().map(|&g| nextcuda_core::Gpu::open(g).map_err(|e| e.0)).collect::<Result<Vec<_>, _>>()?;
+        let total: u64 = gs.iter().map(|g| g.memory().map_or(u64::MAX / 4, |(t, _)| t)).sum();
+        let need = (den + (8u64 << 30)).min(total / 20 * 19);
         loop {
             if abort.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            match g.memory().ok().and_then(|(_, f)| f) {
+            let free: Option<u64> = gs.iter().map(|g| g.memory().ok().and_then(|(_, f)| f)).sum();
+            match free {
                 Some(free) if free < need => {
                     emit(json!({"event": "engine", "state": format!("waiting for the GPU: {:.1} GiB free, {:.1} GiB needed", gib(free), gib(need))}));
                     std::thread::sleep(Duration::from_secs(5));

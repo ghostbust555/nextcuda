@@ -6,6 +6,7 @@ arch: minimax-h3
 title: MiniMax H3 Q8_0 (a reference form)
 about: the denoiser as a Q8_0 GGUF
 gpus: '0'
+# nextcuda: too large for two 12 GB cards whole (the denoiser alone is over 20 GB); use q4km or q6k there
 defaults:
   steps: 8
   seconds: 2.0

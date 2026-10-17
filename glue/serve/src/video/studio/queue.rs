@@ -219,7 +219,9 @@ pub fn num(p: &Value, key: &str, default: f64, lo: f64, hi: f64, int: bool) -> R
 /// or a GGUF form the engine was given (Q6_K, Q4_K_M).
 pub fn engine_name(e: Option<&str>) -> String {
     match e.map(|e| e.trim().to_uppercase()).filter(|e| !e.is_empty()).as_deref() {
-        None | Some("Q8_0") | Some("INT8") => "INT8".into(),
+        // none named: INT8 when the daemon has it (or nothing is known yet), else the first it has (nextcuda: Q4_K_M)
+        None => default_engine(),
+        Some("Q8_0") | Some("INT8") => "INT8".into(),
         Some(e) => e.to_string(),
     }
 }
@@ -262,9 +264,15 @@ pub fn quant_of(id: &str) -> &'static str {
     }
 }
 
-/// The front-end names of the models the daemon has (INT8 always)
+/// The denoiser a request without one gets: INT8 when the daemon has it or names none, else its first
+pub fn default_engine() -> String {
+    let pairs = engine_pairs();
+    if pairs.is_empty() || pairs.iter().any(|(n, _)| n == "INT8") { "INT8".into() } else { pairs[0].0.clone() }
+}
+
+/// The front-end names of the models the daemon has (INT8 unless it has others and not that one)
 pub fn engine_names() -> Vec<String> {
-    let mut v = vec!["INT8".to_string()];
+    let mut v = vec![default_engine()];
     for (q, _) in engine_pairs() {
         if !v.contains(&q) {
             v.push(q);

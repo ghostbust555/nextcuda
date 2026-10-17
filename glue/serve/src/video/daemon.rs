@@ -78,6 +78,9 @@ pub struct Options {
     /// to stop before loading and restored after unloading.
     pub llm_switcher: Option<String>,
     pub threads: usize,
+    /// One slot over every served GPU, its worker given them all (`--gpu 0,1`): a model split over the cards
+    /// (nextcuda's H3 on a 12 GB pair) rather than a copy on each
+    pub span: bool,
 }
 
 /// An engine process and its event stream.
@@ -153,6 +156,8 @@ fn job_engine(spec: &Value) -> Option<&str> {
 /// One GPU and the engine process on it.
 struct Slot {
     gpu: usize,
+    /// the cards a spanning slot's worker takes (empty: `gpu` alone)
+    span: Vec<usize>,
     name: String,
     pci: String,
     mem_gib: f64,
@@ -299,17 +304,18 @@ impl Daemon {
     /// card's memory and loads.
     /// `held`: the slot's share of the hooks is still taken (a worker with another denoiser just ended).
     fn start_worker(&self, k: usize, cancel: &AtomicBool, engine: &str, held: bool) -> Result<Proc> {
-        let (gpu, shared) = {
+        let (gpu, shared, span) = {
             let s = self.s.lock().unwrap();
-            (s.slots[k].gpu, s.slots[k].shared)
+            (s.slots[k].gpu, s.slots[k].shared, s.slots[k].span.clone())
         };
+        let gpu_arg = if span.is_empty() { gpu.to_string() } else { span.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",") };
         let (engine, model) = self.opts.engine_path(Some(engine)).ok_or_else(|| Error(format!("no engine {engine:?}")))?;
         if shared && !held {
             self.acquire_hooks(k, cancel)?;
         }
         let _ = model; // the worker finds the file by the id
         let spawned = Command::new(program()?)
-            .args(["video", "worker", "--gpu", &gpu.to_string(), "--model", &engine])
+            .args(["video", "worker", "--gpu", &gpu_arg, "--model", &engine])
             .args(["--threads", &self.opts.threads.to_string()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -759,13 +765,15 @@ pub fn serve(opts: Options) -> Result<()> {
     }
     let hooks = opts.gpu_lock.is_some() || opts.llm_switcher.is_some();
     let mut slots = Vec::new();
-    for g in &indices {
+    let slot_gpus: Vec<usize> = if opts.span { indices.iter().take(1).copied().collect() } else { indices.clone() };
+    for g in &slot_gpus {
         let Some(info) = found.iter().find(|f| f["index"].as_u64() == Some(*g as u64)) else {
             return Err(Error(format!("--gpu {g}: there is no GPU {g} ({} found; see `nextcuda video gpus`)", found.len())));
         };
         let shared = hooks && opts.shared_gpus.as_ref().is_none_or(|s| s.contains(g));
         slots.push(Slot {
             gpu: *g,
+            span: if opts.span { indices.clone() } else { Vec::new() },
             name: info["name"].as_str().unwrap_or("?").to_string(),
             pci: info["pci"].as_str().unwrap_or("").to_string(),
             mem_gib: info["mem_gib"].as_f64().unwrap_or(0.0),

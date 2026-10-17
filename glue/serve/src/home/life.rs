@@ -1131,6 +1131,10 @@ impl Home {
             return Ok(());
         }
         let _ = std::fs::remove_file(&marker);
+        // the studio (the queue, the page, what video.* reaches): a plain process on this box, started with the daemon
+        if !listening(self.o.ports.video) {
+            self.exec("video serve (the studio)".into(), &["video".into(), "serve".into(), "--port".into(), self.o.ports.video.to_string()])?;
+        }
         let first = enabled.iter().find(|m| s(m, "id") == "minimax-h3").or(enabled.first()).map(|m| s(m, "id")).unwrap_or_default();
         let mut want: Vec<String> = vec![first.clone()];
         want.extend(enabled.iter().map(|m| s(m, "id")).filter(|i| *i != first));

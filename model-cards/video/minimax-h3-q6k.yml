@@ -5,7 +5,8 @@ kind: video
 arch: minimax-h3
 title: 'MiniMax H3 Q6_K (the denoiser in 15.4 GiB: longer clips fit)'
 about: the denoiser as a Q6_K GGUF (expanded to bf16 a matrix at a time)
-gpus: '0'
+gpus: '0,1'
+split: true                      # nextcuda: the denoiser's blocks and the text encoder split over the two 12 GB cards, whole (no streaming)
 defaults:
   steps: 8
   seconds: 2.0

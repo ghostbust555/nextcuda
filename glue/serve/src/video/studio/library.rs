@@ -356,7 +356,7 @@ impl Studio {
         let fastest = gpus.iter().filter(|g| g["engine"].as_str().unwrap_or("INT8") == "INT8").min_by(|a, b| a["step_a"].as_f64().unwrap_or(1.0).total_cmp(&b["step_a"].as_f64().unwrap_or(1.0)));
         let (a, b) = fastest.map(|g| (g["step_a"].as_f64().unwrap_or(1.829e-8), g["step_b"].as_f64().unwrap_or(3.4634e-4))).unwrap_or((1.829e-8, 3.4634e-4));
         json!({"engines": self.engines(), "canvases": self.canvases(),
-               "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": "INT8"},
+               "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": super::queue::default_engine()},
                "cap_gib": 30.3, "gib_per_token": 1.64e-4, "margin_gib": 0.8, "step_a": a, "step_b": b, "gpus": gpus,
                "chain_modes": super::queue::CHAIN_MODES.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<Map<String, Value>>(),
                "measured": {},
