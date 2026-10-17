@@ -96,5 +96,6 @@ port has not landed answers with what it would take and does, and refuses the ca
 - **Drives:** `system.drives`, `system.drive.measure`, `system.move` and `system.move.cancel` likewise: declared, 501.
 - `system.version` lists the methods of the kinds that are on, so none of these show there until they work.
 
-Next: the speech engines in Rust + CUDA (no Python), Breeze TTS 2 and Qwen3-TTS first; they share the 12 Hz codec
-(nextsycl's `crates/codec12hz`).
+Then the same day: the three speech engines run on CUDA in Rust (no Python) - Breeze TTS 2, Qwen3-TTS and VoxCPM2,
+nextsycl's code over CUDA ports of its audio kernels (`kernels/audio/`), each checked against its upstream package
+(README "Speech"). Still declared only: model3d, the drives, music (MiniMax Music 3), OCR, video.

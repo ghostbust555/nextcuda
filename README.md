@@ -114,6 +114,8 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
 | `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B Q4_K_M, its VAE and the Lightning 4-step LoRA | `qwen-image-2512` | 17.7 GiB | served, checked |
 | `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | `nemotron_h_moe` | 43.0 GiB | served (one 12 GB card, experts streamed) |
 | `breeze-tts-2` | Breeze TTS 2 (~3B, CrispASR's Q8_0 GGUF) with Qwen3-TTS's 12 Hz codec: English and Chinese speech - voices designed, cloned (recording + transcript) or directed; vocal events; weights and outputs non-commercial | `breeze-tts-2` | 4.0 GiB | served, checked |
+| `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices styled by an instruction, ten languages | `qwen3-tts` | 4.2 GiB | served, checked |
+| `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz, voices designed from a description or cloned | `voxcpm2` | 4.6 GiB | served, checked |
 
 The model cards are in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256).
 `nextcuda models pull <id> [--from DIR]...` downloads what is missing or hard-links a file already on the machine,
@@ -214,7 +216,7 @@ and `cli/nextcuda/tests/architecture.rs` checks them on every `cargo test`, with
 `./build.sh` builds the program in a debian:trixie toolchain image (its glibc is the GPU host's) and the web front
 end; `kernels/build.sh` builds the CUDA libraries with `nvcc` for the 3060 (sm_86) and the 5070 (sm_120).
 
-## Speech: Breeze TTS 2
+## Speech: Breeze TTS 2, Qwen3-TTS, VoxCPM2
 
 nextsycl's engine (`audio/breezetts2`) and the 12 Hz codec (`crates/codec12hz`), unchanged, over the audio kernel
 library: the music engine's decode kernels (`kernels/audio/minimaxmusic3/mm3.cu`: the small-batch product, the cached
@@ -232,13 +234,20 @@ nextcuda audio check <reference dump dir> --model breeze-tts-2        # referenc
   voice, guidance 4): token ids identical; with the Q8_0 file the text encoder 6.6e-3, the prompt rows 9.5e-3, the
   backbone's logits 4.7e-3 and the depth decoder's 9.1e-3 (teacher forced: 1 of 60 first codes picks otherwise), the
   codec 1.4e-6 - nextsycl's numbers for the same file. Takes made here transcribe word for word (Whisper small).
+- **Qwen3-TTS and VoxCPM2**: nextsycl's engines too (`audio/qwen3tts`, `audio/voxcpm2`; VoxCPM2's kernels
+  `kernels/audio/voxcpm2/vcp.cu`). Checked against their own packages in float32 (`reference/qwen3tts/ref.py`,
+  `reference/voxcpm2/ref.py`): Qwen3-TTS's prompt rows 1.9e-5, first logits 5.4e-4, frames forced: no first code
+  differs (the other codes 4 of 585, near ties), the codec 1.2e-6; VoxCPM2's prompt tokens identical, both language
+  models 3e-4, each patch from the reference's history and noise 5e-3 (cos 0.99999), the VAE 1.1e-6 - run free it
+  takes another valid path after a few patches, as nextsycl documents. On the 5070, 5.6 s of Qwen3-TTS speech in 1.0 s,
+  4.8 s of VoxCPM2's in 1.0 s; both transcribe word for word.
 - **Speed** (RTX 5070): 5.5 GiB loaded in 4 s; 26 frames a second with guidance (2.1x real time; the B70: 22); through
   the front door, 12.7 s of designed speech in 6.5 s.
 
 ## What is not here yet
 
-Video (H3), music, OCR, 3D and the other speech engines (Qwen3-TTS, VoxCPM2): their contracts are in the tree and the
-control plane routes them (or answers not_implemented), but no engine of ours runs them yet; of the llm engines only Nemotron-H is here (no MTP drafts yet). The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
+Video (H3), music, OCR and 3D: their contracts are in the tree and the control plane routes them (or answers
+not_implemented), but no engine of ours runs them yet; of the llm engines only Nemotron-H is here (no MTP drafts yet). The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
 engine behind the same contracts (`docs/PHASES.md`); the python worker of phase 1 stays as a fallback until then.
 
 ## Clocking it
