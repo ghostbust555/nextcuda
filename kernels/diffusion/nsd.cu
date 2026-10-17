@@ -369,12 +369,19 @@ int attention(Ctx* c, const void* q, int64_t Sq, int64_t qs, const void* k, cons
     if (Hq % Hkv) return fail("attention: query heads are not a multiple of the key/value heads");
     const int64_t g = Hq / Hkv;
     const float scale = 1.0f / sqrtf((float) D);
-    // a block of query rows: Hq x R x Skv float32 scores under ~256 MiB
+    // a block of query rows: Hq x R x Skv float32 scores under ~256 MiB - fewer rows a block when the card has not the
+    // room (olmOCR 2's 7.5 GiB of weights left no 256 MiB for its vision tower's whole-page attention, 2026-10-17)
     int64_t R = std::max<int64_t>(1, ((256ll << 20) / 4) / (Hq * Skv));
     R = std::min(R, Sq);
-    float* S = (float*) scratch(c, 0, (size_t) Hq * R * Skv * 4);
-    void* P = scratch(c, 1, (size_t) Hq * R * Skv * esz(dt));
-    if (!S || !P) return fail("attention: the score table did not fit in memory");
+    float* S = nullptr;
+    void* P = nullptr;
+    for (;;) {
+        S = (float*) scratch(c, 0, (size_t) Hq * R * Skv * 4);
+        P = S ? scratch(c, 1, (size_t) Hq * R * Skv * esz(dt)) : nullptr;
+        if ((S && P) || R == 1) break;
+        R = std::max<int64_t>(1, R / 2);
+    }
+    if (!S || !P) return fail("attention: the score table did not fit in memory (even a row of it)");
     const float one = 1.0f, zero = 0.0f;
     const size_t eq = esz(dt);
     for (int64_t q0 = 0; q0 < Sq; q0 += R) {

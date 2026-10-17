@@ -45,11 +45,18 @@ pub fn kind() -> ImageKind {
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], _o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
     let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
+    if gpus.len() > 1 {
+        return Ok(Box::new(OlmOcr::load_on(files, gpu, gpus.get(1), log)?));
+    }
     Ok(Box::new(OlmOcr::load(files, gpu, log)?))
 }
 
 pub struct OlmOcr {
+    /// the decoder's GPU (the whole engine's, on one card)
     pub nsd: Nsd,
+    /// the vision tower's, when it has a card of its own: nextsycl's one 32 GB card is here a 12 GB pair - the 7.5
+    /// GiB decoder left no room for a page's vision activations beside it
+    pub vnsd: Option<Nsd>,
     pub vision: vision::Vision,
     pub decoder: decoder::Decoder,
     pub tok: Tokenizer,
@@ -164,6 +171,11 @@ fn add(all: &mut OcrOutput, r: &OcrOutput) {
 
 impl OlmOcr {
     pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<OlmOcr> {
+        Self::load_on(files, gpu, None, log)
+    }
+
+    /// `load` with the vision tower on `vision_gpu` when one is given
+    pub fn load_on(files: &ModelFiles, gpu: &Arc<Gpu>, vision_gpu: Option<&Arc<Gpu>>, log: &mut dyn FnMut(String)) -> Result<OlmOcr> {
         let t0 = Instant::now();
         let path = |r: &str| files.get(r).ok_or_else(|| Error(format!("{ARCH}: no {r} file")));
         let fm = Gguf::open(path("model")?).map_err(|e| Error(e.0))?;
@@ -174,11 +186,15 @@ impl OlmOcr {
         let nsd = Nsd::new(gpu)?;
         let tok = Tokenizer::from_gguf(&fm).map_err(Error)?;
         let eos = fm.meta("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()).unwrap_or(151645) as u32;
-        let vision = vision::Vision::load(&fp, gpu, log)?;
+        let vnsd = vision_gpu.map(Nsd::new).transpose()?;
+        let vision = vision::Vision::load(&fp, vision_gpu.unwrap_or(gpu), log)?;
         let decoder = decoder::Decoder::load(&fm, gpu, log)?;
         let load_s = t0.elapsed().as_secs_f64();
-        log(format!("olmocr2: loaded on {} in {load_s:.1} s", gpu.name));
-        Ok(OlmOcr { nsd, vision, decoder, tok, eos, load_s, work: Mutex::new(()) })
+        match vision_gpu {
+            Some(v) => log(format!("olmocr2: the decoder on {}, the vision tower on {}, in {load_s:.1} s", gpu.name, v.name)),
+            None => log(format!("olmocr2: loaded on {} in {load_s:.1} s", gpu.name)),
+        }
+        Ok(OlmOcr { nsd, vnsd, vision, decoder, tok, eos, load_s, work: Mutex::new(()) })
     }
 
     pub fn prompt_tokens(&self, prompt: &str, n_image: usize) -> Vec<u32> {
@@ -267,7 +283,12 @@ impl OlmOcr {
     /// The image tokens of a fitted page and its unit grid (rows, columns)
     pub fn image_tokens(&self, page: &Picture, tap: &mut dyn FnMut(&str, &DevBuf) -> nextcuda_core::Result<()>) -> Result<(DevBuf, usize, usize)> {
         let seen = prep::see(page, self.vision.mean, self.vision.std);
-        let img = self.vision.see(&self.nsd, &seen, tap)?;
+        let img = self.vision.see(self.vnsd.as_ref().unwrap_or(&self.nsd), &seen, tap)?;
+        // the image tokens to the decoder's card (a page's are a few MB)
+        let img = match &self.vnsd {
+            Some(_) => DevBuf::from_f32(&self.nsd.gpu, &img.to_f32()?)?,
+            None => img,
+        };
         Ok((img, seen.gh / 2, seen.gw / 2))
     }
 

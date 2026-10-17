@@ -66,7 +66,7 @@ pub fn run(m: &OlmOcr, dir: &Path, picture: Option<&Picture>, gen_tokens: usize,
         }
     }
     let seen = prep::see_planes(&px, h, w);
-    let img = m.vision.see(&m.nsd, &seen, &mut |name, buf| {
+    let img = m.vision.see(m.vnsd.as_ref().unwrap_or(&m.nsd), &seen, &mut |name, buf| {
         let Some(r) = d.get(name) else { return Ok(()) };
         let (rel, cos) = compare(&buf.to_f32()?, &r);
         log(format!("{name:>14}: rel {rel:.2e} cos {cos:.6}"));
@@ -75,6 +75,10 @@ pub fn run(m: &OlmOcr, dir: &Path, picture: Option<&Picture>, gen_tokens: usize,
         }
         Ok(())
     })?;
+    let img = match &m.vnsd {
+        Some(_) => nextcuda_core::DevBuf::from_f32(&m.nsd.gpu, &img.to_f32()?)?,
+        None => img,
+    };
     let (uh, uw) = (seen.gh / 2, seen.gw / 2);
     // the prompt: llama.cpp's chunks
     let tt = std::fs::read_to_string(dir.join("tokens.txt")).map_err(|e| Error(format!("tokens.txt: {e}")))?;
