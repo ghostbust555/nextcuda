@@ -11,7 +11,7 @@ use serde_json::Value;
 const USAGE: &str = "nextcuda audio gen \"<description>\" [--lyrics TEXT | --lyrics-file FILE] [--model ID | --dir DIR] [--seconds N] [--steps N]
                    [--cfg X] [--seed N] [--set NAME=VALUE]... [--opt-NAME VALUE]... [--out FILE|DIR] [--gpu N]
 nextcuda audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--language L] [--instructions TEXT]
-                   [--ref-audio FILE.wav [--ref-text TEXT]] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
+                   [--ref-audio FILE.wav [--ref-text TEXT]] [--cfg X] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextcuda audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextcuda audio start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextcuda audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
@@ -25,8 +25,9 @@ nextcuda audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextcuda_audio::AudioKind> {
-    // nextsycl's speech engines, their entries in place; none runs on CUDA yet (loading says so: docs/PHASES.md)
-    vec![nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind(), nextcuda_audio_breezetts2::kind()]
+    // Breeze TTS 2 runs on CUDA; Qwen3-TTS and VoxCPM2 are nextsycl's entries, not ported yet (loading says so:
+    // docs/PHASES.md); MiniMax Music 3 is not here
+    vec![nextcuda_audio_breezetts2::kind(), nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -36,8 +37,19 @@ fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
 /// The registered audio model `id` (or the first one), or `--dir`: a checkpoint's directory as downloaded (MiniMax
 /// Music 3's diffusers layout, or Qwen3-TTS's: its config.json and speech_tokenizer/): (entry, files by role)
 fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
-    if opt(args, "--dir").is_some() {
-        return Err("audio --dir: nextcuda has no audio engine yet".into());
+    if let Some(d) = opt(args, "--dir") {
+        let dir = Path::new(d);
+        let (arch, files) = if let Ok(f) = nextcuda_audio_breezetts2::files_in(dir) {
+            (nextcuda_audio_breezetts2::ARCH, f)
+        } else if dir.join("audiovae.pth").exists() {
+            (nextcuda_audio_voxcpm2::ARCH, nextcuda_audio_voxcpm2::files_in(dir).map_err(|e| e.0)?)
+        } else if dir.join("speech_tokenizer").is_dir() {
+            (nextcuda_audio_qwen3tts::ARCH, nextcuda_audio_qwen3tts::files_in(dir).map_err(|e| e.0)?)
+        } else {
+            return Err(format!("{}: not a Breeze TTS 2, VoxCPM2 or Qwen3-TTS checkpoint", dir.display()));
+        };
+        let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        return Ok((serde_json::json!({"id": id, "kind": "audio", "arch": arch, "env": {}}), files));
     }
     let all = models::all(cfg)?;
     let m = match opt(args, "--model") {
@@ -204,8 +216,20 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
 }
 
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
-    let _ = (cfg, args);
-    Err("audio check: nextcuda has no audio engine yet".into())
+    let dir = Path::new(args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?);
+    nextcuda_core::use_kind("audio");
+    let (m, files) = model(cfg, args)?;
+    let g = gpu(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let worst = if m["arch"] == nextcuda_audio_breezetts2::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
+        let e = nextcuda_audio_breezetts2::BreezeTts2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextcuda_audio_breezetts2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else {
+        return Err(format!("check knows {} only here (the other speech engines are not ported yet)", nextcuda_audio_breezetts2::ARCH));
+    };
+    println!("worst relative error {worst:.2e}");
+    Ok(())
 }
 
 /// The music server's container (`audio serve` in the foreground, `audio start` in the background)
@@ -273,7 +297,8 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NSD_")) {
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_"))
+        .chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
     a.extend([ce.image.clone(), "bash".into(), "-c".into(),

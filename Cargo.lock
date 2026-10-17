@@ -576,7 +576,12 @@ name = "nextcuda-audio-breezetts2"
 version = "0.0.0"
 dependencies = [
  "nextcuda-audio",
+ "nextcuda-codec12hz",
  "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-tok",
+ "serde_json",
 ]
 
 [[package]]
@@ -593,6 +598,15 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-audio",
  "nextcuda-core",
+]
+
+[[package]]
+name = "nextcuda-codec12hz"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
 ]
 
 [[package]]
