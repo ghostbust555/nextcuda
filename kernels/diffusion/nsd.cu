@@ -27,9 +27,10 @@ struct Ctx {
     cublasLtHandle_t lt = nullptr;
     // scratch buffers (grown, kept): 0 = score table, 1 = probabilities, 2 = im2col / reordered weights,
     // 3 = a slice of dequantized weights, 4 = the rotated activations, 5 = int8 activations, 6 = int32 accumulators,
-    // 7 = cublasLt's workspace
-    void* buf[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-    size_t cap[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // 7 = cublasLt's workspace, 8 = gemm_nt's float32 staging (float32 inputs, a 16-bit output: cuBLAS has no such
+    // product)
+    void* buf[9] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t cap[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     // the normalized Hadamard matrix of each group size (16, 64, 256), half, on the card
     void* had[3] = {nullptr, nullptr, nullptr};
     // a context of its own (nsd_open / nsd_open_gpu, H3's way in) rather than around an ns_gpu (nsd_create): its
@@ -368,8 +369,27 @@ __global__ void reorder_w3d_k(const void* w, int dt, int64_t Co, int64_t Ci, int
 }
 
 // out [M, N] (+)= x [M, K] . w [N, K]^T, float32 accumulation; `ldo`: the row stride of out (>= N)
+__global__ void cvt_rows_k(const void* src, int sdt, int64_t sld, void* dst, int ddt, int64_t dld, int64_t N, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) put(dst, ddt, (i / N) * dld + i % N, get(src, sdt, (i / N) * sld + i % N));
+}
+
 int gemm_nt(Ctx* c, const void* x, int xdt, int64_t M, int64_t K, const void* w, int wdt, int64_t N, void* out, int odt, float beta, int64_t ldo = 0) {
     const float alpha = 1.0f;
+    // float32 operands give a float32 product only (CUBLAS_STATUS_NOT_SUPPORTED otherwise; oneDNN, nextsycl's, writes
+    // any type): through a float32 staging buffer, converted into `out` (H3's patch projections: float32 rows, a
+    // float32 matrix, bfloat16 rows out - 2026-10-17)
+    if (xdt == NSD_F32 && wdt == NSD_F32 && odt != NSD_F32) {
+        const int64_t lo = ldo ? ldo : N;
+        float* st = (float*) scratch(c, 8, (size_t) M * N * 4);
+        if (!st) return fail("gemm: the float32 staging did not fit in memory");
+        if (beta != 0.0f) { cvt_rows_k<<<nb(M * N), 256, 0, c->s>>>(out, odt, lo, st, NSD_F32, N, N, M * N); LAUNCHED("gemm staging in"); }
+        BL(cublasGemmEx(c->cb, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) M, (int) K, &alpha, w, CUDA_R_32F, (int) K, x, CUDA_R_32F, (int) K,
+                        &beta, st, CUDA_R_32F, (int) N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        cvt_rows_k<<<nb(M * N), 256, 0, c->s>>>(st, NSD_F32, N, out, odt, lo, N, M * N);
+        LAUNCHED("gemm staging out");
+        return 0;
+    }
     BL(cublasGemmEx(c->cb, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) M, (int) K, &alpha, w, cdt(wdt), (int) K, x, cdt(xdt), (int) K,
                     &beta, out, cdt(odt), (int) (ldo ? ldo : N), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     return 0;

@@ -1463,6 +1463,12 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     };
     let sample_secs = t0.elapsed().as_secs_f64();
     drop(d);
+    // split over the cards, the blocks make way for the decoders (5 GiB for the video's): the next clip loads them
+    // again (nextcuda: each stage holds a model that fits)
+    if e.devs.len() > 1 {
+        drop(model);
+        e.release();
+    }
     // the next clip's latent anchor: the last latent frame, before any upscaling
     {
         let n = shape.h * shape.w;
