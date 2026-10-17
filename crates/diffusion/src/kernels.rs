@@ -47,6 +47,12 @@ struct Api {
     attention_causal_rows: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, i64, i64, M) -> c_int,
     attention_qk: unsafe extern "C" fn(M, P, i64, i64, P, P, i64, i64, c_int, i64, i64, M, c_int) -> c_int,
     conv2d: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, i64, P, i64, i64, *const f32, M) -> c_int,
+    attention: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, M, c_int) -> c_int,
+    attention_batch: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, M, c_int) -> c_int,
+    conv1d: unsafe extern "C" fn(M, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, i64, *mut f32, i64) -> c_int,
+    conv_transpose1d: unsafe extern "C" fn(M, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, *mut f32, i64) -> c_int,
+    snake: unsafe extern "C" fn(M, *const f32, i64, i64, i64, *const f32, *mut f32) -> c_int,
+    scale: unsafe extern "C" fn(M, *mut f32, i64, f32) -> c_int,
     conv3d_ex: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, i64, *const f32, M) -> c_int,
 }
 
@@ -94,6 +100,12 @@ fn api() -> Result<&'static Api> {
             attention_qk: sym!("nsd_attention_qk"),
             conv2d: sym!("nsd_conv2d"),
             conv3d_ex: sym!("nsd_conv3d_ex"),
+            attention: sym!("nsd_attention"),
+            attention_batch: sym!("nsd_attention_batch"),
+            conv1d: sym!("nsd_conv1d"),
+            conv_transpose1d: sym!("nsd_conv_transpose1d"),
+            snake: sym!("nsd_snake"),
+            scale: sym!("nsd_scale"),
         })
     })
     .as_ref()
@@ -116,6 +128,7 @@ impl Drop for Nsd {
         // SAFETY: made by nsd_create, destroyed once.
         unsafe { (self.k.destroy)(self.ctx) };
     }
+
 }
 
 fn last(k: &Api) -> String {
@@ -289,5 +302,52 @@ impl Nsd {
         // SAFETY: the caller's buffers hold the sizes named.
         self.ok(unsafe { (self.k.conv3d_ex)(self.ctx, x, dt as c_int, thw.0 as i64, thw.1 as i64, thw.2 as i64, ci as i64, w, co as i64, k.0 as i64, k.1 as i64,
                                              k.2 as i64, s.0 as i64, s.1 as i64, s.2 as i64, bias.cast(), out) }, "conv3d")
+    }
+
+    /// Full attention over S rows of H heads x D (rows `stride` apart), out [S, H * D]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention(&self, q: P, k: P, v: P, dt: Dt, s: usize, h: usize, d: usize, stride: usize, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.attention)(self.ctx, q, k, v, dt as c_int, s as i64, h as i64, d as i64, stride as i64, out, out_dt as c_int) }, "attention")
+    }
+
+    /// B independent sequences of S rows each (sequence b's rows from row b * S of q, k, v and out), full attention
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_batch(&self, q: P, k: P, v: P, dt: Dt, b: usize, s: usize, h: usize, d: usize, stride: usize, out: M, out_dt: Dt) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.attention_batch)(self.ctx, q, k, v, dt as c_int, b as i64, s as i64, h as i64, d as i64, stride as i64, out, out_dt as c_int) },
+                "attention (batch)")
+    }
+
+    /// A 1-D convolution of float32 signals x [B, Ci, L] with w [Co, Ci, K] (bias [Co] or null), zero padding `pad`
+    /// both sides: out [B, Co, Lo], Lo = (L + 2 pad - dil (K - 1) - 1) / stride + 1
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d(&self, x: P, b: usize, ci: usize, l: usize, w: P, co: usize, k: usize, bias: P, stride: usize, dil: usize, pad: usize, out: M,
+                  lo: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.conv1d)(self.ctx, x.cast(), b as i64, ci as i64, l as i64, w.cast(), co as i64, k as i64, bias.cast(), stride as i64, dil as i64,
+                                          pad as i64, out.cast(), lo as i64) }, "conv1d")
+    }
+
+    /// The transposed 1-D convolution: x [B, Ci, L], w [Ci, Co, K]; out [B, Co, Lo], Lo = (L - 1) stride - 2 pad + K
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d(&self, x: P, b: usize, ci: usize, l: usize, w: P, co: usize, k: usize, bias: P, stride: usize, pad: usize, out: M,
+                            lo: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.conv_transpose1d)(self.ctx, x.cast(), b as i64, ci as i64, l as i64, w.cast(), co as i64, k as i64, bias.cast(),
+                                                    stride as i64, pad as i64, out.cast(), lo as i64) }, "conv_transpose1d")
+    }
+
+    /// Snake: x + sin^2(alpha x) / alpha per channel of x [B, C, L] float32 (alpha [C])
+    #[allow(clippy::too_many_arguments)]
+    pub fn snake(&self, x: P, b: usize, c: usize, l: usize, alpha: P, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.snake)(self.ctx, x.cast(), b as i64, c as i64, l as i64, alpha.cast(), out.cast()) }, "snake")
+    }
+
+    /// x *= s, float32
+    pub fn scale(&self, x: M, n: usize, s: f32) -> Result<()> {
+        // SAFETY: x holds n floats.
+        self.ok(unsafe { (self.k.scale)(self.ctx, x.cast(), n as i64, s) }, "scale")
     }
 }

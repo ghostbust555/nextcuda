@@ -545,5 +545,106 @@ pub fn selftest(gpu: &Arc<Gpu>) -> Result<Vec<f32>> {
         nsd.wait()?;
         out.push(within("conv3d (strided)", &get_half(&o3, ho * wo * co)?, &want3, 3e-3)?);
     }
+    // the 1-D operations (float32): a strided, dilated convolution, a transposed one, snake, scale
+    {
+        let (b, ci, l, co, k) = (2usize, 5usize, 23usize, 4usize, 3usize);
+        let (x, w, bias) = (data(b * ci * l, 31, 1.0), data(co * ci * k, 32, 0.5), data(co, 33, 1.0));
+        let (stride, dil, pad) = (2usize, 2usize, 2usize);
+        let lo = (l + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+        let mut want = vec![0f32; b * co * lo];
+        for bb in 0..b {
+            for o in 0..co {
+                for t in 0..lo {
+                    let mut a = bias[o];
+                    for c in 0..ci {
+                        for kk in 0..k {
+                            let s = (t * stride + kk * dil) as i64 - pad as i64;
+                            if s >= 0 && (s as usize) < l {
+                                a += w[(o * ci + c) * k + kk] * x[(bb * ci + c) * l + s as usize];
+                            }
+                        }
+                    }
+                    want[(bb * co + o) * lo + t] = a;
+                }
+            }
+        }
+        let (dx, dw, db) = (put_f32(g, &x)?, put_f32(g, &w)?, put_f32(g, &bias)?);
+        let o = DevBuf::f32(g, b * co * lo)?;
+        nsd.conv1d(dx.ptr(), b, ci, l, dw.ptr(), co, k, db.ptr(), stride, dil, pad, o.ptr(), lo)?;
+        nsd.wait()?;
+        out.push(within("conv1d", &o.to_f32()?, &want, 1e-5)?);
+        // transposed: w [Ci, Co, K]
+        let (st, pd, kt) = (3usize, 1usize, 5usize);
+        let wt = data(ci * co * kt, 34, 0.5);
+        let lt = (l - 1) * st + kt - 2 * pd;
+        let mut want2 = vec![0f32; b * co * lt];
+        for bb in 0..b {
+            for o in 0..co {
+                for t in 0..lt {
+                    want2[(bb * co + o) * lt + t] = bias[o];
+                }
+            }
+            for c in 0..ci {
+                for s in 0..l {
+                    for o in 0..co {
+                        for kk in 0..kt {
+                            let t = (s * st + kk) as i64 - pd as i64;
+                            if t >= 0 && (t as usize) < lt {
+                                want2[(bb * co + o) * lt + t as usize] += x[(bb * ci + c) * l + s] * wt[(c * co + o) * kt + kk];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let dwt = put_f32(g, &wt)?;
+        let o2 = DevBuf::f32(g, b * co * lt)?;
+        nsd.conv_transpose1d(dx.ptr(), b, ci, l, dwt.ptr(), co, kt, db.ptr(), st, pd, o2.ptr(), lt)?;
+        nsd.wait()?;
+        out.push(within("conv_transpose1d", &o2.to_f32()?, &want2, 1e-5)?);
+        let alpha: Vec<f32> = data(ci, 35, 1.0).iter().map(|a| a.abs() + 0.5).collect();
+        let want3: Vec<f32> = x.iter().enumerate().map(|(i, v)| {
+            let a = alpha[(i / l) % ci];
+            v + (a * v).sin().powi(2) / (a + 1e-9)
+        }).collect();
+        let (da, o3) = (put_f32(g, &alpha)?, DevBuf::f32(g, x.len())?);
+        nsd.snake(dx.ptr(), b, ci, l, da.ptr(), o3.ptr())?;
+        nsd.scale(o3.ptr(), x.len(), 0.5)?;
+        nsd.wait()?;
+        let want3: Vec<f32> = want3.iter().map(|v| v * 0.5).collect();
+        out.push(within("snake, scale", &o3.to_f32()?, &want3, 1e-5)?);
+    }
+    // unmasked attention, half in, float32 out; and two sequences in one call
+    {
+        let (bs, s, hh, d) = (2usize, 9usize, 3usize, 16usize);
+        let n = bs * s * hh * d;
+        let (q, k, v) = (data(n, 41, 1.0), data(n, 42, 1.0), data(n, 43, 1.0));
+        let (qq, kq, vq): (Vec<f32>, Vec<f32>, Vec<f32>) = (q.iter().map(|x| h(*x)).collect(), k.iter().map(|x| h(*x)).collect(), v.iter().map(|x| h(*x)).collect());
+        let mut want = vec![0f32; n];
+        for b in 0..bs {
+            for i in 0..s {
+                for head in 0..hh {
+                    let row = |j: usize| ((b * s + j) * hh + head) * d;
+                    let qi = row(i);
+                    let sc: Vec<f32> = (0..s).map(|j| (0..d).map(|e| qq[qi + e] * kq[row(j) + e]).sum::<f32>() / (d as f32).sqrt()).collect();
+                    let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                    let p: Vec<f32> = sc.iter().map(|x| (x - mx).exp()).collect();
+                    let z: f32 = p.iter().sum();
+                    for e in 0..d {
+                        want[qi + e] = (0..s).map(|j| p[j] / z * vq[row(j) + e]).sum();
+                    }
+                }
+            }
+        }
+        let (dq, dk, dv) = (put_half(g, &q)?, put_half(g, &k)?, put_half(g, &v)?);
+        let o = DevBuf::f32(g, n)?;
+        nsd.attention_batch(dq.ptr(), dk.ptr(), dv.ptr(), Dt::F16, bs, s, hh, d, hh * d, o.ptr(), Dt::F32)?;
+        nsd.wait()?;
+        out.push(within("attention (batch)", &o.to_f32()?, &want, 3e-3)?);
+        let o1 = DevBuf::f32(g, s * hh * d)?;
+        nsd.attention(dq.ptr(), dk.ptr(), dv.ptr(), Dt::F16, s, hh, d, hh * d, o1.ptr(), Dt::F32)?;
+        nsd.wait()?;
+        out.push(within("attention", &o1.to_f32()?, &want[..s * hh * d], 3e-3)?);
+    }
     Ok(out)
 }

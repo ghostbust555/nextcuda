@@ -782,3 +782,141 @@ int nsd_conv3d_ex(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_
 }
 
 }  // extern "C"
+
+// ---- nextsycl's other shared kernels: unmasked attention, the audio decoders' 1-D operations -------------------------
+
+namespace {
+
+__global__ void unfold1d_k(const float* x, int64_t Ci, int64_t L, int64_t K, int64_t stride, int64_t dil, int64_t pad, int64_t t0, int64_t Lt,
+                           float* col, int64_t n) {
+    const int64_t id = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= n) return;
+    const int64_t t = id % Lt, ck = id / Lt, k = ck % K, ci = ck / K;
+    const int64_t s = (t0 + t) * stride + k * dil - pad;
+    col[id] = s >= 0 && s < L ? x[ci * L + s] : 0.0f;
+}
+
+__global__ void bias1d_k(float* out, const float* bias, int64_t Lo, int64_t t0, int64_t Lt, int64_t n) {
+    const int64_t id = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < n) out[(id / Lt) * Lo + t0 + id % Lt] += bias[id / Lt];
+}
+
+__global__ void gather1d_k(const float* col, int64_t L, int64_t K, int64_t stride, int64_t pad, const float* bias, int64_t co0, int64_t Lo, float* out,
+                           int64_t n) {
+    const int64_t id = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= n) return;
+    const int64_t t = id % Lo, c = id / Lo;
+    float a = bias ? bias[co0 + c] : 0.0f;
+    for (int64_t k = 0; k < K; ++k) {
+        const int64_t u = t + pad - k;
+        if (u < 0 || u % stride != 0) continue;
+        const int64_t s = u / stride;
+        if (s < L) a += col[(c * K + k) * L + s];
+    }
+    out[(co0 + c) * Lo + t] = a;
+}
+
+__global__ void snake1d_k(const float* x, int64_t C, int64_t L, const float* alpha, float* out, int64_t n) {
+    const int64_t id = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= n) return;
+    const float a = alpha[(id / L) % C], v = x[id], s = sinf(a * v);
+    out[id] = v + s * s / (a + 1e-9f);
+}
+
+__global__ void scale_k(float* x, int64_t n, float s) {
+    const int64_t id = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < n) x[id] *= s;
+}
+
+// float32 GEMM without TF32: the reference's numbers
+int sgemm(Ctx* c, cublasOperation_t ta, cublasOperation_t tb, int64_t m, int64_t n, int64_t k, const float* a, int64_t lda, const float* b, int64_t ldb,
+          float* o, int64_t ldo) {
+    const float one = 1.0f, zero = 0.0f;
+    BL(cublasGemmEx(c->cb, ta, tb, (int) m, (int) n, (int) k, &one, a, CUDA_R_32F, (int) lda, b, CUDA_R_32F, (int) ldb, &zero, o, CUDA_R_32F, (int) ldo,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    return 0;
+}
+
+constexpr int64_t CONV_SCRATCH = 32ll << 20;  // floats
+
+}  // namespace
+
+int nsd_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D, int64_t stride, void* out, int out_dt) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    return attention(c, q, S, stride, k, v, S, stride, dt, H, H, D, out, out_dt, 0, 0);
+}
+
+int nsd_attention_batch(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t B, int64_t S, int64_t H, int64_t D, int64_t stride,
+                        void* out, int out_dt) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    const size_t e = esz(dt), eo = esz(out_dt);
+    for (int64_t b = 0; b < B; ++b) {
+        const size_t at = (size_t) b * S * stride * e;
+        if (int rc = attention(c, (const char*) q + at, S, stride, (const char*) k + at, (const char*) v + at, S, stride, dt, H, H, D,
+                               (char*) out + (size_t) b * S * H * D * eo, out_dt, 0, 0)) return rc;
+    }
+    return 0;
+}
+
+int nsd_conv1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K, const float* bias, int64_t stride,
+               int64_t dil, int64_t pad, float* out, int64_t Lo) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    if (B <= 0 || Lo <= 0) return 0;
+    const int64_t CK = Ci * K;
+    const int64_t Lt = std::max<int64_t>(1, std::min<int64_t>(Lo, CONV_SCRATCH / std::max<int64_t>(CK, 1)));
+    float* col = (float*) scratch(c, 2, (size_t) CK * Lt * 4);
+    if (!col) return fail("nsd_conv1d: the unfolding did not fit in memory");
+    for (int64_t b = 0; b < B; ++b) {
+        const float* xb = x + b * Ci * L;
+        float* ob = out + b * Co * Lo;
+        for (int64_t t0 = 0; t0 < Lo; t0 += Lt) {
+            const int64_t lt = std::min(Lt, Lo - t0), n = CK * lt;
+            unfold1d_k<<<nb(n), 256, 0, c->s>>>(xb, Ci, L, K, stride, dil, pad, t0, lt, col, n);
+            LAUNCHED("conv1d unfold");
+            // column-major: out' (lt x Co, ld Lo) = col' (lt x CK) w' (CK x Co)
+            if (int rc = sgemm(c, CUBLAS_OP_N, CUBLAS_OP_N, lt, Co, CK, col, lt, w, CK, ob + t0, Lo)) return rc;
+            if (bias) { bias1d_k<<<nb(Co * lt), 256, 0, c->s>>>(ob, bias, Lo, t0, lt, Co * lt); LAUNCHED("conv1d bias"); }
+        }
+    }
+    return 0;
+}
+
+int nsd_conv_transpose1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K, const float* bias,
+                         int64_t stride, int64_t pad, float* out, int64_t Lo) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    if (B <= 0 || Lo <= 0) return 0;
+    const int64_t Cot = std::max<int64_t>(1, std::min<int64_t>(Co, CONV_SCRATCH / std::max<int64_t>(K * L, 1)));
+    float* col = (float*) scratch(c, 2, (size_t) Cot * K * L * 4);
+    if (!col) return fail("nsd_conv_transpose1d: the scratch did not fit in memory");
+    for (int64_t b = 0; b < B; ++b) {
+        const float* xb = x + b * Ci * L;
+        float* ob = out + b * Co * Lo;
+        for (int64_t co0 = 0; co0 < Co; co0 += Cot) {
+            const int64_t ct = std::min(Cot, Co - co0);
+            // column-major: col' (L x ct K) = x' (L x Ci) w'^T (w [Ci, Co K] row-major, the tile's columns)
+            if (int rc = sgemm(c, CUBLAS_OP_N, CUBLAS_OP_T, L, ct * K, Ci, xb, L, w + co0 * K, Co * K, col, L)) return rc;
+            gather1d_k<<<nb(ct * Lo), 256, 0, c->s>>>(col, L, K, stride, pad, bias, co0, Lo, ob, ct * Lo);
+            LAUNCHED("conv_transpose1d gather");
+        }
+    }
+    return 0;
+}
+
+int nsd_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* alpha, float* out) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    const int64_t n = B * C * L;
+    if (n > 0) { snake1d_k<<<nb(n), 256, 0, c->s>>>(x, C, L, alpha, out, n); LAUNCHED("snake"); }
+    return 0;
+}
+
+int nsd_scale(void* ctx, float* x, int64_t n, float s) {
+    auto* c = (Ctx*) ctx;
+    CU(cudaSetDevice(c->dev));
+    if (n > 0) { scale_k<<<nb(n), 256, 0, c->s>>>(x, n, s); LAUNCHED("scale"); }
+    return 0;
+}

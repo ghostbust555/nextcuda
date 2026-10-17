@@ -115,6 +115,25 @@ int nsd_conv2d(void* ctx, const void* x, int dt, int64_t N, int64_t H, int64_t W
 int nsd_conv3d_ex(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co,
                   int64_t kt, int64_t kh, int64_t kw, int64_t st, int64_t sh, int64_t sw, const float* bias, void* out);
 
+/* Attention without a mask: out = softmax(q . k^T / sqrt(D)) . v, per head. q, k, v: S token rows of H heads x D, row s
+ * at element s * stride, in dt; out [S, H * D] in out_dt. attention_batch: B independent sequences of S tokens, sequence
+ * b's rows from row b * S of q, k, v and out. (nextsycl's; here the blocked cuBLAS attention above.) */
+int nsd_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                  int64_t stride, void* out, int out_dt);
+int nsd_attention_batch(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t B, int64_t S, int64_t H,
+                        int64_t D, int64_t stride, void* out, int out_dt);
+/* The audio decoders' 1-D operations, float32, signals [B, C, L] row-major (an unfolding and one cuBLAS GEMM a tile,
+ * float32 without TF32).
+ * conv1d: w [Co, Ci, K], zero padding `pad` both sides; out [B, Co, Lo], Lo = (L + 2 pad - dil (K - 1) - 1) / stride + 1.
+ * conv_transpose1d: w [Ci, Co, K]; out [B, Co, Lo], Lo = (L - 1) stride - 2 pad + K.
+ * snake: x + sin^2(alpha x) / alpha per channel (alpha [C]); scale: x *= s over n values. */
+int nsd_conv1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+               const float* bias, int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo);
+int nsd_conv_transpose1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+                         const float* bias, int64_t stride, int64_t pad, float* out, int64_t Lo);
+int nsd_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* alpha, float* out);
+int nsd_scale(void* ctx, float* x, int64_t n, float s);
+
 #ifdef __cplusplus
 }
 #endif
