@@ -85,6 +85,14 @@ pub const METHODS: &[Method] = &[
                        ("unload", "boolean", "true: unload the loaded models not answering now (frees the cards)", false)],
              example: r#"{"on": true, "message": "kernel work", "eta_s": 3600, "unload": true}"# },
 
+    Method { kind: "system", name: "drives", summary: "The drives the models are on: device, PCIe link, mount, size, free space, the models' bytes, the read speed as measured (and when); each model's bytes by drive, whether it streams its weights from the disk while it serves, and for each other drive what a move needs or why it cannot move now; the move under way (or the last)",
+             fields: &[], example: "{}" },
+    Method { kind: "system", name: "drive.measure", summary: "Measure a drive's read speed in the background (up to 4 GiB of its largest model files read with O_DIRECT, past the page cache; nothing written), kept with its date (system.drives). Refused while a model loads from it or a move uses it",
+             fields: &[("drive", "string", "the drive's id (nvme1n1) or its mount point (system.drives)", true)], example: r#"{"drive": "nvme1n1"}"# },
+    Method { kind: "system", name: "move", summary: "Move a model's files to another drive, as a job (its progress in system.drives' move): each file copied and read back (size, SHA-256), then the registry repointed, then the old files removed - those another model names stay. Refused while the model is loaded or loading (stop it first), another move runs, or the drive lacks the room (plus 1%, at least 4 GiB); nothing loads the model while it moves",
+             fields: &[MODEL, ("drive", "string", "the drive's id (nvme1n1) or its mount point (system.drives)", true)], example: r#"{"model": "olmocr-2-7b-q8", "drive": "nvme1n1"}"# },
+    Method { kind: "system", name: "move.cancel", summary: "Stop the move under way: what it copied is removed and the registry stays as it was (once the registry is repointed it finishes)",
+             fields: &[], example: "{}" },
     Method { kind: "llm", name: "chat", summary: "A chat completion (OpenAI's body; stream is ignored - use /v1/chat/completions to stream)",
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
                        ("max_tokens", "integer", "", false), ("temperature", "number", "", false), ("tools", "object[]", "OpenAI tool definitions", false),
@@ -161,15 +169,16 @@ pub const METHODS: &[Method] = &[
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
                        QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
-    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
-             fields: &[MODEL_OPT, ("input", "string", "the text to say", true),
+    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2, Breeze TTS 2); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
+             fields: &[MODEL_OPT, ("input", "string", "the text to say (Breeze TTS 2: vocal events inline - English (laugh) (sigh) (cough) (clears throat), Chinese [笑] [叹气] [咳嗽] [清嗓子])", true),
                        ("voice", "string", "a built-in voice (qwen3-tts-custom: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan; audio.info lists them) or a saved one (audio.voices.list: spoken by a model that clones). Checked when submitted, the model loaded or not: an unknown name is a 400 at once (the message lists the voices)", false),
                        ("language", "string", "english, chinese, japanese ... or auto (default). Checked when submitted against the model's list (Qwen3-TTS: chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian); VoxCPM2 has no list and takes any", false),
-                       ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
+                       ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign, Breeze TTS 2: write it in the language of the text); with a cloned voice (ref_audio or a saved voice) the direction of its tone, emotion, pace (Breeze TTS 2: voice direction - picked for you when model is not given)", false),
                        ("ref_audio", "string", "a recording of the voice to clone: WAV as base64 or a data: URL, or upload:<name> (audio.upload, any format it takes) - the Base model", false),
-                       ("ref_text", "string", "what the recording says: the closer, in-context clone", false),
+                       ("ref_text", "string", "what the recording says: the closer, in-context clone (Breeze TTS 2: required, the exact transcript)", false),
                        ("continue_from", r#"{"type": "string", "maxLength": 200}"#, "carry on from speech made here (a book in chunks): the file name (or url) of the chunk before; its last sentences (up to 15 s, cut at a pause) are the in-context reference, after the saved voice's sample when voice names one - pace and voice go on, anchored to the voice. Needs a model that clones (picked for you when model is not given); a built-in voice name is dropped", false),
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
+                       ("cfg", "number", "guidance with instructions (Breeze TTS 2: 4 by default for design and direction; 1 turns it off)", false),
                        ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
@@ -214,6 +223,58 @@ pub const METHODS: &[Method] = &[
              fields: &JOB_ID, example: r#"{"label": "theme-3"}"# },
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
+    Method { kind: "model3d", name: "generate", summary: "A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures; the answer links the GLB. A job like image.generate (wait, reentrant_id, status, cancel)",
+             fields: &[MODEL_OPT, ("image", "string", "the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (model3d.upload); a transparent background is the object's outline, an opaque one is cut out (remove_background)", false),
+                       ("images", r#"{"type": "array", "maxItems": 8, "items": {"oneOf": [{"type": "string"}, {"type": "object", "properties": {"image": {"type": "string"}, "side": {"type": "string", "description": "front, back, left, right, top, bottom, or an azimuth in degrees"}}}]}}"#, "several views of the object (a multi-view model: model3d.info's abilities.views); each a picture or {image, side}", false),
+                       ("texture", "boolean", "PBR textures too (base colour, metallic-roughness); default: what the model does (model3d.info)", false),
+                       ("seed", "integer", "", false), ("steps", "integer", "denoising steps of each stage", false), ("cfg", "number", "guidance", false),
+                       ("resolution", "integer", "the shape's grid / octree resolution: detail against time and memory", false),
+                       ("faces", "integer", "at most this many triangles (decimated to it)", false), ("texture_size", "integer", "the texture's side in texels", false),
+                       ("remove_background", r#"{"type": "boolean", "default": true}"#, "cut the background out of an opaque picture", false),
+                       ("options", "object", "the engine's own (model3d.info lists them)", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "trellis2", "image": "data:image/png;base64,iVBORw0...", "texture": true, "seed": 42, "wait": false, "reentrant_id": "chair-1"}"# },
+    Method { kind: "model3d", name: "rig", summary: "A mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by words (AnimateAnyMesh: prompt); the answer links the rigged or animated GLB. A job like model3d.generate",
+             fields: &[MODEL_OPT, ("mesh", "string", "the mesh: GLB or OBJ as base64, a data: URL or upload:<name> (model3d.upload)", false),
+                       ("file", "string", "or a GLB made here (model3d.generate's file name or url)", false),
+                       ("prompt", "string", "an animating model: the motion, in words (\"a dragon flapping its wings\")", false),
+                       ("frames", "integer", "an animating model: frames to make", false), ("fps", "number", "", false),
+                       ("seed", "integer", "", false), ("steps", "integer", "", false), ("cfg", "number", "", false), ("options", "object", "the engine's own", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit (as model3d.generate)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends; false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "unirig", "file": "1792132541-trellis2-42.glb"}"# },
+    Method { kind: "model3d", name: "tool", summary: "The CPU mesh tools, here (no GPU, no model): decimate (to a triangle budget), remesh (even triangles), uv (a fresh atlas, the texture or colours baked across), convert; the result is saved beside the meshes made (model3d.history) and linked",
+             fields: &[("op", r#"{"type": "string", "enum": ["decimate", "remesh", "uv", "convert"]}"#, "", true),
+                       ("mesh", "string", "the mesh: GLB or OBJ as base64, a data: URL or upload:<name>", false), ("file", "string", "or a GLB made here", false),
+                       ("faces", "integer", "decimate: at most this many triangles", false), ("edge", "number", "remesh: the edge length (default: the mesh's mean)", false),
+                       ("passes", "integer", "remesh: passes (5)", false), ("size", "integer", "uv: the texture's side (2048)", false)],
+             example: r#"{"op": "decimate", "file": "1792132541-trellis2-42.glb", "faces": 20000}"# },
+    Method { kind: "model3d", name: "info", summary: "The model's abilities (generate, texture, views, rig, animate), defaults and options (loaded: from the server)", fields: &[MODEL_OPT], example: "{}" },
+    Method { kind: "model3d", name: "progress", summary: "The request running: its phase (image, structure, shape, texture, decode, mesh, bake, skeleton, skin, motion) and how far", fields: &[], example: "{}" },
+    Method { kind: "model3d", name: "history", summary: "The meshes made, newest first, with their settings and pictures", fields: &[], example: "{}" },
+    Method { kind: "model3d", name: "status", summary: "One job (model3d.generate / model3d.rig) by its label or reentrant_id: state, stage and what it waits for, its place in the queue, progress, its GLB when done",
+             fields: &JOB_ID, example: r#"{"label": "chair-1"}"# },
+    Method { kind: "model3d", name: "jobs", summary: "The 3D jobs: running, waiting (in run order) and the last ended, each as model3d.status answers it",
+             fields: &[("limit", r#"{"type": "integer", "minimum": 0, "maximum": 200, "default": 20}"#, "ended jobs listed", false), ("project", "string", "only this project's", false)], example: r#"{"limit": 5}"# },
+    Method { kind: "model3d", name: "queue.list", summary: "The waiting 3D jobs in run order (held ones too: held, waiting_for)", fields: &[], example: "{}" },
+    Method { kind: "model3d", name: "queue.move", summary: "Move a waiting job to a place in the queue (1 = made next)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("position", r#"{"type": "integer", "minimum": 1, "default": 1}"#, "", false),
+                       ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9}"#, "give it this priority too (where later jobs go)", false)], example: r#"{"label": "chair-2", "position": 1}"# },
+    Method { kind: "model3d", name: "queue.pause", summary: "Hold a waiting job (label or reentrant_id), a project or batch (also the ones submitted later), or (none) the whole 3D queue; running jobs go on",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: r#"{"project": "Props"}"# },
+    Method { kind: "model3d", name: "queue.resume", summary: "Release what queue.pause held (none: everything)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
+    Method { kind: "model3d", name: "upload", summary: "Keep a picture (PNG, JPEG, WebP) or a mesh (GLB, OBJ) here once: model3d.generate's image / images and model3d.rig's mesh then name it as \"upload:<name>\". Kept until system.files.delete {kind: model3d, name}",
+             fields: &[("name", "string", "the file's name: png jpg jpeg webp glb obj; kept as up_<unix seconds>_<name>", true), ("data", "string", "base64 (a data: URL too)", true)],
+             example: r#"{"name": "chair.png", "data": "iVBORw0KGgo..."}"# },
+    Method { kind: "model3d", name: "cancel", summary: "Stop a job by its label or reentrant_id (running: between steps; waiting: at once; ended: ok with already_ended); neither: whatever the 3D servers are making",
+             fields: &JOB_ID, example: r#"{"label": "chair-1"}"# },
+    Method { kind: "model3d", name: "describePromptGuideMD", summary: "How to get good meshes from the model, as Markdown", fields: &[MODEL], example: r#"{"model": "trellis2"}"# },
     Method { kind: "video", name: "generate", summary: "Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)",
              fields: &[("prompt", "string", "read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules", true),
                        ("seconds", r#"{"type": "number", "minimum": 1, "maximum": 15.1, "default": 10}"#, "length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. The answer's frames and seconds say what is made", false),
@@ -326,12 +387,24 @@ const IMAGE_CANVASES: &[(u32, u32, &str, &str)] = &[
     (512, 512, "1:1", "a quick draft"),
 ];
 
+/// The methods nextsycl answers that are declared here (their fields, answers and errors as nextsycl's, in the spec)
+/// but not ported to CUDA yet: why, for the caller (501 not_implemented, not retryable). A method leaves this list
+/// when its port lands; system.version names only the kinds that are on, so a client sees none of them there.
+fn not_ported(m: &Method) -> Option<&'static str> {
+    match (m.kind, m.name) {
+        ("model3d", _) => Some("3D models are not ported to CUDA yet (nextsycl runs them; docs/PHASES.md)"),
+        ("system", "drives" | "drive.measure" | "move" | "move.cancel") => Some("the drives and moving a model's files are not ported yet (docs/PHASES.md)"),
+        _ => None,
+    }
+}
+
 pub(crate) fn code_of(status: u16) -> &'static str {
     match status {
         400 => "invalid_params",
         401 => "unauthorized",
         404 => "not_found",
         499 => "cancelled",
+        501 => "not_implemented",
         409 => "conflict",
         502 => "unavailable",
         503 => "no_room",
@@ -490,7 +563,11 @@ impl Home {
             return self.pick("audio", b, all);
         }
         let voice = s(b, "voice");
-        let need = if !s(b, "ref_audio").is_empty() || !s(b, "continue_from").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some()) {
+        let cloned = !s(b, "ref_audio").is_empty() || !s(b, "continue_from").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some());
+        // a clone with an instruction: a model that directs a cloned voice (Breeze TTS 2)
+        let need = if cloned && !s(b, "instructions").is_empty() {
+            "direction"
+        } else if cloned {
             "clone"
         } else if !voice.is_empty() {
             "voices"
@@ -499,14 +576,18 @@ impl Home {
         } else {
             ""
         };
+        // a saved voice without its transcript: not a model that clones only with one
+        let untold = !voice.is_empty() && self.voices().get(&voice).is_some_and(|v| v["text"].as_str().is_none_or(|t| t.trim().is_empty()));
         let can: Vec<String> = all.iter()
             .filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
             .filter(|m| m["speech"].as_array().is_some_and(|a| need.is_empty() || a.iter().any(|x| x == need)))
+            .filter(|m| !(untold && needs_text(all, &m["id"])))
             .map(|m| s(m, "id")).collect();
         let loaded = self.loaded_of("audio");
         loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
             (409, match need {
                 "clone" => "no enabled speech model clones a voice (system.enable qwen3-tts-base)".to_string(),
+                "direction" => "no enabled speech model directs a cloned voice by instructions (system.enable breeze-tts-2)".to_string(),
                 "design" => "no enabled speech model designs a voice (system.enable qwen3-tts-design)".to_string(),
                 "voices" => "no enabled speech model has built-in voices (system.enable qwen3-tts-custom)".to_string(),
                 _ => "no speech model is enabled (system.enable qwen3-tts-custom ...)".to_string(),
@@ -557,6 +638,9 @@ impl Home {
             if *req && b.get(*f).is_none_or(Value::is_null) {
                 return Err((400, format!("{name} needs \"{f}\"")));
             }
+        }
+        if let Some(why) = not_ported(m) {
+            return Err((501, format!("{name}: {why}")));
         }
         if !self.kinds_on(all).contains(&m.kind) {
             return Err((409, format!("no {} model is enabled (system.enable)", m.kind)));
@@ -875,6 +959,9 @@ impl Home {
                     v["sample"] = json!(format!("http://nextcuda/v1/audio/voices/{name}.wav"));
                     // ready: its sample is there and reads, and an enabled model can speak it now
                     let reads = lib.sample_path(&name).is_some_and(|f| nextcuda_audio::wav_info(&f).is_ok_and(|(_, secs)| secs > 0.0));
+                    // a voice that does not say what its sample says: not the models that clone only with the transcript
+                    let said = v["text"].as_str().is_some_and(|t| !t.trim().is_empty());
+                    let speakers: Vec<Value> = speakers.iter().filter(|id| said || !needs_text(&all, id)).cloned().collect();
                     v["ready"] = json!(reads && !speakers.is_empty());
                     v["models"] = json!(speakers);
                     if !reads {
@@ -1352,9 +1439,30 @@ impl Home {
     }
 }
 
+/// Whether a speech model clones only with what the recording says (its card's `speech` lists `transcript`)
+pub(super) fn needs_text(all: &[Value], id: &Value) -> bool {
+    all.iter().find(|m| &m["id"] == id).is_some_and(|m| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "transcript")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{code_of, rpc_error};
+    use super::{code_of, not_ported, rpc_error, METHODS};
+
+    #[test]
+    fn nextsycls_methods_are_all_declared_and_the_unported_ones_say_so() {
+        let has = |n: &str| METHODS.iter().any(|m| format!("{}.{}", m.kind, m.name) == n);
+        for n in ["model3d.generate", "model3d.rig", "model3d.tool", "model3d.upload", "model3d.describePromptGuideMD", "system.drives",
+                  "system.drive.measure", "system.move", "system.move.cancel", "audio.speak"] {
+            assert!(has(n), "{n} is declared");
+        }
+        let m = |k: &str, n: &str| METHODS.iter().find(|m| m.kind == k && m.name == n).unwrap();
+        assert!(not_ported(m("model3d", "generate")).is_some() && not_ported(m("system", "move")).is_some());
+        assert!(not_ported(m("audio", "speak")).is_none() && not_ported(m("system", "busy")).is_none());
+        assert_eq!(code_of(501), "not_implemented");
+        assert_eq!(rpc_error("model3d.generate", 501, None, "x")["retryable"], false);
+        // Breeze TTS 2's fields are in audio.speak's contract
+        assert!(m("audio", "speak").fields.iter().any(|f| f.0 == "cfg"));
+    }
 
     #[test]
     fn an_rpc_error_says_everything_in_its_body() {

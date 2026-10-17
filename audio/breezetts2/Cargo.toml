@@ -1,0 +1,10 @@
+[package]
+name = "nextcuda-audio-breezetts2"
+description = "Breeze TTS 2 (a CSM fork, 24 kHz): the registry entry, files and options as nextsycl's; the engine not ported to CUDA yet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-audio.workspace = true

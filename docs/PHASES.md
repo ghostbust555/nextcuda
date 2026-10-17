@@ -80,3 +80,21 @@ the tokens of the 768 picture here: the 5070 has room for roughly 3x. Where it g
 Bring in how nextsycl runs engines without Python (the `engine` crates, `nextcuda-sys` over `dist/libnextcuda-<kind>.so`
 built from CUDA kernels), one engine at a time behind the same contracts; the python worker for an engine goes when
 its Rust one passes the same checks.
+
+## nextsycl's contracts, declared ahead of their engines (2026-10-17)
+
+Every API contract nextsycl has is in place here, so a client sees one API on both boxes. A method or engine whose
+port has not landed answers with what it would take and does, and refuses the call with a reason:
+
+- **Speech engines:** `audio/qwen3tts`, `audio/voxcpm2`, `audio/breezetts2` (`nextcuda audio engines`) carry nextsycl's
+  registry entries, file roles, options and abilities (`speech()`), and their cards are in `model-cards/audio/`.
+  Loading says "not ported to CUDA yet". The audio contract has nextsycl's `direction` and `events` (Breeze TTS 2's
+  voice direction and vocal events), and `audio.speak` its Breeze fields and checks: `cfg`, a clone with instructions
+  going to a model that directs, a transcript for a model that clones only with one.
+- **3D:** `model3d/contract` and `crates/mesh` (GLB / OBJ and the CPU mesh tools) as nextsycl's. The `model3d.*`
+  methods are in the spec with their fields, answers and errors, and answer 501 `not_implemented`.
+- **Drives:** `system.drives`, `system.drive.measure`, `system.move` and `system.move.cancel` likewise: declared, 501.
+- `system.version` lists the methods of the kinds that are on, so none of these show there until they work.
+
+Next: the speech engines in Rust + CUDA (no Python), Breeze TTS 2 and Qwen3-TTS first; they share the 12 Hz codec
+(nextsycl's `crates/codec12hz`).

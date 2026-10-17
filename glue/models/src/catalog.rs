@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 
 /// The kinds of model, in the order `search` lists them
-pub const KINDS: &[&str] = &["llm", "image", "video", "audio", "lora"];
+pub const KINDS: &[&str] = &["llm", "image", "video", "audio", "model3d", "lora"];
 
 /// The catalog: its files by key, its models (each card as JSON, its files as role -> key)
 pub struct Catalog {
@@ -388,7 +388,7 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
         "files": files, "gpus": m.get("gpus").cloned().unwrap_or(json!("0")), "env": env, "enabled": true,
         "catalog": m["id"],
     });
-    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "silo", "vram_gib", "headroom_gib"] {
+    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "does", "silo", "vram_gib", "headroom_gib", "streams"] {
         if let Some(v) = m.get(k) {
             e[k] = v.clone();
         }
@@ -490,10 +490,12 @@ mod tests {
     }
 
     #[test]
-    fn a_guide_falls_back_to_its_architecture() {
+    fn a_guide_falls_back_to_its_architecture_then_its_kind() {
         let cat = repo_cards();
-        let g = cat.guide(&json!({"id": "mine", "kind": "image", "arch": "qwen-image-2.1"})).unwrap();
-        assert_eq!(g, std::fs::read_to_string(cat.dir.join("guides/qwen-image-2.1.md")).unwrap());
+        let tts = cat.guide(&json!({"id": "mine", "kind": "audio", "arch": "qwen3-tts"})).unwrap();
+        assert_eq!(tts, std::fs::read_to_string(cat.dir.join("guides/qwen3-tts.md")).unwrap());
+        let chat = cat.guide(&json!({"id": "mine", "kind": "llm", "arch": "new"})).unwrap();
+        assert_eq!(chat, std::fs::read_to_string(cat.dir.join("guides/chat.md")).unwrap());
     }
 
     #[test]

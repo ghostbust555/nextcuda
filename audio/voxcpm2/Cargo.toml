@@ -1,0 +1,10 @@
+[package]
+name = "nextcuda-audio-voxcpm2"
+description = "VoxCPM2 (2B, 48 kHz): the registry entry, files and options as nextsycl's; the engine not ported to CUDA yet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-audio.workspace = true

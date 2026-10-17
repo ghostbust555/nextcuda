@@ -1,0 +1,10 @@
+[package]
+name = "nextcuda-audio-qwen3tts"
+description = "Qwen3-TTS (12 Hz, 1.7B): the registry entry, files and options as nextsycl's; the engine not ported to CUDA yet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-audio.workspace = true

@@ -177,6 +177,7 @@ impl Home {
         let m = all.iter().find(|x| x["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
         let can = |c: &str| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == c));
         number(b, "seconds", 0.5, 600.0)?;
+        number(b, "cfg", 0.0, 30.0)?;
         let saved = |v: &str| self.voices().get(v).is_some();
         let carried = s(b, "continue_from");
         if !carried.is_empty() {
@@ -211,6 +212,15 @@ impl Home {
         }
         if !voice.is_empty() && saved(&voice) && !can("clone") {
             return Err(bad(format!("voice {voice} is a saved voice: speak it with a model that clones (qwen3-tts-base, voxcpm2)")));
+        }
+        // a model that clones only with the transcript: a saved voice must have one, a recording its ref_text
+        if can("transcript") {
+            if !voice.is_empty() && carried.is_empty() && self.voices().get(&voice).is_some_and(|v| v["text"].as_str().is_none_or(|t| t.trim().is_empty())) {
+                return Err(bad(format!("voice {voice}: {id} clones only with what the sample says, and this voice has no transcript - add it again with text, or leave model out")));
+            }
+            if b["ref_audio"].as_str().is_some_and(|a| !a.is_empty()) && s(b, "ref_text").trim().is_empty() {
+                return Err(bad(format!("ref_text: {id} clones from a recording and its exact transcript")));
+            }
         }
         if let Some(a) = b["ref_audio"].as_str().filter(|a| !a.is_empty()) {
             if !can("clone") {

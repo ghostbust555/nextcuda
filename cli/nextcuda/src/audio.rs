@@ -25,7 +25,8 @@ nextcuda audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextcuda_audio::AudioKind> {
-    Vec::new() // nextcuda has no audio engine yet (docs/PHASES.md)
+    // nextsycl's speech engines, their entries in place; none runs on CUDA yet (loading says so: docs/PHASES.md)
+    vec![nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind(), nextcuda_audio_breezetts2::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {

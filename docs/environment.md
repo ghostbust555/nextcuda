@@ -83,6 +83,9 @@ Where the program, its libraries, its models and its sockets are.
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_API_TOKEN` | made once, kept in serve.json beside the registry | the front door API's bearer token; `audio voices design` uses it to call the front door | serve, cli (audio) |
+| `NEXTCUDA_HOME` | ~/nextcuda | where tooling/open-webui.sh finds serve.json (the front door's token) | tooling (open-webui.sh) |
+| `OWUI_PORT` | 3000 | the port tooling/open-webui.sh publishes Open WebUI on | tooling (open-webui.sh) |
+| `OWUI_IMAGE` | ghcr.io/open-webui/open-webui:main | the Open WebUI image tooling/open-webui.sh runs | tooling (open-webui.sh) |
 | `NS_AUDIO_PORT` | 8087 | the audio server's port, as the front door reaches it | serve |
 | `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
@@ -211,6 +214,33 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_NH_HOST` | auto | MoE layers (from the last back) whose experts the nemotronh engine keeps in pinned host memory on one GPU (default: as few as fit; the draft block's first) | llm nemotronh |
 | `NS_NH_PIPELINE` | 1 | 0: a prompt of several chunks over several GPUs chunk after chunk, not as a pipeline (each GPU on its own chunk at once) | llm nemotronh |
 | `NS_NH_PROFILE` | off | Debug: 1 waits for each kernel of the nemotronh engine and times it by name (the wall time it costs, launch overhead included; the waits slow the pass), the table printed after a run | llm nemotronh |
+| `NS_NH_BORROW` | 1 | 0: a long prompt does not borrow VRAM from the hot experts' tail for its passes (it then keeps only NS_NH_RESIDENT_ROWS a pass) | llm nemotronh |
+| `NS_NH_COPY_BATCH` | 1 | 0: a layer's staging copies one by one, not in one ns_stream_copy_batch (cudaMemcpyBatchAsync) when the core library has it | llm nemotronh |
+| `NS_NH_COPY_LANE` | 1 | 0: decode's staging copies on the GPU's stream rather than copy lane 1 (so the experts already in VRAM no longer multiply meanwhile) | llm nemotronh |
+| `NS_NH_CPU` | 1 (when the ggml CPU libraries are there) | 0: the CPU path for part of the pinned experts is not loaded (see NS_NH_CPU_FRAC) | llm nemotronh |
+| `NS_NH_CPU_FRAC` | 0 | part of each layer's pinned experts multiplied by the CPU (ggml-cpu) instead of copied to the card, 0 to 1; measured slower than the copies over gen4 x16, so off | llm nemotronh |
+| `NS_NH_CPU_THREADS` | the CPUs this process may use | threads of the CPU path (NS_NH_CPU_FRAC) | llm nemotronh |
+| `NS_NH_DENSE_GEMM_MIN` | 16 | rows from which a dense matrix's product goes through the tensor cores (dequantized to half, one GEMM) rather than the quantized product | llm nemotronh |
+| `NS_NH_DIRECT` | 1 | 0: expert reads from the file through the page cache instead of O_DIRECT | llm nemotronh |
+| `NS_NH_DYN_VRAM` | 0 | 1: decode's copies up go into the VRAM tier's slots (LRU) instead of a per-pass buffer (measured slower: off) | llm nemotronh |
+| `NS_NH_GEMM_MIN` | 12 | rows of one expert from which its product goes through the tensor cores rather than the quantized product | llm nemotronh |
+| `NS_NH_GGML_DIR` | beside the program | where the CPU path's libggml-base.so and libggml-cpu.so are | llm nemotronh |
+| `NS_NH_HOT` | 1 | 0: the expert profile (expert-profile.txt) is not used to fill VRAM and the pinned cache at load | llm nemotronh |
+| `NS_NH_IO_THREADS` | 24 | threads reading experts from the file (many reads in flight: an NVMe's speed) | llm nemotronh |
+| `NS_NH_KL` | off | nh --bench: FILE - the first run writes each decode step's top 256 log-probabilities and token there; later runs feed its tokens and print KL and top-1 agreement | llm nemotronh |
+| `NS_NH_OVERLAP` | 1 | 0: decode multiplies a layer's experts only after every missing one is read (on: the ones it has while the misses are read) | llm nemotronh |
+| `NS_NH_PINNED_GIB` | 14 (the card sets 22) | GiB of pinned host memory for the expert cache: the biggest speed knob (--opt-pinned-gib) | llm nemotronh |
+| `NS_NH_PREDICT` | 1 | 0: the next MoE layer's routing is not guessed from the residual stream (no reads ahead of the router) | llm nemotronh |
+| `NS_NH_PRED_AHEAD` | 1 | MoE layers guessed ahead (further guesses read wrong experts that push right ones out: measured slower) | llm nemotronh |
+| `NS_NH_PRED_K` | 22 | the top experts of a guess whose misses are read ahead | llm nemotronh |
+| `NS_NH_PRELOAD` | 1 | nh: 0 skips filling VRAM and the pinned cache from the expert profile at start | llm nemotronh |
+| `NS_NH_PRE_K` | 8 | copies toward VRAM for only the first this many of a guess's experts (by score): a wrong guess's copy costs the link's time | llm nemotronh |
+| `NS_NH_RESERVE_MIB` | 700 | MiB of VRAM kept free beside the weights (--opt-reserve-mib) | llm nemotronh |
+| `NS_NH_RESIDENT_ROWS` | 128 | prompt rows a pass keeps resident without borrowing (at most the chunk) | llm nemotronh |
+| `NS_NH_RING` | 1 | 0: small uploads written directly, not through the pinned ring (8 MiB) without a sync each | llm nemotronh |
+| `NS_NH_TAIL_SKIP` | 8 | decode drops a chosen expert ranked after the first this many whose bytes are where NS_NH_TAIL_TIER says (0: off; measured KL 0.0037) | llm nemotronh |
+| `NS_NH_TAIL_TIER` | pinned | what a dropped tail expert is: pinned (in neither VRAM nor pinned memory: a disk read) or vram (not in VRAM) | llm nemotronh |
+| `NS_NH_TRACE` | off | FILE: a line per MoE layer of each decode step appended there: the layer and the experts it chose (a trace for tuning the predictor) | llm nemotronh |
 | `NS_NH_MULTI_GROUPS` | 1024 | Debug: the work-groups of a MoE layer's experts in one launch (the nemotronh silo) | kernels:nemotronh silo |
 | `NS_PEAK_GBS` | 608 | Debug: memory bandwidth (GB/s) the NS_Q35_PROFILE tables show each kernel's share of | llm qwen35 |
 | `NS_PEAK_TF16` | 183 | Debug: f16 TFLOP/s peak the NS_Q35_PROFILE tables compare the f16 GEMMs with | llm qwen35 |
@@ -285,6 +315,10 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_Q3T_STREAMING` | clone 1, built-in and designed voices 0 | the per-request option streaming's name: the text fed a token a frame; a request's options only, the variable itself is not read (--opt-streaming) | audio qwen3tts |
 | `NS_Q3T_TEMPERATURE` | 0.9 | the per-request option temperature's name: the talker's sampling temperature; a request's options only, the variable itself is not read (--opt-temperature) | audio qwen3tts |
 | `NS_Q3T_TOP_K` | 50 | the per-request option top-k's name: the talker's top-k; a request's options only, the variable itself is not read (--opt-top-k) | audio qwen3tts |
+| `NS_BZ2_*` | - | every NS_BZ2_ setting in nextcuda.conf is passed to the audio server | cli (audio serve) |
+| `NS_BZ2_GREEDY` | 0 | the per-request option greedy's name: the most likely code, backbone and depth decoder (deterministic; may not end); a request's options only, the variable itself is not read (--opt-greedy) | audio breezetts2 |
+| `NS_BZ2_TEMPERATURE` | 0.9 | the per-request option temperature's name: the sampling temperature, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-temperature) | audio breezetts2 |
+| `NS_BZ2_TOP_K` | 50 | the per-request option top-k's name: the sampling top-k, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-top-k) | audio breezetts2 |
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
@@ -537,3 +571,4 @@ Read by `build.sh`, `kernels/build.sh`, `wfe/build.sh` and the scripts beside th
 | `HOME` | /tmp | the base of the default paths (~/.config/nextsycl.conf, the registry, the output and cache directories) | cli, serve, models |
 | `USER` | empty | whose processes `restart` looks for (pgrep -u) | serve |
 | `XDG_RUNTIME_DIR` | /tmp | the base of the socket directory (nextsycl/) and the front door's run logs (nextsycl-serve/) | cli, serve |
+

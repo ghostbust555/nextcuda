@@ -547,6 +547,9 @@ name = "nextcuda"
 version = "0.0.0"
 dependencies = [
  "nextcuda-audio",
+ "nextcuda-audio-breezetts2",
+ "nextcuda-audio-qwen3tts",
+ "nextcuda-audio-voxcpm2",
  "nextcuda-core",
  "nextcuda-gguf",
  "nextcuda-image",
@@ -566,6 +569,30 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-core",
  "symphonia",
+]
+
+[[package]]
+name = "nextcuda-audio-breezetts2"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-audio",
+ "nextcuda-core",
+]
+
+[[package]]
+name = "nextcuda-audio-qwen3tts"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-audio",
+ "nextcuda-core",
+]
+
+[[package]]
+name = "nextcuda-audio-voxcpm2"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-audio",
+ "nextcuda-core",
 ]
 
 [[package]]
@@ -630,6 +657,23 @@ dependencies = [
  "nextcuda-gguf",
  "nextcuda-llm",
  "nextcuda-tok",
+]
+
+[[package]]
+name = "nextcuda-mesh"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "png 0.17.16",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-model3d"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-mesh",
 ]
 
 [[package]]
