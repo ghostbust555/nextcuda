@@ -807,7 +807,7 @@ impl Home {
             ("system", "busy") => Ok(self.busy(&all)),
             ("system", "version") => {
                 let on = self.kinds_on(&all);
-                let methods: Vec<String> = METHODS.iter().filter(|m| on.contains(&m.kind)).map(|m| format!("{}.{}", m.kind, m.name)).collect();
+                let methods: Vec<String> = METHODS.iter().filter(|m| on.contains(&m.kind) && not_ported(m).is_none()).map(|m| format!("{}.{}", m.kind, m.name)).collect();
                 Ok(json!({"version": crate::VERSION, "api": API_VERSION, "kinds": on, "features": FEATURES, "methods": methods,
                           "maintenance": self.maintenance().map(|n| super::maint::public(&n))}))
             }
