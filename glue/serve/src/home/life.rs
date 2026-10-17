@@ -1000,7 +1000,17 @@ impl Home {
     /// `id` started in slot `x` on card `gpu`, answering
     fn start_at(&self, kind: &str, id: &str, x: &Slot, gpu: usize) -> Result<(), (u16, String)> {
         let secs = (self.o.idle_minutes * 60).to_string();
-        let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), x.port.to_string(),
+        // a model whose engine splits its stages over its cards (its card's split: true - MiniMax Music 3's language
+        // model on one, its flow stage on the other) gets them all, `gpu` first
+        let on = match self.entry(id) {
+            Ok(m) if m["split"] == true => {
+                let mut v = vec![gpu];
+                v.extend(self.gpus_of(&m).into_iter().filter(|g| *g != gpu));
+                v.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",")
+            }
+            _ => gpu.to_string(),
+        };
+        let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), on, "--port".into(), x.port.to_string(),
                             "--host".into(), self.o.serve_host.clone(), "--wfe".into(), "--slot".into(), x.slot.to_string()];
         if self.o.idle_minutes > 0 {
             args.extend(["--idle-exit".into(), secs]);

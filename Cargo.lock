@@ -548,6 +548,7 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-audio",
  "nextcuda-audio-breezetts2",
+ "nextcuda-audio-minimaxmusic3",
  "nextcuda-audio-qwen3tts",
  "nextcuda-audio-voxcpm2",
  "nextcuda-core",
@@ -577,6 +578,19 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-audio",
  "nextcuda-codec12hz",
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-tok",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-audio-minimaxmusic3"
+version = "0.0.0"
+dependencies = [
+ "fancy-regex",
+ "nextcuda-audio",
  "nextcuda-core",
  "nextcuda-diffusion",
  "nextcuda-gguf",

@@ -8,7 +8,7 @@ members = [
     "image/contract", "image/qwenimage21",
     "video/contract",
     "model3d/contract",
-    "audio/contract", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
+    "audio/contract", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
     "glue/models", "glue/serve",
     "cli/nextcuda",
 ]
@@ -34,6 +34,7 @@ nextcuda-image-qwenimage21 = { path = "image/qwenimage21" }
 nextcuda-video = { path = "video/contract" }
 nextcuda-model3d = { path = "model3d/contract" }
 nextcuda-audio = { path = "audio/contract" }
+nextcuda-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextcuda-audio-qwen3tts = { path = "audio/qwen3tts" }
 nextcuda-audio-voxcpm2 = { path = "audio/voxcpm2" }
 nextcuda-audio-breezetts2 = { path = "audio/breezetts2" }

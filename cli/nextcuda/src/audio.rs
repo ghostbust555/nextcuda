@@ -25,8 +25,7 @@ nextcuda audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextcuda_audio::AudioKind> {
-    // nextsycl's speech engines on CUDA; MiniMax Music 3 is not here yet
-    vec![nextcuda_audio_breezetts2::kind(), nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind()]
+    vec![nextcuda_audio_minimaxmusic3::kind(), nextcuda_audio_breezetts2::kind(), nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -45,7 +44,7 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
         } else if dir.join("speech_tokenizer").is_dir() {
             (nextcuda_audio_qwen3tts::ARCH, nextcuda_audio_qwen3tts::files_in(dir).map_err(|e| e.0)?)
         } else {
-            return Err(format!("{}: not a Breeze TTS 2, VoxCPM2 or Qwen3-TTS checkpoint", dir.display()));
+            (nextcuda_audio_minimaxmusic3::ARCH, nextcuda_audio_minimaxmusic3::files_in(dir).map_err(|e| e.0)?)
         };
         let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         return Ok((serde_json::json!({"id": id, "kind": "audio", "arch": arch, "env": {}}), files));
@@ -85,8 +84,21 @@ fn options(m: &Value, args: &[String]) -> Result<nextcuda_audio::LoadOptions, St
 }
 
 fn gpu(args: &[String]) -> Result<Arc<nextcuda_core::Gpu>, String> {
-    let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
-    nextcuda_core::Gpu::open(i).map_err(|e| e.0)
+    Ok(gpus(args)?.remove(0))
+}
+
+/// `--gpu 0` or `--gpu 0,1` (an engine that splits its stages over two cards takes the second too: MiniMax Music 3)
+fn gpus(args: &[String]) -> Result<Vec<Arc<nextcuda_core::Gpu>>, String> {
+    let list = opt(args, "--gpu").unwrap_or("0");
+    let mut v = Vec::new();
+    for i in list.split(',').filter(|x| !x.trim().is_empty()) {
+        let i: usize = i.trim().parse().map_err(|_| format!("--gpu {list}: card numbers, comma separated"))?;
+        v.push(nextcuda_core::Gpu::open(i).map_err(|e| e.0)?);
+    }
+    if v.is_empty() {
+        v.push(nextcuda_core::Gpu::open(0).map_err(|e| e.0)?);
+    }
+    Ok(v)
 }
 
 fn num<T: std::str::FromStr>(args: &[String], k: &str) -> Result<Option<T>, String> {
@@ -104,9 +116,9 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     let (m, files) = model(cfg, args)?;
     let ks = engines();
     let k = nextcuda_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
-    let g = gpu(args)?;
+    let gs = gpus(args)?;
     let mut log = |s: String| eprintln!("{s}");
-    let e = (k.load)(&files, &[g], &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    let e = (k.load)(&files, &gs, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
     let seed: u64 = num(args, "--seed")?.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos() as u64 % 100_000).unwrap_or(0)
     });
@@ -220,7 +232,12 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let (m, files) = model(cfg, args)?;
     let g = gpu(args)?;
     let mut log = |s: String| eprintln!("{s}");
-    let worst = if m["arch"] == nextcuda_audio_breezetts2::ARCH {
+    let worst = if m["arch"] == nextcuda_audio_minimaxmusic3::ARCH {
+        let gs = gpus(args)?;
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
+        let e = nextcuda_audio_minimaxmusic3::MiniMaxMusic3::load_on(&files, &gs[0], gs.get(1), &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextcuda_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextcuda_audio_breezetts2::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
         let e = nextcuda_audio_breezetts2::BreezeTts2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextcuda_audio_breezetts2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
@@ -233,7 +250,8 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let e = nextcuda_audio_voxcpm2::VoxCpm2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextcuda_audio_voxcpm2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {} and {}", nextcuda_audio_breezetts2::ARCH, nextcuda_audio_qwen3tts::ARCH, nextcuda_audio_voxcpm2::ARCH));
+        return Err(format!("check knows {}, {}, {} and {}", nextcuda_audio_minimaxmusic3::ARCH, nextcuda_audio_breezetts2::ARCH, nextcuda_audio_qwen3tts::ARCH,
+                           nextcuda_audio_voxcpm2::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
@@ -351,9 +369,10 @@ fn serve_here(m: &Value, files: ModelFiles, args: &[String], out: PathBuf, cfg: 
     nextcuda_core::use_kind("audio");
     let ks = engines();
     let k = nextcuda_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
-    let g = gpu(args)?;
+    let gs = gpus(args)?;
+    let g = gs[0].clone();
     let mut log = |s: String| eprintln!("{s}");
-    let e = (k.load)(&files, std::slice::from_ref(&g), &options(m, args)?, &mut log).map_err(|e| e.0)?;
+    let e = (k.load)(&files, &gs, &options(m, args)?, &mut log).map_err(|e| e.0)?;
     let wfe = args.iter().any(|a| a == "--wfe").then(|| cfg.dist.join("wfe"));
     let cors: Vec<String> = opt(args, "--cors").map(str::to_string).or(cfg.get("NS_CORS")).map(|c| c.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
