@@ -6,7 +6,7 @@ members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl", "crates/mesh", "crates/codec12hz", "crates/remover",
     "llm/contract", "llm/nemotronh",
     "image/contract", "image/qwenimage21", "image/paddleocrvl", "image/unlimitedocr", "image/olmocr2",
-    "video/contract",
+    "video/contract", "video/h3",
     "model3d/contract", "model3d/trellis2", "model3d/hunyuan3d", "model3d/unirig", "model3d/rignet", "model3d/animateanymesh",
     "audio/contract", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
     "glue/models", "glue/serve",
@@ -36,6 +36,7 @@ nextcuda-image-paddleocrvl = { path = "image/paddleocrvl" }
 nextcuda-image-unlimitedocr = { path = "image/unlimitedocr" }
 nextcuda-image-olmocr2 = { path = "image/olmocr2" }
 nextcuda-video = { path = "video/contract" }
+nextcuda-video-h3 = { path = "video/h3" }
 nextcuda-model3d = { path = "model3d/contract" }
 nextcuda-model3d-trellis2 = { path = "model3d/trellis2" }
 nextcuda-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }

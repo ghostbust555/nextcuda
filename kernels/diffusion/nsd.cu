@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace {
 
@@ -30,6 +32,16 @@ struct Ctx {
     size_t cap[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     // the normalized Hadamard matrix of each group size (16, 64, 256), half, on the card
     void* had[3] = {nullptr, nullptr, nullptr};
+    // a context of its own (nsd_open / nsd_open_gpu, H3's way in) rather than around an ns_gpu (nsd_create): its
+    // streams are its own (s for the kernels, cq for nsd_upload's copies), and what nsd_alloc / nsd_alloc_host gave
+    // out is counted against `mem_cap` and freed with the context (nsd_mem.inc)
+    bool owned = false;
+    cudaStream_t cq = nullptr;
+    std::mutex mu;
+    std::unordered_map<void*, size_t> allocs;   // device, by pointer
+    std::unordered_map<void*, size_t> host;     // pinned host
+    size_t used = 0, mem_cap = 0;
+    char name[256] = {0};
 };
 
 int cuda_fail(cudaError_t e, const char* what) {
@@ -488,6 +500,13 @@ void nsd_destroy(void* ctx) {
     for (void* b : c->had) if (b) cudaFree(b);
     cublasLtDestroy(c->lt);
     cublasDestroy(c->cb);
+    // what nsd_alloc / nsd_alloc_host gave out goes with the context however it was made (nextsycl's); the kernel
+    // stream only when it is the context's own
+    if (c->cq) cudaStreamSynchronize(c->cq);
+    for (auto& a : c->allocs) cudaFree(a.first);
+    for (auto& a : c->host) cudaFreeHost(a.first);
+    if (c->cq) cudaStreamDestroy(c->cq);
+    if (c->owned) cudaStreamDestroy(c->s);
     delete c;
 }
 
@@ -927,3 +946,13 @@ int nsd_scale(void* ctx, float* x, int64_t n, float s) {
     if (n > 0) { scale_k<<<nb(n), 256, 0, c->s>>>(x, n, s); LAUNCHED("scale"); }
     return 0;
 }
+
+// ---- H3's interface (nextsycl's nsd.h from h3sycl.h): owned contexts and their memory (nsd_mem.inc), the video
+// decoders' and the latent upscaler's operations (nsd_video.inc). One translation unit with the rest: they use Ctx and
+// the helpers above. NSD_SKIP_MEM / NSD_SKIP_VIDEO leave one out (to compile the other alone).
+#ifndef NSD_SKIP_MEM
+#include "nsd_mem.inc"
+#endif
+#ifndef NSD_SKIP_VIDEO
+#include "nsd_video.inc"
+#endif

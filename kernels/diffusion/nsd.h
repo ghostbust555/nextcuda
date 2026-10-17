@@ -134,6 +134,81 @@ int nsd_conv_transpose1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64
 int nsd_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* alpha, float* out);
 int nsd_scale(void* ctx, float* x, int64_t n, float s);
 
+/* ==== BEGIN nsd_mem.inc: H3's contexts and device memory (nextsycl's nsd.h "context" / "device memory") ==== */
+
+/* A context on GPU 0 with its own stream (owned: nsd_destroy frees its streams and everything nsd_alloc /
+ * nsd_alloc_host gave out). */
+void* nsd_open(void);
+/* The GPUs CUDA sees, and an owned context on one of them. nsd_gpu_info fills the name, the memory size and the PCI
+ * address ("0000:0b:00.0", empty when unknown). */
+int nsd_gpu_count(void);
+int nsd_gpu_info(int index, char* name, int name_len, uint64_t* mem_bytes, char* pci, int pci_len);
+void* nsd_open_gpu(int index);
+const char* nsd_device_name(void* ctx);
+
+/* Allocations are counted, and one that would pass the cap (0.94 of the card; NSD_MEM_FRACTION overrides) is refused
+ * here, with an error. (The kernels' scratch buffers are not counted.) Thread-safe. */
+void* nsd_alloc(void* ctx, uint64_t bytes);
+void nsd_free(void* ctx, void* p);              /* waits for the stream (and the uploads) first */
+uint64_t nsd_mem_used(void* ctx);
+uint64_t nsd_mem_cap(void* ctx);
+/* What the whole card has free right now, every process counted (cudaMemGetInfo; 0 when it cannot tell). */
+uint64_t nsd_mem_free(void* ctx);
+
+/* Host <-> device copies, ordered after the stream's queued work; both wait for the copy (the host buffer may be
+ * released on return). Thread-safe. */
+int nsd_write(void* ctx, void* dst, const void* src_host, uint64_t bytes);
+int nsd_read(void* ctx, void* dst_host, const void* src, uint64_t bytes);
+/* Device to device, queued on the stream like a kernel (it does not wait). */
+int nsd_copy(void* ctx, void* dst, const void* src, uint64_t bytes);
+
+/* Pinned host memory, for uploads that overlap the kernels. Not counted against the device cap. nsd_free_host waits
+ * for the uploads first. */
+void* nsd_alloc_host(void* ctx, uint64_t bytes);
+void nsd_free_host(void* ctx, void* p);
+/* Pinned host -> device, queued on the context's copy stream beside the kernels (it does not wait): the kernels do
+ * not wait for it either, so call nsd_upload_wait before using dst. src must be nsd_alloc_host memory and dst device
+ * memory of this GPU; anything else is refused. */
+int nsd_upload(void* ctx, void* dst, const void* src_pinned, uint64_t bytes);
+int nsd_upload_wait(void* ctx);
+
+/* ==== END nsd_mem.inc ==== */
+
+/* ---- nsd_video.inc: nextsycl's video / upscaler / audio operations (H3's interface) -------------------------------
+ * scale_rows: x [M, C] *= s[row] in place (s float32 [M]).
+ * On channels-last volumes [T, H, W, C] in dt (16-bit in use; float32 also read, as nextsycl's load/store):
+ * conv3d: a k x k x k convolution (zero padding k / 2), w [Co, Ci, k, k, k] in dt, bias float32 [Co] or NULL;
+ *   out [T, H, W, Co] (an unfolding in tiles and cuBLAS, float32 accumulation).
+ * group_norm_silu: F frames of N voxels [F, N, C], G groups, statistics per frame and group; affine weight/bias
+ *   float32 [C], then * (1 + scale) + shift when scale/shift (float32 [C]) are given, then SiLU.
+ * temporal_dwconv: per channel along T, w float32 [C, K], zero padding K / 2, bias float32 [C] or NULL; x, out [T, P, C].
+ * trilinear: resize to [To, Ho, Wo, C], align_corners=False.
+ * pad3d: -> [T + front, H + top + bottom, W + left + right, C], zeros in front along T, the spatial border reflected.
+ * Frames [N, H, W, C] in dt:
+ * prelu: x = x > 0 ? x : alpha[c] x in place (x [M, C]).
+ * pixel_shuffle_add: out [N, H r, W r, C] = PixelShuffle(r) of x [N, H, W, C r r] + base [N, H, W, C] (nearest).
+ * resize_area: x [N, Hi, Wi, C] -> out float32 planar [C, N, Ho, Wo], area means clamped to [0, 1].
+ * aa_snake: BigVGAN's anti-aliased SnakeBeta over float32 [B, C, L] (12-tap up / down filters); out [B, C, L]. */
+int nsd_scale_rows(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* s);
+int nsd_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
+               const float* bias, void* out);
+int nsd_group_norm_silu(void* ctx, const void* x, int dt, int64_t F, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
+                        float eps, const float* scale, const float* shift, void* out);
+int nsd_temporal_dwconv(void* ctx, const void* x, int dt, int64_t T, int64_t P, int64_t C, const float* w, int64_t K,
+                        const float* bias, void* out);
+int nsd_trilinear(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t To, int64_t Ho, int64_t Wo,
+                  void* out);
+int nsd_pad3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t front, int64_t top, int64_t bottom,
+              int64_t left, int64_t right, void* out);
+int nsd_prelu(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* alpha);
+int nsd_pixel_shuffle_add(void* ctx, const void* x, int dt, int64_t N, int64_t H, int64_t W, int64_t C, int64_t r,
+                          const void* base, void* out);
+int nsd_resize_area(void* ctx, const void* x, int dt, int64_t N, int64_t Hi, int64_t Wi, int64_t C, int64_t Ho, int64_t Wo,
+                    float* out);
+int nsd_aa_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* log_alpha, const float* log_beta,
+                 const float* up, const float* down, float* out);
+/* ---- end nsd_video.inc ------------------------------------------------------------------------------------------- */
+
 #ifdef __cplusplus
 }
 #endif

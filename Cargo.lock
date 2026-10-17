@@ -885,6 +885,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextcuda-video-h3"
+version = "0.0.0"
+dependencies = [
+ "fancy-regex",
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-video",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
