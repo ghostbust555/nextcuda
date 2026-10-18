@@ -235,6 +235,44 @@ int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns) {
     return 0;
 }
 
+// Graphs: the work queued on the GPU's stream between ns_capture_begin and ns_capture_launch recorded (not run), then
+// launched as one graph - a thousand kernels one entry in the stream's queue, so the host never waits on a full queue
+// and queues the other GPU's work. Nothing between them may allocate or wait (the capture is the thread's own).
+int ns_capture_begin(ns_gpu* g) {
+    NS_CU(use(g));
+    NS_CU(cudaStreamBeginCapture(g->q, cudaStreamCaptureModeThreadLocal));
+    return 0;
+}
+
+int ns_capture_launch(ns_gpu* g) {
+    NS_CU(use(g));
+    cudaGraph_t graph = nullptr;
+    NS_CU(cudaStreamEndCapture(g->q, &graph));
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t e = cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraphDestroy(graph);
+    if (e != cudaSuccess) return ns_cuda(e, "cudaGraphInstantiate");
+    const cudaError_t l = cudaGraphLaunch(exec, g->q);
+    // (freed once it has run)
+    cudaGraphExecDestroy(exec);
+    if (l != cudaSuccess) return ns_cuda(l, "cudaGraphLaunch");
+    return 0;
+}
+
+// a capture that failed part way: ended, its work dropped (the stream usable again)
+int ns_capture_abort(ns_gpu* g) {
+    NS_CU(use(g));
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(g->q, &st);
+    if (st != cudaStreamCaptureStatusNone) {
+        cudaGraph_t graph = nullptr;
+        cudaStreamEndCapture(g->q, &graph);
+        if (graph) cudaGraphDestroy(graph);
+    }
+    cudaGetLastError();
+    return 0;
+}
+
 // the host waits for ticket t (a buffer the work before it read may be written again)
 int ns_ticket_wait(ns_gpu* g, int64_t t) {
     NS_CU(use(g));

@@ -46,6 +46,10 @@ int ns_copy_2d(ns_gpu* g, void* dst, size_t dpitch, const void* src, size_t spit
 int ns_mark(ns_gpu* g, int64_t* ticket);
 int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_await(ns_gpu* g, int64_t ticket);
+/* the work queued between begin and launch recorded, then launched as one graph (ns.cu); abort: a failed capture ended */
+int ns_capture_begin(ns_gpu* g);
+int ns_capture_launch(ns_gpu* g);
+int ns_capture_abort(ns_gpu* g);
 /* the host waits until the work before ticket is done */
 int ns_ticket_wait(ns_gpu* g, int64_t ticket);
 int ns_stream_copy_batch(ns_gpu* g, void* const* dsts, const void* const* srcs, const size_t* sizes, size_t n, const int64_t* after, int ndeps, int lane, int64_t* ticket);

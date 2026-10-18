@@ -389,6 +389,8 @@ pub struct Qwen35<'g> {
     kv_q8: bool,
     /// bytes of a head's row in them
     kv_row: usize,
+    /// over two GPUs: the two buffers on the last that pipelined chunks' rows cross into (`feed_pipelined`)
+    pipe: Vec<DevBuf>,
 }
 
 /// The kernels' times by (GPU, phase, kernel): seconds, calls, bytes, arithmetic
@@ -729,10 +731,15 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         let kv_row = kv_row_bytes(&g, kv_q8_setting());
+        let pipe = if devs.len() == 2 && head == 1 {
+            (0..2).map(|_| DevBuf::new(&devs[1].gpu, chunk * g.n_embd * 4)).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(None), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
                     load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
-                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8: kv_q8_setting(), kv_row,
+                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8: kv_q8_setting(), kv_row, pipe,
                     prof: ["NS_Q35_PROFILE", "NS_PROFILE"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1")).then(|| Mutex::new(Profile::default())) })
     }
 
@@ -1138,17 +1145,8 @@ impl<'g> Qwen35<'g> {
     /// `pass` with the work lock held: a verify pass (2 ..= drafts + 1 rows, drafts on) keeps the DeltaNet
     /// snapshots; with MTP the draft block runs over the rows behind it
     fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
-        let g = &self.g;
         let t = tokens.len();
-        if t == 0 {
-            return Err(e("an empty pass"));
-        }
-        if t > self.chunk {
-            return Err(e(format!("a pass of {t} rows; it takes {}", self.chunk)));
-        }
-        if s.pos + t > s.max_ctx {
-            return Err(e(format!("the context is full ({} of {})", s.pos + t, s.max_ctx)));
-        }
+        self.check_rows(s, s.pos, t)?;
         for d in &self.devs {
             d.arena.reset();
         }
@@ -1159,14 +1157,47 @@ impl<'g> Qwen35<'g> {
         let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
         snaps.of = None;
         self.phase("embed");
-        let mut x = self.embed_with(self.file, &self.embd, self.g.vocab, tokens)?;
+        let x = self.embed_with(self.file, &self.embd, self.g.vocab, tokens)?;
+        let x = self.run_layers(s, 0..self.g.layers, x, t, p0, &rope, snapping.then_some(&*snaps), &mut *tap)?;
+        if snapping {
+            snaps.of = Some((s.id, p0, t));
+        }
+        drop(snaps);
+        s.pos += t;
+        s.shift = shift_after;
+        s.last_rows = t;
+        self.finish(s, x, tokens, p0, &rope, n_out, tap)
+    }
+
+    /// A pass of t rows at p0 fits the chunk and the context
+    fn check_rows(&self, s: &Session, p0: usize, t: usize) -> Result<()> {
+        if t == 0 {
+            return Err(e("an empty pass"));
+        }
+        if t > self.chunk {
+            return Err(e(format!("a pass of {t} rows; it takes {}", self.chunk)));
+        }
+        if p0 + t > s.max_ctx {
+            return Err(e(format!("the context is full ({} of {})", p0 + t, s.max_ctx)));
+        }
+        Ok(())
+    }
+
+    /// Layers `range` over the rows x [t, n_embd] at p0 (on the current GPU, its arena from where it is; the rows
+    /// cross to the next GPU where its layers start): the rows after them. `snaps`: a verify pass's DeltaNet snapshots
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers(&self, s: &Session, range: std::ops::Range<usize>, mut x: DevBuf, t: usize, p0: usize, rope: &Rope, snaps: Option<&Snaps>,
+                  tap: Tap) -> Result<DevBuf> {
+        let g = &self.g;
         let mut h = self.arena().f32(t * g.n_embd)?;
         let mut ffn_g = self.arena().f32(t * g.n_ff)?;
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
         let mut ffn = self.arena().f32(t * g.n_embd)?;
-        let mut li = 0;
+        // the DeltaNet layers before the range (their snapshots' index)
+        let mut li = (0..range.start).filter(|l| !g.full(*l)).count();
         // the arena past this point is the layer's own, made again each layer
-        for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
+        for l in range {
+            let (ly, st) = (&self.layers[l], &s.layers[l]);
             // the next GPU's layers: the rows cross over, its own buffers for them
             if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
                 self.phase("GPU to GPU");
@@ -1180,9 +1211,9 @@ impl<'g> Qwen35<'g> {
             self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
             let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
-                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0, &rope)?,
+                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0, rope)?,
                 (LState::Linear { s: rs, conv }, _, Some(a)) => {
-                    let sn = snapping.then(|| (&snaps.layers[li].0, &snaps.layers[li].1));
+                    let sn = snaps.map(|sn| (&sn.layers[li].0, &sn.layers[li].1));
                     li += 1;
                     self.linear(a, rs, conv, &h, hq8.as_ref(), t, sn)?
                 }
@@ -1202,13 +1233,15 @@ impl<'g> Qwen35<'g> {
             tap(&format!("l_out-{l}"), &x)?;
             self.arena().rewind(mark);
         }
-        if snapping {
-            snaps.of = Some((s.id, p0, t));
-        }
-        drop(snaps);
-        s.pos += t;
-        s.shift = shift_after;
-        s.last_rows = t;
+        Ok(x)
+    }
+
+    /// A pass's end over its rows x after the last layer (the session's position already past them): the draft block
+    /// over them (MTP), the head's logits for the last n_out rows (0: no head, nothing read back)
+    #[allow(clippy::too_many_arguments)]
+    fn finish(&self, s: &Session, mut x: DevBuf, tokens: &[u32], p0: usize, rope: &Rope, n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let g = &self.g;
+        let t = tokens.len();
         // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them). n_out 0: no
         // head (a prompt's chunk before its last: the draft block's rows only)
         let no_head = n_out == 0;
@@ -1233,7 +1266,7 @@ impl<'g> Qwen35<'g> {
             if t > 1 {
                 hs.copy_within(ne * 4, &all, 0, (t - 1) * ne * 4)?;
             }
-            self.mtp_rows(ms, tokens, &hs, p0, &rope, s.max_ctx, false)?;
+            self.mtp_rows(ms, tokens, &hs, p0, rope, s.max_ctx, false)?;
             ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
             if no_head {
                 return Ok(Vec::new());
@@ -1256,6 +1289,101 @@ impl<'g> Qwen35<'g> {
         self.matmul("output", &self.output, &normed, nq8.as_ref(), n, &logits)?;
         let all = logits.to_f32()?;
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
+    }
+
+    /// A prompt over two GPUs as a pipeline (llama.cpp's over its ubatches): the first GPU's layers of chunk k+1 queued
+    /// before the last GPU's layers (and the draft block, the head) of chunk k, so the first always has a chunk queued
+    /// while the host waits on the last's full launch queue; the rows cross into one of two buffers on the last (the
+    /// one chunk k-2 used). Each layer's state for chunk k+1 needs only its own after chunk k: the same sums as one
+    /// pass a chunk. None: not this prompt's (one GPU, the head first, pictures) - `feed_until` reads it a pass a chunk
+    fn feed_pipelined(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<Option<(usize, Vec<f32>)>> {
+        if self.devs.len() != 2 || self.head != 1 || self.pipe.len() != 2 || tokens.len() <= self.chunk || tokens.iter().any(|t| t & PICTURE != 0) {
+            return Ok(None);
+        }
+        let _w = self.work.lock().unwrap();
+        self.snaps.lock().unwrap().of = None;
+        let split = self.devs[1].lb;
+        let ne = self.g.n_embd;
+        // (chunk, its p0, its rows on the last GPU) waiting for the last GPU's part
+        let mut pending: Option<(&[u32], usize, DevBuf)> = None;
+        let mut queued = 0;
+        let mut logits = Vec::new();
+        // the next chunk's first position (the session's moves on as the last GPU's parts are queued)
+        let mut next = s.pos;
+        for (k, c) in tokens.chunks(self.chunk).enumerate() {
+            if queued > 0 && stop(queued) {
+                // (stopped early: what is queued is read in full, no logits)
+                break;
+            }
+            let (t, p0) = (c.len(), next);
+            self.check_rows(s, p0, t)?;
+            next += t;
+            // the first GPU's part of chunk k
+            self.devs[0].arena.reset();
+            self.on(0);
+            self.phase("embed");
+            let x = self.embed_with(self.file, &self.embd, self.g.vocab, c)?;
+            let rope = Rope::From(p0 as i64 - s.shift);
+            let x = self.stage(s, 0..split, x, t, p0, &rope, k > 0, &mut *tap)?;
+            self.phase("GPU to GPU");
+            let xb = self.pipe[k % 2].view(0, t * ne * 4)?;
+            {
+                let mut st = self.staging.lock().unwrap();
+                if st.as_ref().is_none_or(|b| b.len < x.len) {
+                    for d in &self.devs {
+                        d.gpu.sync()?;
+                    }
+                    *st = Some(HostBuf::new(&self.devs[0].gpu, (self.chunk * ne * 4).next_power_of_two())?);
+                }
+                xb.copy_from_peer_async(&x, st.as_mut().unwrap())?;
+            }
+            queued += t;
+            // the last GPU's part of chunk k-1
+            if let Some((pc, pp0, px)) = pending.take() {
+                self.last_part(s, pc, pp0, px, 0, k > 1, &mut *tap)?;
+            }
+            pending = Some((c, p0, xb));
+        }
+        if let Some((pc, pp0, px)) = pending.take() {
+            let all = queued == tokens.len();
+            logits = self.last_part(s, pc, pp0, px, if all { 1 } else { 0 }, true, &mut *tap)?.pop().unwrap_or_default();
+        }
+        Ok(Some((queued, logits)))
+    }
+
+    /// `run_layers` over one GPU's layers, as one graph when `graph` (NS_Q35_GRAPHS=0: never; not while profiling):
+    /// the stage's thousand kernels one entry in the GPU's queue. A capture that fails is run again as launches
+    #[allow(clippy::too_many_arguments)]
+    fn stage(&self, s: &Session, range: std::ops::Range<usize>, x: DevBuf, t: usize, p0: usize, rope: &Rope, graph: bool, tap: Tap) -> Result<DevBuf> {
+        let graph = graph && self.prof.is_none() && !std::env::var("NS_Q35_GRAPHS").is_ok_and(|v| v == "0");
+        if graph {
+            let mark = self.arena().mark();
+            let xv = x.view(0, x.len)?;
+            match self.dev().gpu.graph(|| self.run_layers(s, range.clone(), xv, t, p0, rope, None, &mut *tap))? {
+                Ok(y) => return Ok(y),
+                Err(why) => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| eprintln!("[qwen35: a prompt stage as a graph failed ({why}); its kernels launched one by one]"));
+                    self.arena().rewind(mark);
+                }
+            }
+        }
+        self.run_layers(s, range, x, t, p0, rope, None, tap)
+    }
+
+    /// The last GPU's part of a pipelined chunk (rows x there, at p0 = the session's position): its layers, the
+    /// session past them, the pass's end
+    #[allow(clippy::too_many_arguments)]
+    fn last_part(&self, s: &mut Session, tokens: &[u32], p0: usize, x: DevBuf, n_out: usize, graph: bool, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let t = tokens.len();
+        debug_assert_eq!(p0, s.pos);
+        self.devs[1].arena.reset();
+        self.on(1);
+        let rope = Rope::From(p0 as i64 - s.shift);
+        let x = self.stage(s, self.devs[1].lb..self.g.layers, x, t, p0, &rope, graph, &mut *tap)?;
+        s.pos += t;
+        s.last_rows = t;
+        self.finish(s, x, tokens, p0, &rope, n_out, tap)
     }
 
     /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
@@ -1458,6 +1586,11 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+        if !std::env::var("NS_Q35_PIPE").is_ok_and(|v| v == "0") {
+            if let Some(r) = self.feed_pipelined(s, tokens, stop, &mut *tap)? {
+                return Ok(r);
+            }
+        }
         let mut logits = Vec::new();
         let mut done = 0;
         for c in tokens.chunks(self.chunk) {

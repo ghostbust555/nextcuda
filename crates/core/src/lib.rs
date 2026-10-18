@@ -228,6 +228,29 @@ impl Gpu {
             None => Ok(None),
         }
     }
+    /// `f`'s work on the GPU's stream recorded and launched as one graph (ns_capture_*): None without a device or when
+    /// the capture fails (the work dropped - `f` is then run again by the caller, uncaptured)
+    pub fn graph<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<std::result::Result<T, String>> {
+        let Some((a, r)) = self.dev else { return Ok(f().map_err(|e| e.0)) };
+        // SAFETY: a live handle.
+        check(a, unsafe { (a.capture_begin)(r) }, "starting a capture")?;
+        match f() {
+            // SAFETY: a live handle, capturing.
+            Ok(v) => match check(a, unsafe { (a.capture_launch)(r) }, "launching a graph") {
+                Ok(()) => Ok(Ok(v)),
+                Err(e) => {
+                    // SAFETY: a live handle.
+                    unsafe { (a.capture_abort)(r) };
+                    Ok(Err(e.0))
+                }
+            },
+            Err(e) => {
+                // SAFETY: a live handle.
+                unsafe { (a.capture_abort)(r) };
+                Ok(Err(e.0))
+            }
+        }
+    }
     /// The host waits for the work before `ticket`
     pub fn wait_ticket(&self, ticket: i64) -> Result<()> {
         match self.dev {
