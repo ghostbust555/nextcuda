@@ -348,10 +348,20 @@ constexpr int MR = 16, BKT = 32, MD = 256;
 constexpr int QSTR = MD + 8;     // a query, key or value row's stride in halves (16-byte rows; 8 rows hit 32 banks)
 constexpr int64_t MMA_BLOCKS = 96;   // fewer blocks than this a pass: the keys are split
 
-template <int G>
+// two stages of key and value tiles (half: the tiles themselves; q8: their raw rows, widened into one half pair)
+template <int G, bool Q8>
 constexpr size_t mma_smem() {
-    return ((size_t) G * MR * QSTR + 2 * (size_t) BKT * QSTR) * 2;
+    return Q8 ? 2 * 2 * (size_t) BKT * Q8ROW + 2 * (size_t) BKT * QSTR * 2 : 2 * 2 * (size_t) BKT * QSTR * 2;
 }
+
+// 16 bytes global -> shared, asynchronously (zeros when !pred: nothing read)
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred) {
+    const unsigned a = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(gmem), "r"(pred ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 // keys a split of the tensor-core pass (kv: the last row's keys)
 __host__ __device__ inline int64_t mma_split_keys(int64_t T, int64_t kv, int64_t Hkv) {
     const int64_t b = (T + MR - 1) / MR * Hkv;
@@ -387,10 +397,14 @@ template <int G, bool Q8>
 __global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict__ qp, int64_t qs, const void* __restrict__ kc,
                                                         const void* __restrict__ vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                                                         int64_t p0, int64_t ns, int64_t KB, float* __restrict__ out, float* __restrict__ part) {
+    // the queries in registers (each warp its head's 16 rows as the products' A fragments); the key and value tiles in
+    // two stages, the next read (cp.async) while this one is multiplied. q8: the raw rows in the stages, widened to the
+    // half tiles once they are in
     extern __shared__ __align__(16) unsigned char smem[];
-    __half* Qs = reinterpret_cast<__half*>(smem);   // [G][MR][QSTR]
-    __half* Ks = Qs + G * MR * QSTR;                 // [BKT][QSTR]
-    __half* Vs = Ks + BKT * QSTR;                    // [BKT][QSTR]
+    constexpr int TB = BKT * QSTR;                    // a half tile's halves
+    __half* Kh = reinterpret_cast<__half*>(smem);     // [2][BKT][QSTR] (q8: [1] - the widened tile)
+    __half* Vh = Kh + (Q8 ? 1 : 2) * TB;
+    unsigned char* raw = smem + (Q8 ? 2 : 4) * TB * 2;   // q8: [2 stages][K, V][BKT][Q8ROW]
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, nth = G * 32;
     const int gr = lane >> 2, tq = lane & 3;          // the fragment's row group and column pair
     const int64_t r0 = (int64_t) blockIdx.x * MR, hk = blockIdx.y, sp = blockIdx.z;
@@ -398,49 +412,99 @@ __global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict_
     const int64_t kv_end = p0 + r0 + rows;           // the last row's keys
     const int64_t j0 = sp * KB, j1 = min(kv_end, ns > 1 ? (sp + 1) * KB : kv_end);
     const float scale = rsqrtf((float) MD);
-    // the queries: G heads x 16 rows, scaled; rows past T zero
-    for (int idx = tid; idx < G * MR * (MD / 2); idx += nth) {
-        const int g = idx / (MR * (MD / 2)), rem = idx % (MR * (MD / 2)), r = rem / (MD / 2), d2 = rem % (MD / 2);
-        float2 v = make_float2(0.0f, 0.0f);
-        if (r < rows) {
-            const float* src = qp + (r0 + r) * qs + (hk * G + g) * MD + 2 * d2;
-            v = make_float2(src[0] * scale, src[1] * scale);
+    // the tile at k0 into stage st (keys past j1 zero)
+    auto load = [&](int st, int64_t k0) {
+        if constexpr (!Q8) {
+            __half* kd = Kh + st * TB;
+            __half* vd = Vh + st * TB;
+            for (int idx = tid; idx < BKT * (MD / 8); idx += nth) {
+                const int j = idx / (MD / 8), c = idx % (MD / 8);
+                const bool ok = k0 + j < j1;
+                const int64_t row = hk * cap + (ok ? k0 + j : j0);
+                cp_async16(kd + j * QSTR + c * 8, reinterpret_cast<const __half*>(kc) + row * MD + c * 8, ok);
+                cp_async16(vd + j * QSTR + c * 8, reinterpret_cast<const __half*>(vc) + row * MD + c * 8, ok);
+            }
+        } else {
+            unsigned char* kd = raw + (size_t) st * 2 * BKT * Q8ROW;
+            unsigned char* vd = kd + BKT * Q8ROW;
+            constexpr int C16 = (int) (Q8ROW / 16);
+            for (int idx = tid; idx < BKT * C16; idx += nth) {
+                const int j = idx / C16, c = idx % C16;
+                const bool ok = k0 + j < j1;
+                const int64_t row = hk * cap + (ok ? k0 + j : j0);
+                cp_async16(kd + j * Q8ROW + c * 16, reinterpret_cast<const unsigned char*>(kc) + row * Q8ROW + c * 16, ok);
+                cp_async16(vd + j * Q8ROW + c * 16, reinterpret_cast<const unsigned char*>(vc) + row * Q8ROW + c * 16, ok);
+            }
         }
-        *reinterpret_cast<__half2*>(Qs + (g * MR + r) * QSTR + 2 * d2) = __float22half2_rn(v);
+        cp_async_commit();
+    };
+    if (j0 < j1) load(0, j0);
+    // the queries: rows gr, gr + 8 of this warp's head, scaled, as halves (rows past T zero)
+    uint32_t qa[MD / 16][4];
+    {
+        const float* qr_a = qp + (r0 + gr) * qs + (hk * G + w) * MD;
+        const float* qr_b = qr_a + 8 * qs;
+        const bool ra = gr < rows, rb = gr + 8 < rows;
+#pragma unroll
+        for (int kk = 0; kk < MD / 16; ++kk) {
+            const int c0 = kk * 16 + tq * 2, c1 = c0 + 8;
+            const float2 x0 = ra ? *reinterpret_cast<const float2*>(qr_a + c0) : make_float2(0.0f, 0.0f);
+            const float2 x1 = rb ? *reinterpret_cast<const float2*>(qr_b + c0) : make_float2(0.0f, 0.0f);
+            const float2 x2 = ra ? *reinterpret_cast<const float2*>(qr_a + c1) : make_float2(0.0f, 0.0f);
+            const float2 x3 = rb ? *reinterpret_cast<const float2*>(qr_b + c1) : make_float2(0.0f, 0.0f);
+            qa[kk][0] = pack_h2(x0.x * scale, x0.y * scale);
+            qa[kk][1] = pack_h2(x1.x * scale, x1.y * scale);
+            qa[kk][2] = pack_h2(x2.x * scale, x2.y * scale);
+            qa[kk][3] = pack_h2(x3.x * scale, x3.y * scale);
+        }
     }
     float o[MD / 8][4];
 #pragma unroll
     for (int n = 0; n < MD / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float m_a = -INFINITY, m_b = -INFINITY, l_a = 0.0f, l_b = 0.0f;   // rows gr and gr + 8 (l: this thread's part)
-    const __half* Qw = Qs + w * MR * QSTR;
-    for (int64_t k0 = j0; k0 < j1; k0 += BKT) {
-        __syncthreads();   // the previous tile is used
-        // keys and values: a row a 32 uint4 (8 halves each), row-major
-        for (int idx = tid; idx < BKT * (MD / 8); idx += nth) {
-            const int j = idx / (MD / 8), c = idx % (MD / 8);
-            uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = kv4;
-            if (k0 + j < j1) {
-                kv4 = kv_load8<Q8>(kc, hk * cap + k0 + j, c);
-                vv4 = kv_load8<Q8>(vc, hk * cap + k0 + j, c);
-            }
-            *reinterpret_cast<uint4*>(Ks + j * QSTR + c * 8) = kv4;
-            *reinterpret_cast<uint4*>(Vs + j * QSTR + c * 8) = vv4;
+    int st = 0;
+    for (int64_t k0 = j0; k0 < j1; k0 += BKT, st ^= 1) {
+        // the next tile on its way while this one is used
+        if (k0 + BKT < j1) {
+            load(st ^ 1, k0 + BKT);
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
         }
         __syncthreads();
+        const __half* Ks;
+        const __half* Vs;
+        if constexpr (Q8) {
+            // the raw rows widened: 8 features a thread a step, the scale of their block of 32
+            const unsigned char* kr = raw + (size_t) st * 2 * BKT * Q8ROW;
+            const unsigned char* vr = kr + BKT * Q8ROW;
+            for (int idx = tid; idx < 2 * BKT * (MD / 8); idx += nth) {
+                const int which = idx / (BKT * (MD / 8)), rem = idx % (BKT * (MD / 8)), j = rem / (MD / 8), c = rem % (MD / 8);
+                const unsigned char* r = (which ? vr : kr) + j * Q8ROW;
+                const int2 q = *reinterpret_cast<const int2*>(r + c * 8);
+                const float d = __half2float(reinterpret_cast<const __half*>(r + MD)[c >> 2]);
+                const char4 x = *reinterpret_cast<const char4*>(&q.x), y = *reinterpret_cast<const char4*>(&q.y);
+                __half2 h[4] = {__floats2half2_rn(x.x * d, x.y * d), __floats2half2_rn(x.z * d, x.w * d), __floats2half2_rn(y.x * d, y.y * d),
+                                __floats2half2_rn(y.z * d, y.w * d)};
+                *reinterpret_cast<uint4*>((which ? Vh : Kh) + j * QSTR + c * 8) = *reinterpret_cast<const uint4*>(h);
+            }
+            __syncthreads();
+            Ks = Kh;
+            Vs = Vh;
+        } else {
+            Ks = Kh + st * TB;
+            Vs = Vh + st * TB;
+        }
         // scores S [16][BKT] = Q . K^T
         float s[BKT / 8][4];
 #pragma unroll
         for (int n = 0; n < BKT / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
 #pragma unroll
-        for (int kk = 0; kk < MD; kk += 16) {
-            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(Qw + gr * QSTR + kk + tq * 2);
-            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(Qw + (gr + 8) * QSTR + kk + tq * 2);
-            const uint32_t a2 = *reinterpret_cast<const uint32_t*>(Qw + gr * QSTR + kk + 8 + tq * 2);
-            const uint32_t a3 = *reinterpret_cast<const uint32_t*>(Qw + (gr + 8) * QSTR + kk + 8 + tq * 2);
+        for (int kk = 0; kk < MD / 16; ++kk) {
 #pragma unroll
             for (int n = 0; n < BKT / 8; ++n) {
-                const __half* kr = Ks + (n * 8 + gr) * QSTR + kk + tq * 2;
-                mma16816(s[n][0], s[n][1], s[n][2], s[n][3], a0, a1, a2, a3, *reinterpret_cast<const uint32_t*>(kr),
+                const __half* kr = Ks + (n * 8 + gr) * QSTR + kk * 16 + tq * 2;
+                mma16816(s[n][0], s[n][1], s[n][2], s[n][3], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], *reinterpret_cast<const uint32_t*>(kr),
                          *reinterpret_cast<const uint32_t*>(kr + 8));
             }
         }
@@ -462,14 +526,15 @@ __global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict_
         mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 1));
         mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 2));
         const float mn_a = fmaxf(m_a, mx_a), mn_b = fmaxf(m_b, mx_b);
-        const float c_a = mn_a == -INFINITY ? 1.0f : expf(m_a - mn_a), c_b = mn_b == -INFINITY ? 1.0f : expf(m_b - mn_b);
+        // (the hardware exponent: the products are halves already; the llm sources are built without fast math)
+        const float c_a = mn_a == -INFINITY ? 1.0f : __expf(m_a - mn_a), c_b = mn_b == -INFINITY ? 1.0f : __expf(m_b - mn_b);
         float ps_a = 0.0f, ps_b = 0.0f;
 #pragma unroll
         for (int n = 0; n < BKT / 8; ++n)
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
-                s[n][e] = mn_a == -INFINITY ? 0.0f : expf(s[n][e] - mn_a);
-                s[n][2 + e] = mn_b == -INFINITY ? 0.0f : expf(s[n][2 + e] - mn_b);
+                s[n][e] = mn_a == -INFINITY ? 0.0f : __expf(s[n][e] - mn_a);
+                s[n][2 + e] = mn_b == -INFINITY ? 0.0f : __expf(s[n][2 + e] - mn_b);
                 ps_a += s[n][e];
                 ps_b += s[n][2 + e];
             }
@@ -499,6 +564,8 @@ __global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict_
                 mma16816(o[n + 1][0], o[n + 1][1], o[n + 1][2], o[n + 1][3], a0, a1, a2, a3, b2, b3);
             }
         }
+        // this stage (and the widened tile) are read again only after every warp is done with them
+        __syncthreads();
     }
     // a row's sum over its 4 threads
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 1);
@@ -821,7 +888,7 @@ template <int G, bool Q8>
 int attn_launch(ns_gpu* g, const float* q, int64_t qs, const void* k, const void* v, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                 int64_t p0, float* out, float* scratch) {
     if (use_mma(T, G)) {
-        constexpr size_t sm = mma_smem<G <= 6 ? G : 1>();
+        constexpr size_t sm = mma_smem<G <= 6 ? G : 1, Q8>();
         static std::mutex mu;
         static bool raised[64] = {};
         {
