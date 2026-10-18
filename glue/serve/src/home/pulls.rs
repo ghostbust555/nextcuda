@@ -46,6 +46,11 @@ fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
+/// A size in words: GiB, or MB under one
+fn size(b: u64) -> String {
+    if b >= 1 << 30 { format!("{:.1} GiB", gib(b)) } else { format!("{:.0} MB", b as f64 / 1e6) }
+}
+
 /// One download
 pub(crate) struct Pull {
     pub model: String,
@@ -221,7 +226,7 @@ impl Pull {
         match v["state"].as_str().unwrap_or("") {
             "queued" => format!("downloading {}: queued behind another download to {}", self.model, self.drive),
             "verifying" => format!("downloading {}: checking its SHA-256", self.model),
-            _ => format!("downloading {}: {}% of {:.1} GiB", self.model, v["pct"], gib(self.bytes_total)),
+            _ => format!("downloading {}: {}% of {}", self.model, v["pct"], size(self.bytes_total)),
         }
     }
 }
@@ -330,8 +335,8 @@ impl Home {
         }
         let nd = self.not_downloaded(id).ok_or_else(|| (404, format!("no model card {id} (system.models lists the ones that can be downloaded)")))?;
         if nd["fits"] != true {
-            return Err((503, format!("no room for {id} ({:.1} GiB) on any models folder: {} has {:.1} GiB free (NS_MODEL_DIRS adds folders)",
-                                     gib(nd["bytes"].as_u64().unwrap_or(0)), nd["drive"].as_str().unwrap_or("?"), gib(nd["free"].as_u64().unwrap_or(0)))));
+            return Err((503, format!("no room for {id} ({}) on any models folder: {} has {} free (NS_MODEL_DIRS adds folders)",
+                                     size(nd["bytes"].as_u64().unwrap_or(0)), nd["drive"].as_str().unwrap_or("?"), size(nd["free"].as_u64().unwrap_or(0)))));
         }
         let root = PathBuf::from(nd["folder"].as_str().unwrap_or(""));
         let (run, log) = self.new_run(format!("download {id} to {}", root.display()));
@@ -381,8 +386,8 @@ impl Home {
         let fits = nd["fits"] == true;
         if !self.auto_pull() {
             let room = if fits { String::new() } else { format!("; {} lacks the room", nd["drive"].as_str().unwrap_or("its drive")) };
-            return Err((409, tag(id, bytes, fits, &format!("{id} is not downloaded ({:.1} GiB{room}): system.models.pull {{\"model\": \"{id}\"}} fetches it, or turn on NS_AUTO_PULL",
-                                                         gib(bytes)))));
+            return Err((409, tag(id, bytes, fits, &format!("{id} is not downloaded ({}{room}): system.models.pull {{\"model\": \"{id}\"}} fetches it, or turn on NS_AUTO_PULL",
+                                                         size(bytes)))));
         }
         let p = self.pull_start(id)?;
         if !block {
