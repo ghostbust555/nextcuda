@@ -9,14 +9,14 @@ import { api } from "../api.js";
 import { cameraName, setCameraName, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { Scene, TimelineClip } from "../types.js";
-import { fmtMS, fmtT } from "../util.js";
+import { fmtMS, fmtT, here } from "../util.js";
 import { ClipProgress } from "./Progress.js";
 import { Detail } from "./Detail.js";
 import { Panel } from "./Panel.js";
 
 function exportScene(): void {
   if (state.timelineProject) {
-    location.href = `/api/scene?project=${encodeURIComponent(state.timelineProject)}`;
+    location.href = `api/scene?project=${encodeURIComponent(state.timelineProject)}`;
   }
 }
 
@@ -67,7 +67,7 @@ function ClipCard(props: { placed: Placed; px: number }) {
       on={{ click: () => navigate({ clip: clip.n }) }}
     >
       {clip.thumb
-        ? <img attrs={{ src: clip.thumb, alt, loading: "lazy" }} />
+        ? <img attrs={{ src: here(clip.thumb), alt, loading: "lazy" }} />
         : <div class="ph">{clip.state === "running" ? "●" : "…"}</div>}
       <span class="n">{clip.n}</span>
       <span class="s">{clip.seconds ? `${clip.seconds.toFixed(1)}s` : ""}</span>

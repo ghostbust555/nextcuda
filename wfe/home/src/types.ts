@@ -55,7 +55,7 @@ export interface Model {
   page: number;
 }
 
-export interface Service { id: string; title: string; what: string; port: number; up: boolean; detail?: string | null; link?: string; api?: string }
+export interface Service { id: string; title: string; what: string; port: number; up: boolean; detail?: string | null; link?: string; href?: string | null; api?: string }
 
 export interface Run { id: number; label: string; started: number; rc: number | null; out: string }
 

@@ -338,7 +338,8 @@ impl Home {
     /// passes the request on to its server as `/<sub>` (any method: the page's own API calls go the same way).
     /// `/open/<id>` alone is sent to `/open/<id>/`, so the page's relative links resolve under it. Those servers check
     /// no token and listen on --serve-host (127.0.0.1): this is how another machine reaches them. A disabled model has
-    /// none to open. The video studio and the chat page are always up and on the network: the browser is sent there.
+    /// none to open. The video studio is passed on the same way (it is up while a video model is enabled); the chat page is
+    /// on the network: the browser is sent there.
     fn open(&self, s: &mut Conn, req: &http::Request, rest: &str) {
         let (id, sub) = rest.split_once('/').map_or((rest, None), |(i, r)| (i, Some(r)));
         let m = match registry::find(&self.o.cfg, id) {
@@ -364,7 +365,18 @@ impl Home {
                 }
                 return;
             }
-            "video" => self.o.ports.video,
+            // the studio: up while a video model is enabled (with the daemon); on 127.0.0.1 like the model servers
+            "video" => {
+                let Some(sub) = sub else {
+                    let to = format!("/open/{id}/{query}");
+                    return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: {to}\r\nCache-Control: no-cache\r\n"));
+                };
+                let studio = http::Target::Tcp(format!("127.0.0.1:{}", self.o.ports.video));
+                if let Err(e) = http::forward_to(&mut *s, &studio, req, &format!("/{sub}{query}")) {
+                    http::respond(s, 502, &err(format!("the video studio does not answer: {e}")));
+                }
+                return;
+            }
             _ => self.o.ports.chat_ui,
         };
         let host = req.host.as_deref().unwrap_or("localhost").rsplit_once(':').map_or_else(|| req.host.clone().unwrap_or_default(), |(h, _)| h.to_string());
@@ -401,6 +413,9 @@ impl Home {
     /// The front ends and helpers beside the models: up or not, a link
     fn services(&self) -> Vec<Value> {
         let p = self.o.ports.clone();
+        // the studio's page through this door (its own port is on 127.0.0.1): under an enabled video model's /open/
+        let studio = self.models().into_iter().find(|m| m["kind"] == "video" && m["enabled"] != false)
+            .and_then(|m| m["id"].as_str().map(|i| format!("/open/{i}/")));
         let probes: Vec<Box<dyn FnOnce() -> Value + Send>> = vec![
             Box::new(move || json!({"id": "chat-ui", "title": "Chat", "what": "the chat front end (Open WebUI)", "port": p.chat_ui,
                                     "up": listening(p.chat_ui), "link": "/"})),
@@ -413,7 +428,7 @@ impl Home {
             Box::new(move || {
                 let up = call_for(&Target::Tcp(format!("127.0.0.1:{}", p.video)), "POST", "/rpc/status", Some(&json!({})), 3).is_ok();
                 json!({"id": "studio", "title": "Video studio", "what": "nextcuda video studio (MiniMax H3): clips, queue, projects", "port": p.video,
-                       "up": up, "link": "/"})
+                       "up": up, "link": "/", "href": studio})
             }),
         ];
         let hs: Vec<_> = probes.into_iter().map(std::thread::spawn).collect();

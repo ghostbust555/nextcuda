@@ -3,7 +3,8 @@ import type {
   Envelope, Film, Gpu, Job, JobDetail, ListRow, Methods, Plan, Scene, Status, Summary, TimelineClip,
 } from "./types.js";
 
-const base = "";
+// relative: the page is served at the studio's root or under the front door's /open/<id>/
+const base = ".";
 
 export async function rpc<M extends keyof Methods>(
   method: M,

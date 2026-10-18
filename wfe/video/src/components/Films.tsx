@@ -31,7 +31,7 @@ export function Films() {
                   <td class="num">{f.mb}</td>
                   <td>
                     <a
-                      attrs={{ href: `/out/${encodeURIComponent(f.file)}`, download: true, title: "download" }}
+                      attrs={{ href: `out/${encodeURIComponent(f.file)}`, download: true, title: "download" }}
                       on={{ click: (e: Event) => e.stopPropagation() }}
                     >
                       <span class="i dim" props={{ innerHTML: "&#xf019;" }} />

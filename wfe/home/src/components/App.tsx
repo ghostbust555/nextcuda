@@ -181,9 +181,9 @@ function ModelRow(m: Model) {
               loaded
                 ? btn("unload", "stop", "ghost", "unload now (after the requests it is answering); it stays enabled")
                 : btn("load", m.state === "loading" ? "starting" : "start", "", "load now (otherwise its first request does); the button spins until it answers"),
-              // its own page, loaded or not: an image or audio model's is its server's, so the front door starts the model
-              // first (/open/ID) and sends the browser on
-              <a class="btn" attrs={{ href: m.kind === "image" || m.kind === "audio" ? `/open/${encodeURIComponent(m.id)}` : page, target: "_blank",
+              // its own page, loaded or not, through the front door (/open/ID): an image, audio or 3D model's is its server's,
+              // so the model starts first; a video model's is the studio's
+              <a class="btn" attrs={{ href: m.kind !== "llm" ? `/open/${encodeURIComponent(m.id)}` : page, target: "_blank",
                 title: m.kind === "llm" ? "Open WebUI" : m.kind === "video" ? "the video studio"
                   : loaded ? "its page" : "its page: the model starts first (a minute), then the page opens" }}>
                 <span class="i" props={{ innerHTML: "&#xf08e;" }} /> page
@@ -226,7 +226,7 @@ function ServiceRow(s: Service) {
       <span class={{ dot: true, off: !s.up }} />
       <div><div class="name">{s.title}</div><div class="sub">{s.what}</div></div>
       <div class="state">{s.up ? <span>{s.detail ?? "up"}<span class="hint"> :{s.port}</span></span> : <span class="hint">not running · :{s.port}</span>}</div>
-      <div class="acts">{s.up && s.link ? <a class="btn" attrs={{ href: at(s.port, s.link), target: "_blank" }}><span class="i" props={{ innerHTML: "&#xf08e;" }} /> open</a> : null}</div>
+      <div class="acts">{s.up && s.link ? <a class="btn" attrs={{ href: s.href ?? at(s.port, s.link), target: "_blank" }}><span class="i" props={{ innerHTML: "&#xf08e;" }} /> open</a> : null}</div>
     </div>
   );
 }

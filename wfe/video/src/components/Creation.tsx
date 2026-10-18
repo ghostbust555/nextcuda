@@ -179,7 +179,7 @@ async function addRefs(kind: RefKind, files: FileList | null): Promise<void> {
   for (const f of Array.from(files ?? [])) {
     if (form[kind].length >= REF_MAX[kind]) break;
     try {
-      const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+      const r = await fetch(`api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
       const j = (await r.json()) as { ok: boolean; name?: string; error?: string };
       if (!j.ok || !j.name) throw new Error(j.error ?? `HTTP ${r.status}`);
       form[kind] = [...form[kind], j.name];
@@ -261,7 +261,7 @@ async function setControl(key: ControlKey, files: FileList | null): Promise<void
   const f = files?.[0];
   if (!f) return;
   try {
-    const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+    const r = await fetch(`api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
     const j = (await r.json()) as { ok: boolean; name?: string; error?: string };
     if (!j.ok || !j.name) throw new Error(j.error ?? `HTTP ${r.status}`);
     form[key] = j.name;

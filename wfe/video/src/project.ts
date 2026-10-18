@@ -1,3 +1,4 @@
+import { here } from "./util.js";
 /** Project and clip data: loading a timeline, selecting a clip, holding and clearing.
  *
  *  Kept out of the components so the router can drive the same actions a click does, and
@@ -58,7 +59,7 @@ export async function selectClip(n: number | null, scroll = true): Promise<void>
   if (!c) return;
   try {
     if (c.state === "done" && c.name) {
-      state.video = { file: `${c.name}.mp4`, poster: c.thumb, playing: false };
+      state.video = { file: `${c.name}.mp4`, poster: c.thumb ? here(c.thumb) : null, playing: false };
       state.detail = { kind: "job", name: c.name, data: await api.job(c.name) };
     } else {
       state.detail = { kind: "clip", label: c.label, data: await api.clip(c.label) };
