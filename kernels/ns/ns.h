@@ -46,6 +46,8 @@ int ns_copy_2d(ns_gpu* g, void* dst, size_t dpitch, const void* src, size_t spit
 int ns_mark(ns_gpu* g, int64_t* ticket);
 int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_await(ns_gpu* g, int64_t ticket);
+/* the host waits until the work before ticket is done */
+int ns_ticket_wait(ns_gpu* g, int64_t ticket);
 int ns_stream_copy_batch(ns_gpu* g, void* const* dsts, const void* const* srcs, const size_t* sizes, size_t n, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_stamp(ns_gpu* g, int64_t* ticket);
 int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns);
@@ -54,6 +56,9 @@ int ns_sync(ns_gpu* g);
 /* device memory of one GPU to another's, through `staging`: host memory of `bytes` (pinned memory belongs to one
  * context, so it is pinned for at most one of the two copies; plain memory works for both, slower); waits */
 int ns_copy_peer(ns_gpu* to, void* dst, ns_gpu* from, const void* src, size_t bytes, void* staging);
+/* As ns_copy_peer through pinned staging (ns_alloc_host), ordered on the devices only: after the work queued on both so
+ * far, before the work queued on either later; the host does not wait (the GPUs run side by side) */
+int ns_copy_peer_async(ns_gpu* to, void* dst, ns_gpu* from, const void* src, size_t bytes, void* staging);
 
 #ifdef __cplusplus
 }

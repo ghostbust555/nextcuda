@@ -46,11 +46,13 @@ pub struct Api {
     pub mark: unsafe extern "C" fn(Gpu, *mut i64) -> c_int,
     pub stream_copy: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize, *const i64, c_int, c_int, *mut i64) -> c_int,
     pub await_: unsafe extern "C" fn(Gpu, i64) -> c_int,
+    pub ticket_wait: unsafe extern "C" fn(Gpu, i64) -> c_int,
     pub stamp: unsafe extern "C" fn(Gpu, *mut i64) -> c_int,
     pub elapsed: unsafe extern "C" fn(Gpu, i64, i64, *mut f64) -> c_int,
     pub fill: unsafe extern "C" fn(Gpu, *mut c_void, u8, usize) -> c_int,
     pub sync: unsafe extern "C" fn(Gpu) -> c_int,
     pub copy_peer: unsafe extern "C" fn(Gpu, *mut c_void, Gpu, *const c_void, usize, *mut c_void) -> c_int,
+    pub copy_peer_async: unsafe extern "C" fn(Gpu, *mut c_void, Gpu, *const c_void, usize, *mut c_void) -> c_int,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded for the process's life.
@@ -125,11 +127,13 @@ impl Api {
             mark: sym!("ns_mark"),
             stream_copy: sym!("ns_stream_copy"),
             await_: sym!("ns_await"),
+            ticket_wait: sym!("ns_ticket_wait"),
             stamp: sym!("ns_stamp"),
             elapsed: sym!("ns_elapsed"),
             fill: sym!("ns_fill"),
             sync: sym!("ns_sync"),
             copy_peer: sym!("ns_copy_peer"),
+            copy_peer_async: sym!("ns_copy_peer_async"),
         })
     }
 

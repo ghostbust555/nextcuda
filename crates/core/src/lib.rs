@@ -216,6 +216,26 @@ impl Gpu {
         Ok((r.3 << 20, Some(r.4 << 20)))
     }
 
+    /// A ticket for the work queued on the GPU so far (None without a device)
+    pub fn ticket(&self) -> Result<Option<i64>> {
+        match self.dev {
+            Some((a, r)) => {
+                let mut t = 0i64;
+                // SAFETY: a live handle, an out-pointer to a local.
+                check(a, unsafe { (a.mark)(r, &mut t) }, "marking the GPU's queue")?;
+                Ok(Some(t))
+            }
+            None => Ok(None),
+        }
+    }
+    /// The host waits for the work before `ticket`
+    pub fn wait_ticket(&self, ticket: i64) -> Result<()> {
+        match self.dev {
+            // SAFETY: a live handle.
+            Some((a, r)) => check(a, unsafe { (a.ticket_wait)(r, ticket) }, "waiting for the GPU"),
+            None => Ok(()),
+        }
+    }
     pub fn sync(&self) -> Result<()> {
         match self.dev {
             // SAFETY: a live handle.
@@ -329,6 +349,22 @@ impl DevBuf {
             }
             // SAFETY: both buffers live, sizes checked; the call waits for both copies.
             return check(a, unsafe { (a.copy_peer)(to, self.ptr, from, src.ptr, src.len, staging.as_mut_ptr().cast()) }, "copying between GPUs");
+        }
+        // SAFETY: both in bounds; distinct allocations.
+        unsafe { std::ptr::copy_nonoverlapping(src.ptr.cast::<u8>(), self.ptr.cast::<u8>(), src.len) };
+        Ok(())
+    }
+    /// As `copy_from_peer` through pinned staging, ordered on the GPUs only (ns_copy_peer_async): the host goes on,
+    /// both GPUs' later work is ordered after it. The staging stays alive while the copy can be in flight (the owner's)
+    pub fn copy_from_peer_async(&self, src: &DevBuf, staging: &mut HostBuf) -> Result<()> {
+        self.bounds(0, src.len)?;
+        if let (Some((a, to)), Some((_, from))) = (self.gpu.dev, src.gpu.dev) {
+            if staging.len < src.len || staging.pin.is_none() {
+                return Err(Error(format!("a pinned staging area of {} bytes for {}", staging.len, src.len)));
+            }
+            let st = staging.base();
+            // SAFETY: both buffers live, sizes checked; the staging pinned and kept by the caller.
+            return check(a, unsafe { (a.copy_peer_async)(to, self.ptr, from, src.ptr, src.len, st.cast()) }, "copying between GPUs");
         }
         // SAFETY: both in bounds; distinct allocations.
         unsafe { std::ptr::copy_nonoverlapping(src.ptr.cast::<u8>(), self.ptr.cast::<u8>(), src.len) };

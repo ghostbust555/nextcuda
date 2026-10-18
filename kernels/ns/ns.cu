@@ -3,6 +3,9 @@
 #include "ns.h"
 #include "ns_internal.hpp"
 
+#include <mutex>
+#include <unordered_map>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -232,6 +235,13 @@ int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns) {
     return 0;
 }
 
+// the host waits for ticket t (a buffer the work before it read may be written again)
+int ns_ticket_wait(ns_gpu* g, int64_t t) {
+    NS_CU(use(g));
+    NS_CU(cudaEventSynchronize(g->ev[t % g->ev.size()]));
+    return 0;
+}
+
 // the GPU's stream waits (on the device) for ticket t
 int ns_await(ns_gpu* g, int64_t t) {
     NS_CU(use(g));
@@ -260,6 +270,33 @@ int ns_copy_peer(ns_gpu* to, void* dst, ns_gpu* from, const void* src, size_t by
     NS_CU(use(to));
     NS_CU(cudaMemcpyAsync(dst, staging, bytes, cudaMemcpyHostToDevice, to->q));
     NS_CU(cudaStreamSynchronize(to->q));
+    return 0;
+}
+
+// The same through pinned `staging`, ordered on the devices only (the host does not wait): the read after the work
+// queued on `from` so far, the write after the work queued on `to` so far (dst may be what that work reads); later work
+// on `to` after the write, on `from` after the read (src may then be reused); a staging area's next read after its
+// last write. Two GPUs then run side by side: `from` on the next rows while `to` is on these.
+int ns_copy_peer_async(ns_gpu* to, void* dst, ns_gpu* from, const void* src, size_t bytes, void* staging) {
+    static std::mutex mu;
+    static std::unordered_map<void*, std::pair<ns_gpu*, int64_t>> last;   // staging -> its last write's (GPU, ticket)
+    std::lock_guard<std::mutex> lk(mu);
+    NS_CU(use(from));
+    const int64_t ready = keep(from, from->q);
+    NS_CU(cudaStreamWaitEvent(from->cq, from->ev[ready % from->ev.size()], 0));
+    auto it = last.find(staging);
+    if (it != last.end()) NS_CU(cudaStreamWaitEvent(from->cq, it->second.first->ev[it->second.second % it->second.first->ev.size()], 0));
+    NS_CU(cudaMemcpyAsync(staging, src, bytes, cudaMemcpyDeviceToHost, from->cq));
+    const int64_t read = keep(from, from->cq);
+    NS_CU(cudaStreamWaitEvent(from->q, from->ev[read % from->ev.size()], 0));
+    NS_CU(use(to));
+    const int64_t free_ = keep(to, to->q);
+    NS_CU(cudaStreamWaitEvent(to->cq, to->ev[free_ % to->ev.size()], 0));
+    NS_CU(cudaStreamWaitEvent(to->cq, from->ev[read % from->ev.size()], 0));
+    NS_CU(cudaMemcpyAsync(dst, staging, bytes, cudaMemcpyHostToDevice, to->cq));
+    const int64_t wrote = keep(to, to->cq);
+    NS_CU(cudaStreamWaitEvent(to->q, to->ev[wrote % to->ev.size()], 0));
+    last[staging] = {to, wrote};
     return 0;
 }
 

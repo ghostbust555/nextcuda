@@ -23,7 +23,7 @@ use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use nextcuda_core::{Arena, DevBuf, Gpu};
+use nextcuda_core::{Arena, DevBuf, Gpu, HostBuf};
 use nextcuda_gguf::{GType, Gguf, Tensor};
 use nextcuda_llm::{Error, GpuInfo, Result, Sampler, Tap};
 
@@ -304,7 +304,20 @@ struct Dev {
     w16: DevBuf,
     lb: usize,
     le: usize,
+    /// pinned rows for the passes' token embeddings, used in turn (each slot's ticket: its last reader), so an upload
+    /// never waits for the GPU's queue - the host queues the next chunk while the GPUs are on this one
+    uploads: Mutex<Uploads>,
 }
+
+/// Slots of pinned host memory a kernel reads in place, with the ticket of the work that last read each
+#[derive(Default)]
+struct Uploads {
+    slots: Vec<(Option<HostBuf>, Option<i64>)>,
+    next: usize,
+}
+
+/// Upload slots a GPU: as many passes queued ahead of the GPU as there are
+const UPLOAD_SLOTS: usize = 4;
 
 /// A picture's tokens in a prompt: ids past the vocabulary, PICTURE | (the picture's key << 12) | its token's index,
 /// the key a hash of the picture (so a prefix with another picture is never reused for it). Rows in raster order of
@@ -341,7 +354,7 @@ pub struct Qwen35<'g> {
     /// the GPU the kernels go to now (set under `work`: a pass walks the GPUs in order)
     cur: std::sync::atomic::AtomicUsize,
     /// host memory a pass's rows cross between GPUs through
-    staging: Mutex<Vec<u8>>,
+    staging: Mutex<Option<HostBuf>>,
     k: &'static ffi::Api,
     layers: Vec<Layer>,
     output_norm: DevBuf,
@@ -586,12 +599,18 @@ impl<'g> Qwen35<'g> {
             };
             let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
             let mut last_err = String::new();
-            let mut found = None;
+            // of the chunks that fit, the one that leaves the last GPU (the fastest: the server orders them weakest
+            // first) the most layers - the work goes to the faster card, the slower one takes what is left; a larger
+            // chunk on a tie (measured, the 5070 + 3060 at 80K: 2,048 rows 35 layers there 707 tok/s, 512 rows 40
+            // layers 732)
+            let mut found: Option<(usize, Vec<(usize, usize)>)> = None;
             for c in tries {
                 match plan(c) {
                     Ok(b) => {
-                        found = Some((c, b));
-                        break;
+                        let last_layers = |b: &[(usize, usize)]| b.last().map_or(0, |x| x.1 - x.0);
+                        if found.as_ref().is_none_or(|(_, fb)| last_layers(&b) > last_layers(fb)) {
+                            found = Some((c, b));
+                        }
                     }
                     Err(x) => last_err = x,
                 }
@@ -691,7 +710,8 @@ impl<'g> Qwen35<'g> {
             gpu.sync()?;
             // its half buffer: its own layers' largest matrix to expand (the last GPU: the head's and the draft block's too)
             let own = layer_x16[lb..le].iter().copied().max().unwrap_or(0).max(if i == head { tail_x16 } else { 0 }).max(1 << 20);
-            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, own)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le });
+            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, own)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le,
+                                uploads: Mutex::new(Uploads { slots: (0..UPLOAD_SLOTS).map(|_| (None, None)).collect(), next: 0 }) });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
@@ -709,7 +729,7 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         let kv_row = kv_row_bytes(&g, kv_q8_setting());
-        Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, layers, output_norm, output, embd, chunk,
+        Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(None), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
                     load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
                     mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8: kv_q8_setting(), kv_row,
@@ -756,6 +776,12 @@ impl<'g> Qwen35<'g> {
         let mut rows: Vec<_> = p.rows.iter().map(|(k, v)| (*k, *v)).collect();
         rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
         let mut out = vec![format!("qwen35 profile: {total:.3} s in kernels (synced after each)")];
+        for d in &self.devs {
+            let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+            out.push(format!("  {}: work memory {:.0} of {:.0} MiB used at most, {} spills", d.gpu.name,
+                             mib(d.arena.peak.load(std::sync::atomic::Ordering::Relaxed)), mib(d.arena.len()),
+                             d.arena.spills.load(std::sync::atomic::Ordering::Relaxed)));
+        }
         for ((dev, phase, name), (t, n, b, fl)) in rows.into_iter().take(40) {
             out.push(format!("  gpu{dev} {phase:<12} {name:<14} {:>8.3} s {:>5.1}% {n:>7} calls {:>7.1} GB/s {:>7.1} TFLOP/s", t, 100.0 * t / total.max(1e-12),
                              b / t.max(1e-12) / 1e9, fl / t.max(1e-12) / 1e12));
@@ -801,11 +827,16 @@ impl<'g> Qwen35<'g> {
         self.on(to);
         let y = self.arena().bytes(x.len)?;
         let mut st = self.staging.lock().unwrap();
-        if st.len() < x.len {
-            st.resize(x.len, 0);
+        if st.as_ref().is_none_or(|b| b.len < x.len) {
+            // a larger staging area: the copies through the old one finished first
+            for d in &self.devs {
+                d.gpu.sync()?;
+            }
+            *st = Some(HostBuf::new(&self.devs[self.layer_dev[0]].gpu, x.len.next_power_of_two())?);
         }
-        // the copy waits for the GPU before (its layers) and the copy into this one
-        y.copy_from_peer(x, &mut st)?;
+        // ordered on the GPUs only: after the GPU before (its layers) and this one's queue, before what either does
+        // next - the host goes on to queue more (the next chunk on the first GPU while this one is on these rows)
+        y.copy_from_peer_async(x, st.as_mut().unwrap())?;
         Ok(y)
     }
 
@@ -951,19 +982,35 @@ impl<'g> Qwen35<'g> {
     fn embed_from(&self, file: &Gguf, embd: &Tensor, vocab: usize, tokens: &[u32]) -> Result<DevBuf> {
         let g = &self.g;
         let row = embd.ty.bytes(g.n_embd as u64).ok_or_else(|| e("the embedding's row size"))? as usize;
-        let mut raw = vec![0u8; tokens.len() * row];
-        for (i, t) in tokens.iter().enumerate() {
-            if *t as usize >= vocab {
-                return Err(e(format!("token {t} past the vocabulary ({vocab})")));
-            }
-            file.read_into(embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
+        let n = tokens.len() * row;
+        // the rows into the GPU's next pinned slot (once the work that read it last is done), read there in place
+        let d = self.dev();
+        let mut up = d.uploads.lock().unwrap();
+        let i = up.next;
+        up.next = (i + 1) % up.slots.len();
+        let slot = &mut up.slots[i];
+        if let Some(t) = slot.1.take() {
+            d.gpu.wait_ticket(t)?;
         }
-        let src = self.arena().bytes(raw.len())?;
-        src.write(0, &raw)?;
+        if slot.0.as_ref().is_none_or(|b| b.len < n) {
+            slot.0 = Some(HostBuf::new(&d.gpu, n.next_power_of_two())?);
+        }
+        let hb = slot.0.as_mut().unwrap();
+        {
+            let raw = hb.as_mut_slice();
+            for (i, t) in tokens.iter().enumerate() {
+                if *t as usize >= vocab {
+                    return Err(e(format!("token {t} past the vocabulary ({vocab})")));
+                }
+                file.read_into(embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
+            }
+        }
+        let src = hb.device_view(0, n)?;
         let x = self.arena().f32(tokens.len() * g.n_embd)?;
-        // SAFETY: the rows' blocks -> float32.
-        self.op("dequant", String::new, raw.len() + 4 * tokens.len() * g.n_embd, 0,
+        // SAFETY: the rows' blocks (pinned host memory, read over PCIe) -> float32.
+        self.op("dequant", String::new, n + 4 * tokens.len() * g.n_embd, 0,
                 || unsafe { (self.k.dequant_f32)(self.raw(), embd.ty.code() as i32, src.ptr(), (tokens.len() * g.n_embd) as i64, x.fp()) })?;
+        slot.1 = d.gpu.ticket()?;
         Ok(x)
     }
 
@@ -1162,7 +1209,9 @@ impl<'g> Qwen35<'g> {
         s.pos += t;
         s.shift = shift_after;
         s.last_rows = t;
-        // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them)
+        // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them). n_out 0: no
+        // head (a prompt's chunk before its last: the draft block's rows only)
+        let no_head = n_out == 0;
         let n = n_out.clamp(1, t);
         let ne = g.n_embd;
         // the head's GPU (NS_Q35_HEAD=first: back to the first)
@@ -1186,11 +1235,17 @@ impl<'g> Qwen35<'g> {
             }
             self.mtp_rows(ms, tokens, &hs, p0, &rope, s.max_ctx, false)?;
             ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
+            if no_head {
+                return Ok(Vec::new());
+            }
             self.phase("head");
             // the head reads the rows' Q8_1 forms when it takes them all; fewer rows (a short prompt's last) it quantizes
             // itself (the split layout does not slice by rows)
             (all.view((t - n) * ne * 4, n * ne * 4)?, if n == t { q } else { None })
         } else {
+            if no_head {
+                return Ok(Vec::new());
+            }
             let last = x.view((t - n) * ne * 4, n * ne * 4)?;
             let normed = self.arena().f32(n * ne)?;
             let q = self.norm(&last, &self.output_norm, &normed, n, ne)?;
@@ -1407,9 +1462,13 @@ impl<'g> Qwen35<'g> {
         let mut done = 0;
         for c in tokens.chunks(self.chunk) {
             if done > 0 && stop(done) {
+                // (stopped early: no logits - the chunk before had no head)
                 break;
             }
-            logits = self.pass(s, c, 1, &mut *tap)?.pop().unwrap_or_default();
+            // a chunk before the last: no head (nothing read back), so the host queues the next chunk at once and
+            // the GPUs run side by side (the first on the next rows while the last is on these)
+            let last = done + c.len() == tokens.len();
+            logits = self.pass(s, c, if last { 1 } else { 0 }, &mut *tap)?.pop().unwrap_or_default();
             done += c.len();
         }
         Ok((done, logits))
