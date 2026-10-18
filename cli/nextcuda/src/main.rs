@@ -458,7 +458,7 @@ fn generate(args: &[String]) -> Result<(), String> {
         (Some(f), None) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
         (None, None) => opt("--prompt").ok_or("--prompt TEXT, --prompt-file PATH or --ids FILE")?,
     };
-    let effort = nextcuda_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
+    let effort = nextcuda_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "default".into())).ok_or("--effort none|low|medium|high|max (default: the template's own)")?;
     let max: usize = opt("--max").and_then(|v| v.parse().ok()).unwrap_or(256);
     let temp: f32 = opt("--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let top_p: f32 = opt("--top-p").and_then(|v| v.parse().ok()).unwrap_or(0.95);
@@ -560,7 +560,7 @@ fn batch_check(args: &[String]) -> Result<(), String> {
     let tok = nextcuda_tok::Tokenizer::from_gguf(&f)?;
     let chat = chat_of(&f)?;
     let ids: Vec<Vec<u32>> = prompts.iter()
-        .map(|p| tok.encode(&chat(&[nextcuda_tok::Message { role: "user", content: p, ..Default::default() }], nextcuda_tok::Effort::Low, &[])))
+        .map(|p| tok.encode(&chat(&[nextcuda_tok::Message { role: "user", content: p, ..Default::default() }], nextcuda_tok::Effort::Default, &[])))
         .collect();
     let ctx = ids.iter().map(|v| v.len()).max().unwrap_or(0) + n + 8;
     let gs: Vec<std::sync::Arc<nextcuda_core::Gpu>> = gpus.iter().map(|i| nextcuda_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
@@ -644,7 +644,7 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0,1".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
     let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
     let tok = nextcuda_tok::Tokenizer::from_gguf(&f)?;
-    let ids = tok.encode(&chat_of(&f)?(&[nextcuda_tok::Message { role: "user", content: &prompt, ..Default::default() }], nextcuda_tok::Effort::Low, &[]));
+    let ids = tok.encode(&chat_of(&f)?(&[nextcuda_tok::Message { role: "user", content: &prompt, ..Default::default() }], nextcuda_tok::Effort::Default, &[]));
     let gs: Vec<std::sync::Arc<nextcuda_core::Gpu>> = gpus.iter().map(|i| nextcuda_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
     let eng = load_engine(&f, &gs, LoadOptions { expert_bytes: None, mirror_bytes: None, draft: true, kv: (ids.len() + n + 4, 2) }, &mut log)?;
@@ -760,7 +760,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     if ctx_list.is_empty() || ctx_list.iter().any(|c| *c < 256) {
         return Err("--ctx N or N,M,... (tokens, at least 256 each)".into());
     }
-    let effort = nextcuda_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
+    let effort = nextcuda_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "default".into())).ok_or("--effort none|low|medium|high|max (default: the template's own)")?;
     let gib_opt = |k: &str| opt(k).and_then(|v| v.parse::<f64>().ok()).map(|x| (x * (1u64 << 30) as f64) as usize);
     // the model's file lives as long as the server
     let f: &'static Gguf = Box::leak(Box::new(Gguf::open(Path::new(model)).map_err(|e| e.0)?));

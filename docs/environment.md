@@ -250,6 +250,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_PEAK_TF32` | 22.9 | Debug: f32 TFLOP/s peak the NS_Q35_PROFILE tables compare the other kernels with | llm qwen35 |
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |
 | `NS_Q35_DRAFTS` | 3 | tokens drafted a step with MTP (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
+| `NS_Q38_CASES` | none | Test: a directory the Qwen3.8 template test writes each case's prompt to (compared with the jinja template by tooling) | tok (tests) |
 | `NS_Q35_MMVQ_GROUPS` | 512 | Experiment: work-groups of the silo's matrix-vector kernels with a lookup table | kernels:qwen35 silo |
 | `NS_Q35_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the silo's matrix-vector kernels | kernels:qwen35 silo |
 | `NS_Q35_MTP` | the first .gguf in an MTP/ folder beside the model | the MTP draft block's GGUF (--opt-mtp) | llm qwen35 |

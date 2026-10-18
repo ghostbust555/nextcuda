@@ -689,9 +689,12 @@ impl Server {
             Api::OpenAi => req["reasoning_effort"].as_str().or_else(|| req["chat_template_kwargs"]["reasoning_effort"].as_str()),
         };
         let effort = match effort {
-            Some(e) => Effort::parse(e).ok_or(format!("effort {e:?}: low, high or max"))?,
+            Some(e) => Effort::parse(e).ok_or(format!("effort {e:?}: none, low, medium, high or max"))?,
             None => self.default_effort,
         };
+        // Qwen3.8's switch (llama.cpp's chat_template_kwargs, or the request's own): false answers without thinking
+        let thinking = req["chat_template_kwargs"]["enable_thinking"].as_bool().or_else(|| req["enable_thinking"].as_bool());
+        let effort = if thinking == Some(false) { Effort::Off } else { effort };
         let chain = req["logprob_chain"].as_bool().or_else(|| req["LogProbChain"].as_bool()).unwrap_or(false);
         Ok(Ask { messages, tools, effort,
                  max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
@@ -1111,11 +1114,7 @@ impl Server {
         let id = format!("chatcmpl-{}", now());
         let rid = self.next_id.fetch_add(1, Ordering::Relaxed);
         *rid_out = rid;
-        let effort = match ask.effort {
-            Effort::Low => "low",
-            Effort::High => "high",
-            Effort::Max => "max",
-        };
+        let effort = ask.effort.name();
         let last_user = ask.messages.iter().rev().find(|m| m.role == "user").map_or("", |m| m.content.as_str());
         self.running.lock().unwrap().insert(rid, json!({"id": rid, "via": via, "state": "waiting", "started": now(), "prompt_tokens": ids.len(),
                                                     "max_tokens": max, "generated": 0, "model": self.name,
@@ -1257,6 +1256,9 @@ impl Server {
                     parts.push((true, piece));
                 }
             } else {
+                // the answer starts at its first visible character (the blank line after </think> is not part of it,
+                // as the non-streamed answer and llama.cpp have it)
+                let piece = if content.is_empty() { piece.trim_start().to_string() } else { piece };
                 content.push_str(&piece);
                 parts.push((false, piece));
             }

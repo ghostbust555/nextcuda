@@ -32,7 +32,11 @@ fn emit(v: &Value, ind: usize, out: &mut String) {
     let pad = " ".repeat(ind);
     match v {
         Value::Object(m) => {
-            for (k, x) in m {
+            // sorted, as the document always was (serde_json keeps insertion order now: the chat templates write a
+            // request's tools in the order it gave them)
+            let mut keys: Vec<(&String, &Value)> = m.iter().collect();
+            keys.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, x) in keys {
                 match (x, empty(x)) {
                     (_, Some(e)) => out.push_str(&format!("{pad}{}: {e}\n", key(k))),
                     (Value::Object(_) | Value::Array(_), _) => {

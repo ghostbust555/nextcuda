@@ -390,18 +390,45 @@ impl Tokenizer {
 /// How much GLM-5.3 thinks before answering (its template's `reasoning_effort`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effort {
+    /// no thinking (Qwen3.8's `enable_thinking: false`, `reasoning_effort: none`); the others read it as Low
+    Off,
+    /// the template's own default (Qwen3.8: medium); the others read it as Low, the server's default before
+    Default,
     Low,
+    /// Qwen3.8's medium; the others read it as High
+    Medium,
     High,
     Max,
 }
 
 impl Effort {
     pub fn parse(s: &str) -> Option<Effort> {
-        match s {
-            "low" => Some(Effort::Low),
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(Effort::Off),
+            "default" => Some(Effort::Default),
+            "low" | "minimal" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
             "high" => Some(Effort::High),
-            "max" => Some(Effort::Max),
+            "max" | "xhigh" | "ultracode" | "extreme" => Some(Effort::Max),
             _ => None,
+        }
+    }
+    /// The three levels the older templates know: off and the default as low, medium as high
+    pub fn level(self) -> Effort {
+        match self {
+            Effort::Off | Effort::Default | Effort::Low => Effort::Low,
+            Effort::Medium | Effort::High => Effort::High,
+            Effort::Max => Effort::Max,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Effort::Off => "off",
+            Effort::Default => "default",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Max => "max",
         }
     }
 }
@@ -433,11 +460,12 @@ pub struct ToolCall {
 /// GLM-5.3's chat template (`tokenizer.chat_template`), its text-only, tool-free path: `[gMASK]<sop>`, the effort
 /// line, the turns, then `<|assistant|><think>` to generate.
 pub fn glm_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
+    let effort = effort.level();
     let mut s = String::from("[gMASK]<sop>");
     s += match effort {
         Effort::Low => "<|system|>Reasoning Effort: Low",
         Effort::High => "<|system|>Reasoning Effort: High",
-        Effort::Max => "<|system|>Reasoning Effort: Max",
+        _ => "<|system|>Reasoning Effort: Max",
     };
     for m in messages {
         match m.role {
@@ -493,6 +521,7 @@ pub fn deepseek_chat(messages: &[Message], _effort: Effort, _tools: &[String]) -
 /// turn as `<｜Assistant｜></think>` its answer `<｜end▁of▁sentence｜>` (earlier turns keep no thinking), then
 /// `<｜Assistant｜>` and `<think>` - or `</think>` at the low effort (V4's non-thinking mode).
 pub fn deepseek4_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
+    let effort = effort.level();
     const MAX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
     let thinking = !matches!(effort, Effort::Low);
     let mut s = String::from("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
@@ -584,10 +613,11 @@ fn today() -> String {
 /// `<|eom|>`, its answer `to=user`), then `<|start|>assistant` to generate - the model writes ` to=self` and its
 /// reasoning, `<|eom|>`, then `<|start|>assistant to=user<|message|>` and the answer, `<|eot|>`.
 pub fn muse_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
+    let effort = effort.level();
     let strength = match effort {
         Effort::Low => "low",
         Effort::High => "high",
-        Effort::Max => "xhigh",
+        _ => "xhigh",
     };
     let reasoning = format!("Reasoning strength: {strength}.");
     let recipients = "# Valid recipients: \"self\", \"user\".";
@@ -753,11 +783,227 @@ pub fn qwen_chat(messages: &[Message], _effort: Effort, tools: &[String]) -> Str
     s
 }
 
+/// The `<|think_*|>` switches a system or user turn may carry (froggeric's Qwen3.8 template): stripped from the text
+const QWEN38_SWITCHES: &[&str] = &["<|think_off|>", "<|think_on|>", "<|think_xhigh|>", "<|think_high|>", "<|think_ultracode|>", "<|think_extreme|>",
+                                   "<|think_max|>", "<|think_medium|>", "<|think_low|>", "<|think_minimal|>"];
+
+fn qwen38_strip(text: &str) -> String {
+    let mut t = text.trim().to_string();
+    for sw in QWEN38_SWITCHES {
+        if t.contains(sw) {
+            t = t.split(sw).collect::<Vec<_>>().join("").trim().to_string();
+        }
+    }
+    t
+}
+
+/// A tool result that reads as an error (the template's heuristic: its first 120 characters, lowercased)
+fn qwen38_tool_failed(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    let head: String = lower.chars().take(120).collect();
+    let code = ["throw new ", "throw error", "console.error", "logger.error", "logging.error"].iter().any(|k| lower.contains(k))
+        || ["import ", "def ", "function "].iter().any(|k| head.contains(k));
+    let exit0 = head.contains("exit code: 0") || head.contains("process exited with code 0");
+    let error_ok = ["\"error\": null", "\"error\":null", "\"error\": false", "\"error\":false", "\"error\": \"\"", "\"error\":\"\""].iter().any(|k| head.contains(k));
+    let strong = (head.contains("\"error\":") && !error_ok) || head.contains("\"status\": \"error\"") || head.contains("\"status\":\"error\"")
+        || head.contains("traceback (most recent call last):") || head.contains("command not found") || head.contains("invalid syntax") || head.contains("fatal:")
+        || ((head.contains("exit code: ") || head.contains("process exited with code")) && !exit0) || head.starts_with("exception:") || head.starts_with("failed to ");
+    let weak = head.contains("error:") || head.contains("err!");
+    let weak_off = head.contains("$ ") || head.contains("took ") || content.chars().count() >= 600;
+    !code && (strong || (weak && !weak_off))
+}
+
+/// Qwen3.8's chat template as brainiac-llm serves it (peculiar-ragdoll/Qwen-Sharp-Chat-Templates v22.5.0: froggeric's
+/// fixed Qwen3.5/3.6/3.8 template and its terseness prompt; tools in its XML format; past thinking kept). The effort:
+/// Off is `enable_thinking: false` (`<think>\n\n</think>` closed in the prompt), Low / Medium (and Default) / High and
+/// Max (its xhigh) the template's reasoning_effort; a `<|think_*|>` switch in a system or user turn overrides it.
+pub fn qwen38_chat(messages: &[Message], effort: Effort, tools: &[String]) -> String {
+    let mut thinking = effort != Effort::Off;
+    let mut level = match effort {
+        Effort::Low => "low",
+        Effort::High | Effort::Max => "xhigh",
+        _ => "medium",
+    };
+    for m in messages.iter().filter(|m| matches!(m.role, "system" | "developer" | "user")) {
+        let c = m.content;
+        if c.contains("<|think_off|>") {
+            thinking = false;
+        } else if c.contains("<|think_on|>") {
+            thinking = true;
+        } else if ["<|think_xhigh|>", "<|think_high|>", "<|think_ultracode|>", "<|think_extreme|>", "<|think_max|>"].iter().any(|k| c.contains(k)) {
+            (thinking, level) = (true, "xhigh");
+        } else if c.contains("<|think_low|>") || c.contains("<|think_minimal|>") {
+            (thinking, level) = (true, "low");
+        } else if c.contains("<|think_medium|>") {
+            (thinking, level) = (true, "medium");
+        }
+    }
+    let instructions = match (thinking, level) {
+        (true, "xhigh") => "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
+        (true, "low") => "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
+        _ => "",
+    };
+    let head = messages.iter().take_while(|m| matches!(m.role, "system" | "developer")).count();
+    let mut sc = messages[..head].iter().map(|m| qwen38_strip(m.content)).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let lead = if thinking {
+        "Answer directly, after thinking. Lead with the answer, then only what it needs to be correct and usable."
+    } else {
+        "Answer directly and concisely. Give the answer with only what it needs to be correct and usable."
+    };
+    let terse = format!("{lead}\nNever: open with preamble or pleasantries; restate the question; add filler transitions; hedge with niceties; or repeat a point you've already made.\nAlways: keep essential steps, caveats, uncertainties, and specifics \u{2014} never drop correctness or a needed warning for brevity. Keep the final answer lean. Use the least structure that conveys it (plain prose when short; lists or code only when they earn their place). If genuinely uncertain, say so and explain why \u{2014} never omit uncertainty for the sake of brevity.\nIf a user request is genuinely ambiguous, ask a sharp question, don't guess.");
+    sc = if sc.is_empty() { terse } else { format!("{}\n\n{terse}", sc.trim()) };
+    let mut s = String::new();
+    if !tools.is_empty() && !sc.contains("[TOOL_REQUEST]") {
+        s += "<|im_start|>system\n";
+        if !instructions.is_empty() {
+            s += instructions;
+            s += "\n\n";
+        }
+        s += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for t in tools {
+            s += "\n";
+            s += t;
+        }
+        s += "\n</tools>";
+        s += "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n";
+        if thinking {
+            s += "<think>\nBrief explanation of tool call\n</think>\n";
+        }
+        s += "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n";
+        if thinking {
+            s += "- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n";
+        }
+        s += "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n";
+        s += if thinking {
+            "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.\n"
+        } else {
+            "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY, with NO conversational text before it.\n"
+        };
+        s += "- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.\n- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.\n- If you have all necessary data, provide your final answer directly to the user without any tool call.\n</IMPORTANT>";
+        s += "\n\n";
+        s += &sc;
+        s += "<|im_end|>\n";
+    } else {
+        s += "<|im_start|>system\n";
+        if !instructions.is_empty() {
+            s += instructions;
+            s += "\n\n";
+        }
+        s += &sc;
+        s += "<|im_end|>\n";
+    }
+    let ms = &messages[head..];
+    let (mut prev, mut failures) = ("", 0usize);
+    for (k, m) in ms.iter().enumerate() {
+        let system = matches!(m.role, "system" | "developer");
+        let mut content = m.content.trim().to_string();
+        if system || m.role == "user" {
+            content = qwen38_strip(&content);
+        }
+        if system {
+            s += "<|im_start|>system\n";
+            s += &content;
+            s += "<|im_end|>\n";
+        } else if m.role == "user" {
+            failures = 0;
+            s += "<|im_start|>user\n";
+            s += &content;
+            s += "<|im_end|>\n";
+        } else if m.role == "assistant" {
+            let mut reasoning = String::new();
+            if let Some(r) = m.reasoning.filter(|r| !r.is_empty()) {
+                let lead_end = if content.starts_with("<think>") && content.contains("</think>") || content.starts_with("</think>") {
+                    "</think>"
+                } else if content.starts_with("<thinking>") && content.contains("</thinking>") || content.starts_with("</thinking>") {
+                    "</thinking>"
+                } else {
+                    ""
+                };
+                if !lead_end.is_empty() {
+                    content = content.rsplit(lead_end).next().unwrap_or("").trim_start_matches('\n').to_string();
+                }
+                reasoning = r.to_string();
+            } else {
+                let end = if content.starts_with("</think>") {
+                    "</think>"
+                } else if content.starts_with("</thinking>") {
+                    "</thinking>"
+                } else if content.contains("\n</think>") {
+                    "\n</think>"
+                } else if content.contains("\n</thinking>") {
+                    "\n</thinking>"
+                } else if content.contains("\n</ think>") {
+                    "\n</ think>"
+                } else if content.contains("\n</think >") {
+                    "\n</think >"
+                } else if content.starts_with("<think>") && content.contains("</think>") {
+                    "</think>"
+                } else if content.starts_with("<thinking>") && content.contains("</thinking>") {
+                    "</thinking>"
+                } else {
+                    ""
+                };
+                if !end.is_empty() {
+                    let start = if end.contains("thinking") { "<thinking>" } else { "<think>" };
+                    let before = content.split(end).next().unwrap_or("").trim_end_matches('\n');
+                    reasoning = if before.contains(start) { before.rsplit(start).next().unwrap_or("").trim_start_matches('\n').to_string() } else { before.to_string() };
+                    content = content.rsplit(end).next().unwrap_or("").trim_start_matches('\n').to_string();
+                }
+            }
+            s += "<|im_start|>assistant\n<think>\n";
+            s += reasoning.trim();
+            s += "\n</think>\n\n";
+            s += &content;
+            for (i, call) in m.calls.iter().enumerate() {
+                s += if i > 0 { "\n<tool_call>\n<function=" } else if content.trim().is_empty() { "<tool_call>\n<function=" } else { "\n\n<tool_call>\n<function=" };
+                s += &call.name;
+                s += ">\n";
+                for (k, v) in &call.args {
+                    s += "<parameter=";
+                    s += k;
+                    s += ">\n";
+                    s += v;
+                    s += "\n</parameter>\n";
+                }
+                s += "</function>\n</tool_call>";
+            }
+            s += "<|im_end|>\n";
+        } else if m.role == "tool" {
+            failures = if qwen38_tool_failed(&content) { failures + 1 } else { 0 };
+            if prev != "tool" {
+                s += "<|im_start|>user";
+            }
+            s += "\n<tool_response>\n";
+            s += &content;
+            if failures >= 2 {
+                s += &format!("\n\n\u{26a0}\u{fe0f} SYSTEM WARNING: {failures} consecutive tool errors detected. Your previous approach is incorrect. You MUST use a fundamentally different approach or corrected arguments.");
+            } else if failures == 1 {
+                s += "\n\n\u{26a0}\u{fe0f} SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.";
+            }
+            s += "\n</tool_response>";
+            if k + 1 == ms.len() || ms[k + 1].role != "tool" {
+                s += "<|im_end|>\n";
+            }
+        } else {
+            s += "<|im_start|>user\n[";
+            s += m.role;
+            s += "]: ";
+            s += &content;
+            s += "<|im_end|>\n";
+        }
+        prev = m.role;
+    }
+    s += "<|im_start|>assistant\n";
+    s += if thinking { "<think>\n" } else { "<think>\n\n</think>\n\n" };
+    s
+}
+
 /// Nemotron 3.5's chat template (`tokenizer.chat_template`, n5h): ChatML with a system turn always (empty without one),
 /// the tools in it after the system text, past assistant turns' thinking dropped (`<think></think>` kept in its place:
 /// truncate_history_thinking), tool results in one user turn, then `<|im_start|>assistant\n<think>\n`. Low effort is
 /// the template's medium_effort (`{reasoning effort: efficient}` after the last user turn).
 pub fn nemotron_chat(messages: &[Message], effort: Effort, tools: &[String]) -> String {
+    let effort = effort.level();
     let (sys, ms) = match messages.first() {
         Some(m) if m.role == "system" => (m.content, &messages[1..]),
         _ => ("", messages),
@@ -993,4 +1239,39 @@ mod hf_json_tests {
         assert_eq!(t.encode("[S0]hi hi!"), vec![9, 3, 5, 6]);
     }
 
+}
+
+#[cfg(test)]
+mod qwen38_cases {
+    use super::*;
+
+    /// The cases tooling compares with the template itself (NS_Q38_CASES=dir: each case's prompt written there)
+    #[test]
+    fn qwen38_cases() {
+        let call = [ToolCall { name: "get_weather".into(), args: vec![("city".into(), "Chicago".into()), ("days".into(), "3".into())] }];
+        let tool = r#"{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}"#.to_string();
+        let m = |role, content| Message { role, content, reasoning: None, calls: &[] };
+        let cases: Vec<(&str, Vec<Message>, Effort, Vec<String>)> = vec![
+            ("user_default", vec![m("user", "Hi")], Effort::Default, vec![]),
+            ("sys_off", vec![m("system", "You are a pirate."), m("user", "Hi")], Effort::Off, vec![]),
+            ("low", vec![m("user", "Hi")], Effort::Low, vec![]),
+            ("max", vec![m("system", "S1"), m("developer", "S2"), m("user", "Hi")], Effort::Max, vec![]),
+            ("multi", vec![m("user", "A"), Message { role: "assistant", content: "Answer A", reasoning: Some("thought A"), calls: &[] },
+                           m("assistant", "<think>\ninline thought\n</think>\n\nAnswer B"), m("user", "C <|think_low|>")], Effort::Default, vec![]),
+            ("switch_off", vec![m("user", "<|think_off|> quick")], Effort::High, vec![]),
+            ("tools", vec![m("system", "Be helpful."), m("user", "Weather?"), Message { role: "assistant", content: "", reasoning: Some("need tool"), calls: &call },
+                           m("tool", "Error: city not found"), m("tool", "{\"error\": \"timeout\"}"), m("user", "again"),
+                           Message { role: "assistant", content: "Checking.", reasoning: None, calls: &call }, m("tool", "sunny")], Effort::Default, vec![tool.clone()]),
+            ("tools_off", vec![m("user", "Weather?")], Effort::Off, vec![tool]),
+            ("other_role", vec![m("user", "x"), m("critic", "y")], Effort::Default, vec![]),
+        ];
+        let dir = std::env::var("NS_Q38_CASES").ok();
+        for (name, msgs, effort, tools) in &cases {
+            let p = qwen38_chat(msgs, *effort, tools);
+            assert!(p.ends_with("<|im_start|>assistant\n<think>\n") || p.ends_with("</think>\n\n"), "{name}");
+            if let Some(d) = &dir {
+                std::fs::write(format!("{d}/{name}.rs.txt"), p).unwrap();
+            }
+        }
+    }
 }

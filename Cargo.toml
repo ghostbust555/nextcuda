@@ -51,7 +51,7 @@ nextcuda-audio-voxcpm2 = { path = "audio/voxcpm2" }
 nextcuda-audio-breezetts2 = { path = "audio/breezetts2" }
 nextcuda-models = { path = "glue/models" }
 nextcuda-serve = { path = "glue/serve" }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
 debug = 1
