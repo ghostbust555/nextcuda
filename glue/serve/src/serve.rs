@@ -111,6 +111,7 @@ pub struct Server {
 /// One message of a request: its role, text, kept thinking, and an assistant turn's tool calls
 struct Msg {
     role: String,
+    /// its text, a picture part as PICTURE_MARK
     content: String,
     reasoning: Option<String>,
     calls: Vec<ToolCall>,
@@ -118,6 +119,8 @@ struct Msg {
 
 struct Ask {
     messages: Vec<Msg>,
+    /// the pictures' sources in the order their marks come in the messages
+    pictures: Vec<String>,
     /// OpenAI's `tools` (functions the model may call; none when `tool_choice` is "none")
     tools: Vec<Value>,
     effort: Effort,
@@ -437,6 +440,67 @@ fn message_json(text: &str, reasoning: &str, calls: &[Value]) -> Value {
     m
 }
 
+/// The marker a picture part becomes in a message's text (Qwen-VL's, as llama.cpp's mtmd writes it); its
+/// `<|image_pad|>` is replaced by the picture's tokens once the prompt is tokenized
+const PICTURE_MARK: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+/// A content part's picture source (OpenAI's image_url as an object or a string; `image` / `input_image` forms)
+fn picture_source(p: &Value) -> Option<String> {
+    let t = p["type"].as_str().unwrap_or("");
+    if !matches!(t, "image_url" | "image" | "input_image") {
+        return None;
+    }
+    let v = if p["image_url"].is_null() { &p["image"] } else { &p["image_url"] };
+    v.as_str().or_else(|| v["url"].as_str()).map(str::to_string)
+}
+
+/// A message's content as text with its pictures as `PICTURE_MARK`, and the pictures' sources in order
+fn content_of(v: &Value) -> (String, Vec<String>) {
+    match v {
+        Value::Array(a) => {
+            let mut text = String::new();
+            let mut pics = Vec::new();
+            for p in a {
+                if let Some(src) = picture_source(p) {
+                    text += PICTURE_MARK;
+                    pics.push(src);
+                } else if let Some(t) = p.get("text").and_then(|t| t.as_str()).or_else(|| p.as_str()) {
+                    text += t;
+                }
+            }
+            (text, pics)
+        }
+        other => (text_of(other), Vec::new()),
+    }
+}
+
+/// A picture's bytes from its source: a data: URL (or bare base64), or an http:// URL (https needs TLS, which this
+/// server does not have: such a client sends the picture as a data: URL)
+fn picture_bytes(src: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    if src.starts_with("https://") {
+        return Err(format!("{}: https picture URLs are not fetched here (no TLS) - send the picture as a data: URL", &src[..src.len().min(80)]));
+    }
+    if let Some(rest) = src.strip_prefix("http://") {
+        let (host, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
+        let addr = if host.contains(':') { host.to_string() } else { format!("{host}:80") };
+        let mut s = std::net::TcpStream::connect(&addr).map_err(|e| format!("{addr}: {e}"))?;
+        s.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        // HTTP/1.0: the answer is the body to the close (no chunks)
+        write!(s, "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: nextcuda\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+        let mut all = Vec::new();
+        s.take(64 << 20).read_to_end(&mut all).map_err(|e| e.to_string())?;
+        let end = all.windows(4).position(|w| w == b"\r\n\r\n").ok_or("a malformed answer")?;
+        let head = String::from_utf8_lossy(&all[..end]);
+        let status = head.split_whitespace().nth(1).unwrap_or("");
+        if status != "200" {
+            return Err(format!("{}: HTTP {status}", &src[..src.len().min(80)]));
+        }
+        return Ok(all[end + 4..].to_vec());
+    }
+    http::unbase64(src)
+}
+
 fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -674,11 +738,12 @@ impl Server {
     /// A request's body as an `Ask` (OpenAI's fields, or /api/chat's).
     fn ask(&self, req: &Value, api: Api) -> Result<Ask, String> {
         let thinking_key = if api == Api::Lines { "thinking" } else { "reasoning_content" };
-        let messages = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| Msg {
-            role: m["role"].as_str().unwrap_or("user").to_string(),
-            content: text_of(&m["content"]),
-            reasoning: m[thinking_key].as_str().map(str::to_string),
-            calls: calls_of(&m["tool_calls"]),
+        let mut pictures = Vec::new();
+        let messages = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| {
+            let (content, pics) = content_of(&m["content"]);
+            pictures.extend(pics);
+            Msg { role: m["role"].as_str().unwrap_or("user").to_string(), content, reasoning: m[thinking_key].as_str().map(str::to_string),
+                  calls: calls_of(&m["tool_calls"]) }
         }).collect();
         let tools = match (api, req["tool_choice"].as_str()) {
             (Api::OpenAi, Some("none")) | (Api::Lines, _) => Vec::new(),
@@ -696,7 +761,7 @@ impl Server {
         let thinking = req["chat_template_kwargs"]["enable_thinking"].as_bool().or_else(|| req["enable_thinking"].as_bool());
         let effort = if thinking == Some(false) { Effort::Off } else { effort };
         let chain = req["logprob_chain"].as_bool().or_else(|| req["LogProbChain"].as_bool()).unwrap_or(false);
-        Ok(Ask { messages, tools, effort,
+        Ok(Ask { messages, pictures, tools, effort,
                  max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
                  temp: req["temperature"].as_f64().unwrap_or(1.0) as f32,
                  top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32,
@@ -708,6 +773,38 @@ impl Server {
                      _ => None,
                  },
                  chain, seed: req["seed"].as_u64().or_else(|| req["seed"].as_i64().map(|s| s as u64)) })
+    }
+
+    /// A prompt's pictures in place: each `<|image_pad|>` (in order) becomes its picture's tokens, the picture given to
+    /// the engine first (its key from the picture's bytes: a prefix with another picture is never reused for it)
+    fn place_pictures(&self, ids: Vec<u32>, sources: &[String]) -> Result<Vec<u32>, String> {
+        use sha2::{Digest, Sha256};
+        if !self.engine.sees() {
+            return Err(format!("{} takes no pictures (no vision tower loaded)", self.name));
+        }
+        let pad = self.tok.encode("<|image_pad|>");
+        let [pad] = pad[..] else { return Err("the tokenizer has no <|image_pad|> token".into()) };
+        let n_marks = ids.iter().filter(|t| **t == pad).count();
+        if n_marks != sources.len() {
+            return Err(format!("{} pictures and {n_marks} picture marks in the prompt (a message's text holds <|image_pad|>?)", sources.len()));
+        }
+        let mut out = Vec::with_capacity(ids.len() + sources.len() * 1024);
+        let mut k = 0;
+        for t in ids {
+            if t != pad {
+                out.push(t);
+                continue;
+            }
+            let bytes = picture_bytes(&sources[k]).map_err(|e| format!("picture {}: {e}", k + 1))?;
+            let h = Sha256::digest(&bytes);
+            let bits = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) & ((1 << (31 - nextcuda_llm::PICTURE_INDEX_BITS)) - 1);
+            let key = nextcuda_llm::PICTURE_TOKEN | (bits << nextcuda_llm::PICTURE_INDEX_BITS);
+            let pic = nextcuda_diffusion::picture::Picture::decode(&bytes).map_err(|e| format!("picture {}: {e}", k + 1))?.rgb();
+            let (nx, ny) = self.engine.add_picture(key, &pic.data, pic.width as usize, pic.height as usize).map_err(|e| format!("picture {}: {}", k + 1, e.0))?;
+            out.extend((0..(nx * ny) as u32).map(|i| key | i));
+            k += 1;
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------------ the engine thread
@@ -1104,6 +1201,7 @@ impl Server {
         // Muse Glimmer's channels: the answer after `<|start|>assistant` is a to=self message, then the to=user one
         let channels = text.ends_with("<|start|>assistant");
         let ids = self.tok.encode(&text);
+        let ids = if ask.pictures.is_empty() { ids } else { self.place_pictures(ids, &ask.pictures)? };
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }

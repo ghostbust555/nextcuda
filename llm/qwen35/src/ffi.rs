@@ -33,6 +33,7 @@ pub struct Api {
     pub swiglu: unsafe extern "C" fn(G, F, F, FM, i64, f32) -> c_int,
     // q35.h: its own
     pub qk_norm_rope: unsafe extern "C" fn(G, F, i64, i64, FM, i64, i64, i64, i64, F, f32, i64, f32, i64) -> c_int,
+    pub qk_norm_mrope: unsafe extern "C" fn(G, F, i64, i64, FM, i64, i64, i64, i64, F, f32, i64, f32, P) -> c_int,
     pub kv_store: unsafe extern "C" fn(G, F, i64, F, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
     pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64,
     pub attn: unsafe extern "C" fn(G, F, i64, P, P, i64, i64, i64, i64, i64, i64, FM, FM) -> c_int,
@@ -82,6 +83,7 @@ pub fn api() -> nextcuda_core::Result<&'static Api> {
             kda_scan: sym!("ns_q35_kda_scan"),
             swiglu: sym!("ns_q35_swiglu"),
             qk_norm_rope: sym!("ns_q35_qk_norm_rope"),
+            qk_norm_mrope: sym!("ns_q35_qk_norm_mrope"),
             kv_store: sym!("ns_q35_kv_store"),
             attn_scratch: sym!("ns_q35_attn_scratch"),
             attn: sym!("ns_q35_attn"),

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nextcuda-core.workspace = true
+nextcuda-diffusion.workspace = true
 nextcuda-gguf.workspace = true
 nextcuda-llm.workspace = true
 nextcuda-tok.workspace = true

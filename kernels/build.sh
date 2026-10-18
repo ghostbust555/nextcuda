@@ -58,8 +58,8 @@ for k in $KINDS; do
   # a kind with no kernels of its own is still a library when its engines run on the shared ones alone (video: H3
   # is all nsd)
   [ -n "$(ls "$OBJ"/${k}_*.o 2>/dev/null | grep -v '_silo_' || true)" ] || [ "$k" = video ] || continue
-  # the shared diffusion kernels (nsd) are in every kind's library but llm's
-  [ "$k" = llm ] || objs="$objs $(ls "$OBJ"/diffusion_*.o 2>/dev/null || true)"
+  # the shared diffusion kernels (nsd) are in every kind's library (llm's too: Qwen3.8's vision tower runs on them)
+  objs="$objs $(ls "$OBJ"/diffusion_*.o 2>/dev/null || true)"
   extra=()
   sdso=$(ls "$SDLIB"/bin/libstable-diffusion.so "$SDLIB"/libstable-diffusion.so 2>/dev/null | head -1 || true)
   if [ "$k" = image ] && [ -n "$sdso" ]; then

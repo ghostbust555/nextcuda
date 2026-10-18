@@ -22,6 +22,11 @@ typedef struct ns_gpu ns_gpu;
  * on its first n_rot features (pairs i, i + n_rot/2; angle (p0 + t) * theta^(-2i / n_rot)); into dst [t * ds + h * D] */
 int ns_q35_qk_norm_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D,
                         const float* w, float eps, int64_t n_rot, float theta, int64_t p0);
+/* As ns_q35_qk_norm_rope with each row's own positions: pos3 [3][T] int32 on the GPU, (temporal, row, column) - a
+ * picture's tokens. Qwen3.8's interleaved M-RoPE (llama.cpp's IMROPE, sections 11 / 11 / 10): rotary pair k turns by
+ * position section k % 3. A text row's three are equal (= ns_q35_qk_norm_rope at that position) */
+int ns_q35_qk_norm_mrope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D,
+                         const float* w, float eps, int64_t n_rot, float theta, const int32_t* pos3);
 /* The cache [Hkv][cap][D] half: rows k [T, Hkv x D] (ks floats apart) and v (vs apart) at positions p0.. */
 int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                     void* kc, void* vc);

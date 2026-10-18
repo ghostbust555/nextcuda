@@ -559,8 +559,10 @@ __global__ void __launch_bounds__(256) kda_scan_k(const float* __restrict__ qv, 
 }
 
 // ---- the small passes
+// pos3 (nullable): each row's (t, h, w) positions [3][T] - Qwen3.8's interleaved M-RoPE (llama.cpp's IMROPE with
+// sections 11 / 11 / 10): pair k turns by position section k % 3; without it every pair by p0 + t
 __global__ void qk_norm_rope_k(const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t H, int64_t D, const float* w,
-                               float eps, int64_t n_rot, float theta, int64_t p0) {
+                               float eps, int64_t n_rot, float theta, int64_t p0, const int32_t* pos3, int64_t T) {
     extern __shared__ float row[];   // the normed row: dst may be src
     const int l = threadIdx.x;
     const int64_t th = blockIdx.x, t = th / H, h = th % H;
@@ -571,13 +573,14 @@ __global__ void qk_norm_rope_k(const float* src, int64_t ss, int64_t hs, float* 
     for (int64_t i = l; i < D; i += 32) row[i] = x[i] * inv * w[i];
     __syncwarp();
     const int64_t half_rot = n_rot / 2;
-    const float pos = (float) (p0 + t);
+    const float lin = (float) (p0 + t);
     float* y = dst + t * ds + h * D;
     for (int64_t i = l; i < D; i += 32) {
         const float v = row[i];
         if (i < n_rot) {
             // rotate-half over the first n_rot: pair (i, i + n_rot / 2)
             const int64_t k = i < half_rot ? i : i - half_rot;
+            const float pos = pos3 ? (float) pos3[(k % 3) * T + t] : lin;
             const float a = pos * powf(theta, -2.0f * (float) k / (float) n_rot);
             const float c = cosf(a), sn = sinf(a);
             const float other = row[i < half_rot ? i + half_rot : i - half_rot];
@@ -811,7 +814,19 @@ int ns_q35_qk_norm_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, flo
     NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     if (D % 32 != 0 || D > 4096 || n_rot > D || n_rot % 2) return ns_fail("ns_q35_qk_norm_rope: D a multiple of 32 (at most 4096), n_rot even and at most D");
-    qk_norm_rope_k<<<(unsigned) (T * H), 32, (size_t) D * 4, g->q>>>(src, ss, hs, dst, ds, H, D, w, eps, n_rot, theta, p0);
+    qk_norm_rope_k<<<(unsigned) (T * H), 32, (size_t) D * 4, g->q>>>(src, ss, hs, dst, ds, H, D, w, eps, n_rot, theta, p0, nullptr, T);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_qk_norm_mrope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D,
+                         const float* w, float eps, int64_t n_rot, float theta, const int32_t* pos3) {
+    NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
+    if (T <= 0) return 0;
+    if (D % 32 != 0 || D > 4096 || n_rot > D || n_rot % 2 || !pos3) return ns_fail("ns_q35_qk_norm_mrope: D a multiple of 32 (at most 4096), n_rot even and at most D, the positions given");
+    qk_norm_rope_k<<<(unsigned) (T * H), 32, (size_t) D * 4, g->q>>>(src, ss, hs, dst, ds, H, D, w, eps, n_rot, theta, 0, pos3, T);
     NS_LAUNCH_CHECK();
     return 0;
     NS_CATCH

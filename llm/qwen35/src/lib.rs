@@ -6,6 +6,7 @@
 
 pub mod engine;
 mod ffi;
+pub mod vision;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -110,7 +111,8 @@ impl Engine for engine::Qwen35<'_> {
     }
     fn cache_fingerprint(&self) -> String {
         // checkpoints hold the draft block's cache too when it is loaded
-        if self.has_draft() { "qwen35 f16-kv nsq35-1 mtp".into() } else { "qwen35 f16-kv nsq35-1".into() }
+        // nsq35-2: a checkpoint carries the session's rotary shift (pictures)
+        if self.has_draft() { "qwen35 f16-kv nsq35-2 mtp".into() } else { "qwen35 f16-kv nsq35-2".into() }
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
         Ok(Session::new(engine::Qwen35::session(self, max_ctx)?))
@@ -166,6 +168,12 @@ impl Engine for engine::Qwen35<'_> {
     }
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::Qwen35::gpu_info(self)
+    }
+    fn sees(&self) -> bool {
+        engine::Qwen35::sees(self)
+    }
+    fn add_picture(&self, key: u32, rgb: &[u8], w: usize, h: usize) -> Result<(usize, usize)> {
+        engine::Qwen35::add_picture_rgb(self, key, rgb, w, h)
     }
     fn report(&self, _tokens: usize) -> Vec<String> {
         engine::Qwen35::profile_lines(self)

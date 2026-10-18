@@ -748,6 +748,7 @@ name = "nextcuda-llm-qwen35"
 version = "0.0.0"
 dependencies = [
  "nextcuda-core",
+ "nextcuda-diffusion",
  "nextcuda-gguf",
  "nextcuda-llm",
  "nextcuda-tok",

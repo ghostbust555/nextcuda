@@ -18,6 +18,7 @@
 //! own normed output), verifies [token, drafts] in one pass and keeps the longest prefix the sampled tokens match - a
 //! rejected row's DeltaNet states come back from the pass's snapshots.
 
+use std::collections::HashMap;
 use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -150,6 +151,9 @@ struct Layer {
 pub struct Session {
     pub pos: usize,
     pub max_ctx: usize,
+    /// a text token's rotary position is its slot less this: the slots pictures took beyond the positions they
+    /// advance (a picture of n tokens on an nx x ny grid moves the position by max(nx, ny))
+    pub shift: i64,
     layers: Vec<LState>,
     /// rows of the last forward pass
     last_rows: usize,
@@ -302,6 +306,31 @@ struct Dev {
     le: usize,
 }
 
+/// A picture's tokens in a prompt: ids past the vocabulary, PICTURE | (the picture's key << 12) | its token's index,
+/// the key a hash of the picture (so a prefix with another picture is never reused for it). Rows in raster order of
+/// the merged patch grid, nx columns by ny rows
+pub const PICTURE: u32 = nextcuda_llm::PICTURE_TOKEN;
+pub const PICTURE_INDEX_BITS: u32 = nextcuda_llm::PICTURE_INDEX_BITS;
+
+/// What the vision tower made of a picture: its tokens' embeddings [nx * ny, n_embd] (float32, host) and its grid
+pub struct Picture {
+    pub rows: Vec<f32>,
+    pub nx: usize,
+    pub ny: usize,
+}
+
+/// A picture token's (key, index)
+fn picture_of(id: u32) -> Option<(u32, usize)> {
+    (id & PICTURE != 0).then(|| (id & !PICTURE & !((1 << PICTURE_INDEX_BITS) - 1), (id & ((1 << PICTURE_INDEX_BITS) - 1)) as usize))
+}
+
+/// The rotary positions of a pass's rows: one run from a position (text), or each row's own (temporal, row, column)
+/// - pictures' tokens (Qwen3.8's M-RoPE), [3][t] int32 (put on each GPU as it is used)
+enum Rope {
+    From(i64),
+    Rows(Vec<i32>),
+}
+
 pub struct Qwen35<'g> {
     pub g: Geometry,
     file: &'g Gguf,
@@ -333,6 +362,22 @@ pub struct Qwen35<'g> {
     next_id: std::sync::atomic::AtomicU64,
     load_s: f64,
     load_bytes: u64,
+    /// the pictures prompts name (`add_picture`), by key
+    pictures: Mutex<HashMap<u32, Arc<Picture>>>,
+    /// the vision tower (a projector beside the model), on the last GPU
+    vision: Option<crate::vision::Vision>,
+}
+
+/// The projector beside the model (`mmproj*.gguf` in its folder), unless NS_Q35_VISION=0
+fn vision_path(f: &Gguf) -> Option<std::path::PathBuf> {
+    if std::env::var("NS_Q35_VISION").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let dir = f.paths.first()?.parent()?;
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("mmproj") && n.ends_with(".gguf"))).collect();
+    found.sort();
+    found.into_iter().next()
 }
 
 /// NS_Q35_CHUNK when set; otherwise chosen at load (`Qwen35::load`: 2,048 rows when they fit)
@@ -400,11 +445,17 @@ impl<'g> Qwen35<'g> {
         let mtp_bytes = mtp_w + if mfile.is_some() { snap_bytes as u64 } else { 0 };
         let margin: u64 = 768 << 20;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        // the vision tower: a Qwen3-VL projector beside the model (NS_Q35_VISION=0: none), its weights on the last GPU
+        let mmproj = vision_path(f);
+        let vision_bytes = match &mmproj {
+            Some(p) => Gguf::open(p).map(|m| crate::vision::card_bytes(&m)).unwrap_or(0),
+            None => 0,
+        };
         // the draft block's pass behind a chunk's: its inputs and outputs beside the main pass's
         let has_mtp = mfile.is_some();
         let arena_of = |c: usize| arena_bytes(&g, c) + if has_mtp { c * 8 * g.n_embd * 4 } else { 0 };
         let (chunk, bounds) = if gpus.len() == 1 {
-            let fixed = weights + mtp_bytes + w16_bytes as u64 + margin;
+            let fixed = weights + mtp_bytes + vision_bytes + w16_bytes as u64 + margin;
             let chunk = chunk_setting().unwrap_or_else(|| {
                 [2048, 1024].into_iter().find(|c| fixed + arena_bytes(&g, *c) as u64 + SESSION_ROOM <= free[0]).unwrap_or(512)
             });
@@ -431,7 +482,7 @@ impl<'g> Qwen35<'g> {
                     // (and 512 MiB the plan does not see: the allocator's rounding, small buffers)
                     let mut over = margin + (512 << 20) + w16_bytes as u64 + arena_of(c) as u64;
                     if i + 1 == n {
-                        over += head_w + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
+                        over += head_w + vision_bytes + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
                     }
                     free[i] as i64 - over as i64
                 }).collect();
@@ -593,9 +644,19 @@ impl<'g> Qwen35<'g> {
             .collect::<Vec<_>>().join(", ");
         log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), gib(loaded)));
+        let vision = match &mmproj {
+            Some(p) => match crate::vision::Vision::load(p, &devs[devs.len() - 1].gpu, &mut *log) {
+                Ok(v) => Some(v),
+                Err(x) => {
+                    log(format!("qwen35: the vision tower {} does not load ({}); no pictures", p.display(), x.0));
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
-                    load_bytes: loaded })
+                    load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision })
     }
 
     /// A kernel call (its return code checked): timed on the device with NS_Q35_PROFILE=1, with the bytes it moves
@@ -759,9 +820,35 @@ impl<'g> Qwen35<'g> {
         self.op("add", String::new, 12 * n, n, || unsafe { (self.k.add)(self.raw(), y.fp(), x.fp(), n as i64) })
     }
 
-    /// The tokens' embeddings [t, n_embd] (their rows read from the file, expanded on the GPU)
-    fn embed(&self, tokens: &[u32]) -> Result<DevBuf> {
-        self.embed_from(self.file, &self.embd, self.g.vocab, tokens)
+    /// `embed_from` with pictures' tokens: their rows the picture's (the vision tower's), the others the table's
+    fn embed_with(&self, file: &Gguf, embd: &Tensor, vocab: usize, tokens: &[u32]) -> Result<DevBuf> {
+        if !tokens.iter().any(|t| t & PICTURE != 0) {
+            return self.embed_from(file, embd, vocab, tokens);
+        }
+        let plain: Vec<u32> = tokens.iter().map(|t| if t & PICTURE != 0 { 0 } else { *t }).collect();
+        let x = self.embed_from(file, embd, vocab, &plain)?;
+        let ne = self.g.n_embd;
+        let pics = self.pictures.lock().unwrap();
+        // runs of one picture's consecutive tokens, one write each
+        let mut j = 0;
+        while j < tokens.len() {
+            let Some((key, i)) = picture_of(tokens[j]) else {
+                j += 1;
+                continue;
+            };
+            let p = pics.get(&key).ok_or_else(|| e(format!("picture {key:#x}: not given to the engine")))?;
+            let mut n = 1;
+            while j + n < tokens.len() && picture_of(tokens[j + n]) == Some((key, i + n)) {
+                n += 1;
+            }
+            if i + n > p.nx * p.ny {
+                return Err(e(format!("picture token {} of {}", i + n - 1, p.nx * p.ny)));
+            }
+            let bytes: Vec<u8> = p.rows[i * ne..(i + n) * ne].iter().flat_map(|v| v.to_le_bytes()).collect();
+            x.write(j * ne * 4, &bytes)?;
+            j += n;
+        }
+        Ok(x)
     }
 
     /// Rows of a token embedding kept in its file
@@ -786,7 +873,7 @@ impl<'g> Qwen35<'g> {
 
     /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]
     #[allow(clippy::too_many_arguments)]
-    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&Q8>, t: usize, p0: usize) -> Result<DevBuf> {
+    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&Q8>, t: usize, p0: usize, rope: &Rope) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
         let qf = self.arena().f32(t * hq * 2 * d)?;
@@ -801,14 +888,29 @@ impl<'g> Qwen35<'g> {
         let none = String::new;
         // the keys the rows see in all (causal): what attention reads and multiplies
         let keys = t * p0 + t * (t + 1) / 2;
+        // a picture's rows: their positions on this GPU
+        let pos3 = match rope {
+            Rope::Rows(p) => {
+                let b = self.arena().bytes(p.len() * 4)?;
+                b.write(0, &p.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                Some(b)
+            }
+            Rope::From(_) => None,
+        };
+        let from = match rope {
+            Rope::From(f) => *f,
+            Rope::Rows(_) => 0,
+        };
         // SAFETY: the rows and caches as named in q35.h.
         unsafe {
-            self.op("q norm rope", none, 8 * t * hq * d, 10 * t * hq * d,
-                    || (k.qk_norm_rope)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64, d as i64,
-                                        a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, p0 as i64))?;
-            self.op("k norm rope", none, 8 * t * hk * d, 10 * t * hk * d,
-                    || (k.qk_norm_rope)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
-                                        a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, p0 as i64))?;
+            for (src, ss, hs, dst, heads, w, name) in [(&qf, hq * 2 * d, 2 * d, &q, hq, &a.q_norm, "q norm rope"), (&kr, hk * d, d, &kn, hk, &a.k_norm, "k norm rope")] {
+                self.op(name, none, 8 * t * heads * d, 10 * t * heads * d, || match &pos3 {
+                    Some(p) => (k.qk_norm_mrope)(self.raw(), src.fp(), ss as i64, hs as i64, dst.fp(), (heads * d) as i64, t as i64, heads as i64, d as i64,
+                                                 w.fp(), g.eps, g.n_rot as i64, g.theta, p.ptr().cast()),
+                    None => (k.qk_norm_rope)(self.raw(), src.fp(), ss as i64, hs as i64, dst.fp(), (heads * d) as i64, t as i64, heads as i64, d as i64,
+                                             w.fp(), g.eps, g.n_rot as i64, g.theta, from),
+                })?;
+            }
             self.op("kv store", none, 12 * t * hk * d, 0,
                     || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                     kc.ptr(), vc.ptr()))?;
@@ -909,11 +1011,12 @@ impl<'g> Qwen35<'g> {
         }
         self.on(0);
         let p0 = s.pos;
+        let (rope, shift_after) = self.rope_of(tokens, p0, s.shift)?;
         let mut snaps = self.snaps.lock().unwrap();
         let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
         snaps.of = None;
         self.phase("embed");
-        let mut x = self.embed(tokens)?;
+        let mut x = self.embed_with(self.file, &self.embd, self.g.vocab, tokens)?;
         let mut h = self.arena().f32(t * g.n_embd)?;
         let mut ffn_g = self.arena().f32(t * g.n_ff)?;
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
@@ -934,7 +1037,7 @@ impl<'g> Qwen35<'g> {
             self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
             let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
-                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0)?,
+                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0, &rope)?,
                 (LState::Linear { s: rs, conv }, _, Some(a)) => {
                     let sn = snapping.then(|| (&snaps.layers[li].0, &snaps.layers[li].1));
                     li += 1;
@@ -961,6 +1064,7 @@ impl<'g> Qwen35<'g> {
         }
         drop(snaps);
         s.pos += t;
+        s.shift = shift_after;
         s.last_rows = t;
         // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them)
         let n = n_out.clamp(1, t);
@@ -979,7 +1083,7 @@ impl<'g> Qwen35<'g> {
             if t > 1 {
                 hs.copy_within(ne * 4, &all, 0, (t - 1) * ne * 4)?;
             }
-            self.mtp_rows(ms, tokens, &hs, p0, s.max_ctx, false)?;
+            self.mtp_rows(ms, tokens, &hs, p0, &rope, s.max_ctx, false)?;
             ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
             self.phase("head");
             // the head reads the rows' Q8_1 forms when it takes them all; fewer rows (a short prompt's last) it quantizes
@@ -1001,11 +1105,11 @@ impl<'g> Qwen35<'g> {
     /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
     /// there; with `head`, the last row's logits (and its normed output kept for a chained draft)
     /// the last row's likeliest token (`head`: its logits' argmax, taken on the GPU - 4 bytes read back, not the logits)
-    fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool) -> Result<Option<u32>> {
+    fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, rope: &Rope, cap: usize, head: bool) -> Result<Option<u32>> {
         let Some(m) = &self.mtp else { return Ok(None) };
         let g = &self.g;
         let (t, ne) = (tokens.len(), g.n_embd);
-        let emb = self.embed_from(&m.file, &m.embd, m.vocab, tokens)?;
+        let emb = self.embed_with(&m.file, &m.embd, m.vocab, tokens)?;
         let en = self.arena().f32(t * ne)?;
         self.rms(&emb, &m.enorm, &en, t, ne)?;
         let hn = self.arena().f32(t * ne)?;
@@ -1018,7 +1122,7 @@ impl<'g> Qwen35<'g> {
         self.add(&cur, &tmp, t * ne)?;
         let h = self.arena().f32(t * ne)?;
         let hq8 = self.norm(&cur, &m.attn_norm, &h, t, ne)?;
-        let att = self.full(&m.attn, &ms.k, &ms.v, cap, &h, hq8.as_ref(), t, p0)?;
+        let att = self.full(&m.attn, &ms.k, &ms.v, cap, &h, hq8.as_ref(), t, p0, rope)?;
         self.add(&cur, &att, t * ne)?;
         let hq8 = self.norm(&cur, &m.post_norm, &h, t, ne)?;
         let fg = self.arena().f32(t * g.n_ff)?;
@@ -1062,7 +1166,7 @@ impl<'g> Qwen35<'g> {
             self.arena().reset();
             self.phase("mtp draft");
             let hs = if i == 0 { &ms.pending } else { &ms.chain };
-            let Some(t) = self.mtp_rows(ms, &[tok], hs, s.pos + i, s.max_ctx, true)? else { break };
+            let Some(t) = self.mtp_rows(ms, &[tok], hs, s.pos + i, &Rope::From((s.pos + i) as i64 - s.shift), s.max_ctx, true)? else { break };
             tok = t;
             out.push(tok);
         }
@@ -1143,7 +1247,7 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Session { pos: 0, max_ctx, layers, last_rows: 0, id, mtp })
+        Ok(Session { pos: 0, max_ctx, shift: 0, layers, last_rows: 0, id, mtp })
     }
 
     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
@@ -1157,6 +1261,7 @@ impl<'g> Qwen35<'g> {
             ms.pending.fill(0)?;
         }
         s.pos = 0;
+        s.shift = 0;
         s.last_rows = 0;
         Ok(())
     }
@@ -1191,6 +1296,7 @@ impl<'g> Qwen35<'g> {
             d.pending.copy_within(0, &sm.pending, 0, g.n_embd * 4)?;
         }
         dst.pos = src.pos;
+        dst.shift = src.shift;
         dst.last_rows = 0;
         Ok(())
     }
@@ -1312,6 +1418,8 @@ impl<'g> Qwen35<'g> {
             ms.pending.read(0, &mut b)?;
             bufs.push(b);
         }
+        // the rotary shift last (a checkpoint without it: none)
+        bufs.push(s.shift.to_le_bytes().to_vec());
         let bytes = bufs.iter().map(|b| b.len()).sum();
         Ok(Checkpoint { pos: s.pos, bufs, bytes })
     }
@@ -1361,9 +1469,103 @@ impl<'g> Qwen35<'g> {
             let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's state"))?;
             ms.pending.write(0, b)?;
         }
+        s.shift = it.next().filter(|b| b.len() == 8).map_or(0, |b| i64::from_le_bytes(b[..8].try_into().unwrap()));
         s.pos = ck.pos;
         s.last_rows = 0;
         Ok(())
+    }
+
+    /// A picture prompts may name by its key (its tokens: `PICTURE | key | index`); the same key again replaces it
+    pub fn add_picture(&self, key: u32, p: Picture) -> Result<()> {
+        if p.nx * p.ny == 0 || p.nx * p.ny > 1 << PICTURE_INDEX_BITS || p.rows.len() != p.nx * p.ny * self.g.n_embd {
+            return Err(e(format!("a picture of {} x {} tokens and {} values (at most {} tokens of {})", p.nx, p.ny, p.rows.len(), 1 << PICTURE_INDEX_BITS, self.g.n_embd)));
+        }
+        let mut m = self.pictures.lock().unwrap();
+        // the most recent ones kept (a picture is n x 20 KiB of host memory)
+        if m.len() >= 64 {
+            m.clear();
+        }
+        m.insert(key & !PICTURE & !((1 << PICTURE_INDEX_BITS) - 1), Arc::new(p));
+        Ok(())
+    }
+
+    /// Whether pictures can be given (a vision tower loaded)
+    pub fn sees(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// A picture (RGB8 rows, w x h) through the vision tower, kept under `key` for the prompts that name its tokens:
+    /// its token grid (columns, rows). Resized as llama.cpp's mtmd resizes it (sides to 32s, 8 ..= 4,096 tokens,
+    /// bicubic), fewer tokens when the last GPU's work memory is smaller than a picture that size needs
+    pub fn add_picture_rgb(&self, key: u32, rgb: &[u8], w: usize, h: usize) -> Result<(usize, usize)> {
+        let v = self.vision.as_ref().ok_or_else(|| e("this model has no vision tower (no mmproj beside it)"))?;
+        if rgb.len() != w * h * 3 || w == 0 || h == 0 {
+            return Err(e(format!("a {w}x{h} picture of {} bytes (RGB: {})", rgb.len(), w * h * 3)));
+        }
+        // a picture already seen (its key): as it was
+        if let Some(p) = self.pictures.lock().unwrap().get(&(key & !PICTURE & !((1 << PICTURE_INDEX_BITS) - 1))) {
+            return Ok((p.nx, p.ny));
+        }
+        let _w = self.work.lock().unwrap();
+        let last = self.devs.len() - 1;
+        let arena = &self.devs[last].arena;
+        let (mut tw, mut th) = crate::vision::target_size(w, h);
+        // the work memory a picture needs: fewer tokens when the arena is smaller (it spills to the card otherwise)
+        while v.work_bytes((tw / crate::vision::PATCH) * (th / crate::vision::PATCH)) > arena.len() && tw * th > crate::vision::MIN_TOKENS * 1024 {
+            let a = crate::vision::ALIGN;
+            (tw, th) = (((tw * 9 / 10) / a).max(1) * a, ((th * 9 / 10) / a).max(1) * a);
+        }
+        let pic = nextcuda_diffusion::picture::Picture { width: w as u32, height: h as u32, channels: 3, data: rgb.to_vec() };
+        let sized = if (tw, th) == (w, h) { pic } else { pic.resize_bicubic(tw as u32, th as u32) };
+        let f: Vec<f32> = sized.data.iter().map(|b| *b as f32).collect();
+        arena.reset();
+        let nsd = nextcuda_diffusion::kernels::Nsd::new(&self.devs[last].gpu)?;
+        let alloc = |n: usize| arena.bytes(n);
+        let (rows, (nx, ny)) = v.see(&nsd, &f, th, tw, &alloc)?;
+        drop(nsd);
+        arena.reset();
+        if v.out != self.g.n_embd {
+            return Err(e(format!("the vision tower gives {} wide tokens; the model takes {}", v.out, self.g.n_embd)));
+        }
+        self.add_picture(key, Picture { rows, nx, ny })?;
+        Ok((nx, ny))
+    }
+
+    /// The rows' rotary positions from slot p0 with the session's shift, and the shift after them
+    fn rope_of(&self, tokens: &[u32], p0: usize, shift: i64) -> Result<(Rope, i64)> {
+        if !tokens.iter().any(|t| t & PICTURE != 0) {
+            return Ok((Rope::From(p0 as i64 - shift), shift));
+        }
+        let t = tokens.len();
+        let mut pos = vec![0i32; 3 * t];
+        let mut shift = shift;
+        let pics = self.pictures.lock().unwrap();
+        for (j, tok) in tokens.iter().enumerate() {
+            let slot = (p0 + j) as i64;
+            let (a, b, c) = match picture_of(*tok) {
+                Some((key, i)) => {
+                    let p = pics.get(&key).ok_or_else(|| e(format!("picture {key:#x}: not given to the engine")))?;
+                    if i >= p.nx * p.ny {
+                        return Err(e(format!("picture token {i} of {}", p.nx * p.ny)));
+                    }
+                    // llama.cpp's M-RoPE for an image: (t, t + row, t + column), t its first token's position
+                    let t0 = slot - i as i64 - shift;
+                    let r = (t0, t0 + (i / p.nx) as i64, t0 + (i % p.nx) as i64);
+                    if i + 1 == p.nx * p.ny {
+                        shift += (p.nx * p.ny) as i64 - p.nx.max(p.ny) as i64;
+                    }
+                    r
+                }
+                None => {
+                    let q = slot - shift;
+                    (q, q, q)
+                }
+            };
+            pos[j] = a as i32;
+            pos[t + j] = b as i32;
+            pos[2 * t + j] = c as i32;
+        }
+        Ok((Rope::Rows(pos), shift))
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {

@@ -256,6 +256,16 @@ pub trait Engine: Send + Sync {
     }
 
     fn gpu_info(&self) -> Vec<GpuInfo>;
+    /// Pictures: whether a vision tower is loaded (a prompt's pictures go through `add_picture`)
+    fn sees(&self) -> bool {
+        false
+    }
+    /// A picture (RGB8 rows, w x h) through the vision tower, kept for the prompts that name its tokens: ids
+    /// `PICTURE_TOKEN | key | i` (key: bits 12-30, from a hash of the picture; i its token, raster order). Its token grid
+    /// (columns, rows): a prompt holds columns x rows of its ids, in order
+    fn add_picture(&self, _key: u32, _rgb: &[u8], _w: usize, _h: usize) -> Result<(usize, usize)> {
+        Err(Error("this model takes no pictures".into()))
+    }
     fn expert_stats(&self) -> ExpertStats {
         ExpertStats::default()
     }
@@ -270,6 +280,11 @@ pub trait Engine: Send + Sync {
         Vec::new()
     }
 }
+
+/// A picture's tokens in a prompt (`Engine::add_picture`): ids past any vocabulary
+pub const PICTURE_TOKEN: u32 = 0x8000_0000;
+/// bits of a picture token's index (at most 4,096 tokens a picture)
+pub const PICTURE_INDEX_BITS: u32 = 12;
 
 /// How an engine loads: the file, its GPUs, the options, a log
 pub type LoadFn = for<'g> fn(&'g Gguf, &[Arc<Gpu>], &LoadOptions, &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>>;

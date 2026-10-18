@@ -6,12 +6,13 @@
 id: qwen3.8-27b-gsq-iq3s
 kind: llm
 arch: qwen35
-title: Qwen3.8-27B GSQ-RCO IQ3_S (two cards, whole)
-about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; ISTA-DASLab''s GSQ-RCO IQ3_S GGUF with the MTP head inside (11.3 GiB). Split over the RTX 5070 and RTX 3060, nothing streamed. Text (vision: the mmproj beside it, not yet)'
+title: Qwen3.8-27B GSQ-RCO IQ3_S (two cards, whole; text and pictures)
+about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; ISTA-DASLab''s GSQ-RCO IQ3_S GGUF with the MTP head inside (11.3 GiB). Split over the RTX 5070 and RTX 3060, nothing streamed. Text and pictures (the vision tower: the mmproj beside it, resident on the 5070)'
 gpus: '1,0'                      # the order the engine takes them: the last (the 5070) is filled first
 split: true
-vram_gib: 10.7                   # its memory on each card at 96K (weights, the cache, a prompt chunk's work; measured)
-ctx: '98304'                     # 96K: prompt chunks of 1,024 (128K does not fit beside the weights)
+vram_gib: 10.9                   # its memory on each card at 80K (weights, the cache, a prompt chunk's work, the vision tower; measured)
+ctx: '81920'                     # 80K with the vision tower (0.85 GiB) and prompt chunks of 1,024; 88K takes chunks of 512, 96K does not fit
+                                 # beside it (NS_Q35_VISION=0: no pictures, 96K)
 tools: true
 tasks: true
 env:
