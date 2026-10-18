@@ -1,0 +1,12 @@
+[package]
+name = "nextcuda-llm-qwen35"
+description = "Dense Qwen3.5 / Qwen3.8 (qwen35: Qwen3.8-27B ...): gated DeltaNet and gated full attention, a dense SwiGLU - over one or more CUDA cards, the weights resident (a split hands the rows between cards)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-llm.workspace = true
+nextcuda-tok.workspace = true

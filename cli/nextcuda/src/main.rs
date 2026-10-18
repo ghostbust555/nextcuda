@@ -97,7 +97,7 @@ language models (nextcuda llm ...; the names without `llm` still work):
                  [--cache-dir DIR [--cache-disk-gib G (32)] [--cache-ttl-hours H (24)]]
                                 the server itself (what start runs in its container)
   nextcuda llm generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N]
-                 [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
+                 [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp] [--top N]
   nextcuda llm info <model.gguf>      the architecture and geometry, every tensor checked by role, bytes by group
   nextcuda llm tokenize <model.gguf> <text>
   nextcuda llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
@@ -161,7 +161,7 @@ fn gib(b: u64) -> f64 {
 
 /// The llm engines this program has, one a model architecture (llm/<arch>)
 pub(crate) fn engines() -> Vec<EngineKind> {
-    vec![nextcuda_llm_nemotronh::engine::kind()]
+    vec![nextcuda_llm_nemotronh::engine::kind(), nextcuda_llm_qwen35::kind()]
 }
 
 /// The engine for `f`'s architecture, loaded on `gpus`
@@ -412,10 +412,21 @@ pub(crate) struct TempSampler<'a> {
     pub rng: &'a mut Rng,
     /// draws on the GPU (Sampler::device) from this seed
     pub seed: u64,
+    /// --top N: each step's N likeliest tokens and their log-probabilities on stderr (a reference to compare with)
+    pub top: usize,
 }
 
 impl nextcuda_llm::Sampler for TempSampler<'_> {
     fn sample(&mut self, logits: &[f32]) -> u32 {
+        if self.top > 0 {
+            let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let lse = mx + logits.iter().map(|x| ((x - mx) as f64).exp()).sum::<f64>().ln() as f32;
+            let mut ix: Vec<usize> = (0..logits.len()).collect();
+            ix.select_nth_unstable_by(self.top, |a, b| logits[*b].total_cmp(&logits[*a]));
+            ix.truncate(self.top);
+            ix.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
+            eprintln!("[top] {}", ix.iter().map(|i| format!("{i}:{:.3}", logits[*i] - lse)).collect::<Vec<_>>().join(" "));
+        }
         sample(logits, self.temp, self.top_p, self.rng)
     }
     fn dist(&mut self, logits: &[f32]) -> Option<Vec<(u32, f32)>> {
@@ -425,10 +436,10 @@ impl nextcuda_llm::Sampler for TempSampler<'_> {
         self.rng.next_f32()
     }
     fn greedy(&self) -> bool {
-        self.temp <= 0.0
+        self.temp <= 0.0 && self.top == 0
     }
     fn device(&self) -> Option<nextcuda_llm::DeviceSampling> {
-        (self.temp > 0.0).then_some(nextcuda_llm::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
+        (self.temp > 0.0 && self.top == 0).then_some(nextcuda_llm::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
     }
 }
 
@@ -480,7 +491,8 @@ fn generate(args: &[String]) -> Result<(), String> {
     let prefill = t0.elapsed().as_secs_f64();
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
-    let mut draw = TempSampler { temp, top_p, rng: &mut rng, seed };
+    let top: usize = opt("--top").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut draw = TempSampler { temp, top_p, rng: &mut rng, seed, top };
     let mut dec = eng.decoder(logits, mtp);
     dec.set_context(&ids);
     let mut pending: Vec<u8> = Vec::new();

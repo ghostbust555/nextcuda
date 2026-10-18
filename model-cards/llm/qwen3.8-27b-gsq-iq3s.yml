@@ -1,0 +1,32 @@
+# Qwen3.8-27B GSQ-RCO IQ3_S (+ its MTP head) over the two 12 GB cards, whole
+# model card (model-cards/README.md): what `nextcuda models search | pull` offers and what the registry entry gets.
+# The engine (llm/qwen35) keeps every weight resident: its 64 layers split over the cards (the 5070 last: it takes the
+# most layers and the head), the rows handed over at the boundary. ISTA-DASLab's file mixes IQ1_M ... Q6_K by tensor
+# (its card's "task-lossless" point); the same file brainiac-llm's llama.cpp serves.
+id: qwen3.8-27b-gsq-iq3s
+kind: llm
+arch: qwen35
+title: Qwen3.8-27B GSQ-RCO IQ3_S (two cards, whole)
+about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; ISTA-DASLab''s GSQ-RCO IQ3_S GGUF with the MTP head inside (11.3 GiB). Split over the RTX 5070 and RTX 3060, nothing streamed. Text (vision: the mmproj beside it, not yet)'
+gpus: '1,0'                      # the order the engine takes them: the last (the 5070) is filled first
+split: true
+vram_gib: 10.7                   # its memory on each card at 96K (weights, the cache, a prompt chunk's work; measured)
+ctx: '98304'                     # 96K: prompt chunks of 1,024 (128K does not fit beside the weights)
+tools: true
+tasks: true
+env:
+  NS_PARALLEL: '1'               # one session: all of the cache to it
+files:
+  model:
+    key: qwen3.8-27b-gsq-rco-iq3s-mtp
+    url: https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/d562806dbafae37109975e970aae91b43e73b440/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+    size: 12120016960
+    sha256: 58fd826723939933dc86f45b7fe04545cbc2de1c70f6fe2cdd3858c87a98c12f
+    path: qwen3.8-27b-gsq/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+  mmproj:
+    key: qwen3.8-27b-mmproj-bf16
+    url: https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/d562806dbafae37109975e970aae91b43e73b440/mmproj-Qwen3.8-27B-BF16.gguf
+    size: 931146528
+    sha256: 13cb7bebccbd04afc8f4090cb949ecf8937cdf7377c5799b1a0c594e7c0d3e16
+    path: qwen3.8-27b-gsq/mmproj-Qwen3.8-27B-BF16.gguf
+guide: guides/chat.md

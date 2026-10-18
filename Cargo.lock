@@ -560,6 +560,7 @@ dependencies = [
  "nextcuda-image-unlimitedocr",
  "nextcuda-llm",
  "nextcuda-llm-nemotronh",
+ "nextcuda-llm-qwen35",
  "nextcuda-mesh",
  "nextcuda-model3d",
  "nextcuda-model3d-animateanymesh",
@@ -734,6 +735,16 @@ dependencies = [
 
 [[package]]
 name = "nextcuda-llm-nemotronh"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-gguf",
+ "nextcuda-llm",
+ "nextcuda-tok",
+]
+
+[[package]]
+name = "nextcuda-llm-qwen35"
 version = "0.0.0"
 dependencies = [
  "nextcuda-core",

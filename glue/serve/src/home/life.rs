@@ -332,6 +332,15 @@ impl Home {
         (g("mode"), g("starting"))
     }
 
+    /// Whether the studio runs the chat card and `id` is one of its modes (its llm modes file names it): then it
+    /// switches models (it knows when a render holds the card); else this page starts the chat server itself
+    fn studio_chat(&self, id: &str) -> bool {
+        listening(self.o.ports.video)
+            && call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({})), 4).ok()
+                .map(|v| v.get("result").cloned().unwrap_or(v))
+                .is_some_and(|v| v["choices"].as_object().is_some_and(|c| c.contains_key(id)))
+    }
+
     /// The registered chat model the chat server answers as now
     pub(crate) fn chat_loaded(&self, all: &[Value]) -> Option<String> {
         let v = call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.llm)), "GET", "/v1/models", None, 3).ok()?;
@@ -664,7 +673,7 @@ impl Home {
                     return Ok(());
                 }
                 self.chat_room(id)?;
-                if !listening(self.o.ports.video) {
+                if !self.studio_chat(id) {
                     return self.chat_start(id);
                 }
                 call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": id})), 600).map_err(|e| (502, format!("the studio's llm.mode: {e}")))?;
@@ -694,7 +703,7 @@ impl Home {
             }
             "video" => self.exec("video: unload the engines".into(), &["video".into(), "unload".into()]).map(|_| ()).map_err(|e| (500, e)),
             _ => {
-                if self.chat_loaded(&self.models()).as_deref() == Some(id) && !listening(self.o.ports.video) {
+                if self.chat_loaded(&self.models()).as_deref() == Some(id) && !self.studio_chat(id) {
                     return self.exec(format!("llm stop ({id})"), &["llm".into(), "stop".into()]).map(|_| ()).map_err(|e| (500, e));
                 }
                 if self.chat_loaded(&self.models()).as_deref() == Some(id) {
