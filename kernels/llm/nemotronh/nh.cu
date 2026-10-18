@@ -236,6 +236,32 @@ __global__ void gemv_f32_k(const float* W, const float* x, float* y, int64_t T, 
     }
 }
 
+// one row a block: y[t][r] = W[r] . x[t] for t < T (at most 8), float4 reads, the block's sums reduced in shared memory
+__global__ void __launch_bounds__(256) gemv_f32_rows_k(const float* W, const float* x, float* y, int64_t T, int64_t R, int64_t C) {
+    const int64_t r = blockIdx.x;
+    float s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const float4* w4 = reinterpret_cast<const float4*>(W + r * C);
+    for (int64_t c = threadIdx.x; c < C / 4; c += 256) {
+        const float4 w = w4[c];
+        for (int t = 0; t < T; ++t) {
+            const float4 v = reinterpret_cast<const float4*>(x + t * C)[c];
+            s[t] += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+        }
+    }
+    __shared__ float part[8][8];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    for (int t = 0; t < T; ++t) {
+        const float v = warp_sum(s[t]);
+        if (lane == 0) part[t][wid] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < T) {
+        float v = 0.0f;
+        for (int k = 0; k < 8; ++k) v += part[threadIdx.x][k];
+        y[threadIdx.x * R + r] = v;
+    }
+}
+
 __global__ void combine_k(float* out, const float* dn, const int32_t* tp, const float* w, int64_t L) {
     const int64_t t = blockIdx.x;
     for (int64_t i = threadIdx.x; i < L; i += blockDim.x) {
@@ -448,6 +474,13 @@ int ns_nh_gemv_f32(ns_gpu* g, const float* W, const float* x, float* y, int64_t 
     NS_TRY
     NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
+    if (R < 512 && T <= 8 && C % 4 == 0) {
+        // few rows (Qwen3.8's DeltaNet alpha / beta: 48): a block a row, its 256 threads over the columns, so the
+        // matrix is read by enough of the card
+        gemv_f32_rows_k<<<(unsigned) R, 256, 0, g->q>>>(W, x, y, T, R, C);
+        NS_LAUNCH_CHECK();
+        return 0;
+    }
     gemv_f32_k<<<(unsigned) ((R + 7) / 8), 256, 0, g->q>>>(W, x, y, T, R, C);
     NS_LAUNCH_CHECK();
     return 0;

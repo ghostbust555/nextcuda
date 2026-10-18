@@ -62,12 +62,23 @@ int ns_q35_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, fl
 int ns_q35_l2_norm(ns_gpu* g, float* x, int64_t rows, int64_t n, float eps);
 /* The gated delta rule (KDA's scan, per-feature decay; d 128 only): per row t and head h, with q, k, v [T][H][d], gate
  * [T][H][d] (the decay factors, multiplied in), beta [T][H]: S = diag(gate) S;  S += k (beta (v - S^T k))^T;
- * o = S^T q / sqrt(d) (the scale is the kernel's).  S [H][d][d] (key index first), updated; o [T][H][d]. snap
+ * o = S^T q / sqrt(d) (the scale is the kernel's).  S [H][d][d] (value index first: S[h][j][i] is key i, value j;
+ * glm.cpp's is key first - a warp reads a value column whole), updated; o [T][H][d]. snap
  * (nullable): S after each row but the last, [T-1][H][d][d] */
 int ns_q35_kda_scan(ns_gpu* g, const float* q, const float* k, const float* v, const float* gate, const float* beta, float* S, float* o,
                     int64_t T, int64_t H, int64_t d, float* snap);
 /* out [n] = silu(min(gate, limit)) * clamp(up, -limit, limit) (always clamped: +inf for none); out may be gate */
 int ns_q35_swiglu(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit);
+
+/* ---- the prompt products, ggml-cuda's MMQ (q35_mmq.cu, third_party/ggml-cuda): x as q8_1 in MMQ's tiles, the
+ * matrix's blocks on the int8 tensor cores. Types: Q2_K Q4_K Q6_K IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS */
+int ns_q35_mmq_supported(int type);
+/* bytes of x [T][K] quantized for ns_q35_mmq */
+size_t ns_q35_mmq_q8_bytes(int64_t K, int64_t T);
+/* x [T][K] float32 -> xq, in the layout a matrix of `type` reads */
+int ns_q35_mmq_quantize(ns_gpu* g, int type, const float* x, int64_t T, int64_t K, void* xq);
+/* y [T][n_out] = x . W^T, W [n_out][K] in `type`'s blocks, x as ns_q35_mmq_quantize made it (for that type) */
+int ns_q35_mmq(ns_gpu* g, int type, const void* w, int64_t n_out, int64_t K, const void* xq, int64_t T, float* y);
 
 #ifdef __cplusplus
 }

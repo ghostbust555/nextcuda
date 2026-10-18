@@ -364,8 +364,21 @@ pub struct Qwen35<'g> {
     load_bytes: u64,
     /// the pictures prompts name (`add_picture`), by key
     pictures: Mutex<HashMap<u32, Arc<Picture>>>,
-    /// the vision tower (a projector beside the model), on the last GPU
+    /// the vision tower (a projector beside the model), on the first GPU
     vision: Option<crate::vision::Vision>,
+    /// NS_Q35_PROFILE=1: the kernels' times
+    prof: Option<Mutex<Profile>>,
+    /// the GPU of the head and the draft block (an index into devs)
+    head: usize,
+    /// the prompt products by MMQ (NS_Q35_MMQ=0: by the half expansion and cuBLAS)
+    mmq: bool,
+}
+
+/// The kernels' times by (GPU, phase, kernel): seconds, calls, bytes, arithmetic
+#[derive(Default)]
+struct Profile {
+    phase: &'static str,
+    rows: HashMap<(usize, &'static str, &'static str), (f64, u64, f64, f64)>,
 }
 
 /// The projector beside the model (`mmproj*.gguf` in its folder), unless NS_Q35_VISION=0
@@ -416,7 +429,18 @@ impl<'g> Qwen35<'g> {
             f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum()
         }).collect();
         let head_w = weights - layer_w.iter().sum::<u64>();
-        let w16_bytes = [g.n_ff * g.n_embd, g.heads * 2 * g.head * g.n_embd, g.conv_dim() * g.n_embd].into_iter().max().unwrap_or(0) * 2;
+        // the half buffer a prompt chunk expands a matrix into: with MMQ only the matrices it does not take (the file's
+        // IQ1_M, the float32 ones), so each GPU's is its own layers' largest such (without MMQ: the largest matrix)
+        let mmq_on = !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0");
+        let expands = |t: &Tensor| t.shape.len() == 2 && !(mmq_on && unsafe { (k.mmq_supported)(t.ty.code() as i32) } != 0) && t.shape[0] > 1 && t.shape[1] > 1;
+        let layer_x16: Vec<usize> = (0..g.layers).map(|l| {
+            let p = format!("blk.{l}.");
+            f.tensors.iter().filter(|t| t.name.starts_with(&p) && expands(t)).map(|t| t.elements() as usize * 2).max().unwrap_or(0)
+        }).collect();
+        // the head's and the draft block's (on the last GPU)
+        let tail_x16 = f.tensors.iter().filter(|t| (!t.name.starts_with("blk.") || t.name.starts_with(&format!("blk.{}.", g.layers))) && t.name != "token_embd.weight" && expands(t))
+            .map(|t| t.elements() as usize * 2).max().unwrap_or(0);
+        let w16_bytes = layer_x16.iter().copied().max().unwrap_or(0).max(tail_x16);
         let mut free = Vec::with_capacity(gpus.len());
         for gpu in gpus {
             let (total, fr) = gpu.memory()?;
@@ -443,9 +467,10 @@ impl<'g> Qwen35<'g> {
         let mtp_w = mfile.as_ref().map_or(0, |m| m.tensors.iter().filter(|t| if in_file { t.name.starts_with(&format!("blk.{}.", g.layers)) } else { t.name != "token_embd.weight" })
             .map(|t| t.bytes).sum::<u64>());
         let mtp_bytes = mtp_w + if mfile.is_some() { snap_bytes as u64 } else { 0 };
-        let margin: u64 = 768 << 20;
+        let margin: u64 = 512 << 20;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        // the vision tower: a Qwen3-VL projector beside the model (NS_Q35_VISION=0: none), its weights on the last GPU
+        // the vision tower: a Qwen3-VL projector beside the model (NS_Q35_VISION=0: none), its weights on the first GPU
+        // (the slower card: a picture is rare, and the faster card's room goes to layers)
         let mmproj = vision_path(f);
         let vision_bytes = match &mmproj {
             Some(p) => Gguf::open(p).map(|m| crate::vision::card_bytes(&m)).unwrap_or(0),
@@ -454,6 +479,11 @@ impl<'g> Qwen35<'g> {
         // the draft block's pass behind a chunk's: its inputs and outputs beside the main pass's
         let has_mtp = mfile.is_some();
         let arena_of = |c: usize| arena_bytes(&g, c) + if has_mtp { c * 8 * g.n_embd * 4 } else { 0 };
+        // the head and the draft block: on the last GPU, or (NS_Q35_HEAD=first) on the first - the slower card when the
+        // server orders them weakest first, so the faster one's room goes to layers (a prompt pass runs ~2.7x faster
+        // there; decode reads the head and the draft block from the slower card)
+        let head_first = gpus.len() > 1 && std::env::var("NS_Q35_HEAD").is_ok_and(|v| v == "first");
+        let head_i = if head_first { 0 } else { gpus.len() - 1 };
         let (chunk, bounds) = if gpus.len() == 1 {
             let fixed = weights + mtp_bytes + vision_bytes + w16_bytes as u64 + margin;
             let chunk = chunk_setting().unwrap_or_else(|| {
@@ -470,7 +500,8 @@ impl<'g> Qwen35<'g> {
             // state and verify snapshots (DeltaNet)
             let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
             let mtp_on = has_mtp;
-            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + if g.full(l) { (2 * g.heads_kv * ctx * g.head * 2) as u64 } else {
+            // (a layer with a matrix MMQ does not take: its GPU's half buffer as large as it)
+            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + layer_x16[l] as u64 + if g.full(l) { (2 * g.heads_kv * ctx * g.head * 2) as u64 } else {
                 (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
             }).collect();
             let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
@@ -479,10 +510,13 @@ impl<'g> Qwen35<'g> {
                 // what each GPU has for layers: its free memory less the spare, its half buffer and work memory; the
                 // last's less the head and the draft block (its weights, its cache)
                 let room: Vec<i64> = (0..n).map(|i| {
-                    // (and 512 MiB the plan does not see: the allocator's rounding, small buffers)
-                    let mut over = margin + (512 << 20) + w16_bytes as u64 + arena_of(c) as u64;
-                    if i + 1 == n {
-                        over += head_w + vision_bytes + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
+                    // (and 256 MiB the plan does not see: the allocator's rounding, small buffers)
+                    let mut over = margin + (256 << 20) + arena_of(c) as u64;
+                    if i == 0 {
+                        over += vision_bytes;
+                    }
+                    if i == head_i {
+                        over += head_w + tail_x16 as u64 + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
                     }
                     free[i] as i64 - over as i64
                 }).collect();
@@ -560,7 +594,9 @@ impl<'g> Qwen35<'g> {
                 *d = i;
             }
         }
-        let lastg = gpus[gpus.len() - 1].clone();
+        // (a GPU dropped by the plan is never the first: the head's index is kept)
+        let head = if head_first { 0 } else { gpus.len() - 1 };
+        let lastg = gpus[head].clone();
         let mut loaded = 0u64;
         let mut layers = Vec::with_capacity(g.layers);
         for l in 0..g.layers {
@@ -635,9 +671,11 @@ impl<'g> Qwen35<'g> {
         });
         let vh = DevBuf::f32(&lastg, 8 * g.n_embd)?;
         let mut devs = Vec::with_capacity(gpus.len());
-        for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
+        for (i, (gpu, &(lb, le))) in gpus.iter().zip(&bounds).enumerate() {
             gpu.sync()?;
-            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le });
+            // its half buffer: its own layers' largest matrix to expand (the last GPU: the head's and the draft block's too)
+            let own = layer_x16[lb..le].iter().copied().max().unwrap_or(0).max(if i == head { tail_x16 } else { 0 }).max(1 << 20);
+            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, own)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
@@ -645,7 +683,7 @@ impl<'g> Qwen35<'g> {
         log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), gib(loaded)));
         let vision = match &mmproj {
-            Some(p) => match crate::vision::Vision::load(p, &devs[devs.len() - 1].gpu, &mut *log) {
+            Some(p) => match crate::vision::Vision::load(p, &devs[0].gpu, &mut *log) {
                 Ok(v) => Some(v),
                 Err(x) => {
                     log(format!("qwen35: the vision tower {} does not load ({}); no pictures", p.display(), x.0));
@@ -656,7 +694,9 @@ impl<'g> Qwen35<'g> {
         };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
-                    load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision })
+                    load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
+                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head,
+                    prof: ["NS_Q35_PROFILE", "NS_PROFILE"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1")).then(|| Mutex::new(Profile::default())) })
     }
 
     /// A kernel call (its return code checked): timed on the device with NS_Q35_PROFILE=1, with the bytes it moves
@@ -666,16 +706,45 @@ impl<'g> Qwen35<'g> {
         ffi::check(rc, name)
     }
 
-    /// `op`, its return code left to the caller (the byte and arithmetic counts name what a kernel does; no probe here)
-    fn op_rc(&self, _name: &'static str, _key: impl FnOnce() -> String, _bytes: usize, _flops: usize, f: impl FnOnce() -> c_int) -> Result<c_int> {
-        Ok(f())
+    /// `op`, its return code left to the caller. NS_Q35_PROFILE=1: each kernel timed (the GPU synced after it: the
+    /// times are a pass's shares, not its speed), by its phase and name, with the bytes and arithmetic it does
+    fn op_rc(&self, name: &'static str, _key: impl FnOnce() -> String, bytes: usize, flops: usize, f: impl FnOnce() -> c_int) -> Result<c_int> {
+        let Some(prof) = &self.prof else { return Ok(f()) };
+        let t0 = Instant::now();
+        let rc = f();
+        self.dev().gpu.sync()?;
+        let dt = t0.elapsed().as_secs_f64();
+        let mut p = prof.lock().unwrap();
+        let phase = p.phase;
+        let dev = self.cur.load(std::sync::atomic::Ordering::Relaxed);
+        let r = p.rows.entry((dev, phase, name)).or_default();
+        r.0 += dt;
+        r.1 += 1;
+        r.2 += bytes as f64;
+        r.3 += flops as f64;
+        Ok(rc)
     }
 
-    /// What the next kernels are part of (nextsycl's probe groups by it; none here)
-    fn phase(&self, _p: &'static str) {}
+    /// What the next kernels are part of (the profile groups by it)
+    fn phase(&self, p: &'static str) {
+        if let Some(prof) = &self.prof {
+            prof.lock().unwrap().phase = p;
+        }
+    }
 
     pub fn profile_lines(&self) -> Vec<String> {
-        Vec::new()
+        let Some(prof) = &self.prof else { return Vec::new() };
+        let mut p = prof.lock().unwrap();
+        let total: f64 = p.rows.values().map(|r| r.0).sum();
+        let mut rows: Vec<_> = p.rows.iter().map(|(k, v)| (*k, *v)).collect();
+        rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+        let mut out = vec![format!("qwen35 profile: {total:.3} s in kernels (synced after each)")];
+        for ((dev, phase, name), (t, n, b, fl)) in rows.into_iter().take(40) {
+            out.push(format!("  gpu{dev} {phase:<12} {name:<14} {:>8.3} s {:>5.1}% {n:>7} calls {:>7.1} GB/s {:>7.1} TFLOP/s", t, 100.0 * t / total.max(1e-12),
+                             b / t.max(1e-12) / 1e9, fl / t.max(1e-12) / 1e12));
+        }
+        p.rows.clear();
+        out
     }
 
     pub fn load_seconds(&self) -> f64 {
@@ -697,8 +766,9 @@ impl<'g> Qwen35<'g> {
         self.cur.store(i, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// the GPU of the head and the draft block
     fn last(&self) -> usize {
-        self.devs.len() - 1
+        self.head
     }
 
     fn arena(&self) -> &Arena {
@@ -766,6 +836,15 @@ impl<'g> Qwen35<'g> {
             // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
             return self.op("mmvq", key, wb + q8 + 4 * t * rows, flops,
                            || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) });
+        }
+        // a prompt's rows: ggml-cuda's MMQ from the blocks (int8 tensor cores; NS_Q35_MMQ=0: the half product)
+        if self.mmq && unsafe { (k.mmq_supported)(w.ty.code() as i32) } != 0 {
+            // SAFETY: arithmetic only; then x [t, cols] -> its q8_1 tiles; y [t, rows] = x . W^T.
+            let qb = self.arena().bytes(unsafe { (k.mmq_q8_bytes)(kk, t as i64) })?;
+            self.op("mmq quantize", key, 4 * t * cols + t * cols, 0,
+                    || unsafe { (k.mmq_quantize)(self.raw(), w.ty.code() as i32, x.fp(), t as i64, kk, qb.ptr()) })?;
+            return self.op("mmq", key, wb + t * cols + 4 * t * rows, flops,
+                           || unsafe { (k.mmq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), n, kk, qb.ptr(), t as i64, y.fp()) });
         }
         // the matrix expanded to half (directly, or through float32), x to half, then the half product
         let elems = rows * cols;
@@ -1069,6 +1148,11 @@ impl<'g> Qwen35<'g> {
         // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them)
         let n = n_out.clamp(1, t);
         let ne = g.n_embd;
+        // the head's GPU (NS_Q35_HEAD=first: back to the first)
+        if self.cur.load(std::sync::atomic::Ordering::Relaxed) != self.head {
+            self.phase("GPU to GPU");
+            x = self.hop(&x, self.head)?;
+        }
         self.phase("head");
         let (normed, nq8) = if let Some(ms) = s.mtp.as_ref().filter(|_| self.mtp.is_some()) {
             let all = self.arena().f32(t * ne)?;
@@ -1496,7 +1580,7 @@ impl<'g> Qwen35<'g> {
 
     /// A picture (RGB8 rows, w x h) through the vision tower, kept under `key` for the prompts that name its tokens:
     /// its token grid (columns, rows). Resized as llama.cpp's mtmd resizes it (sides to 32s, 8 ..= 4,096 tokens,
-    /// bicubic), fewer tokens when the last GPU's work memory is smaller than a picture that size needs
+    /// bicubic), fewer tokens when the first GPU's work memory is smaller than a picture that size needs
     pub fn add_picture_rgb(&self, key: u32, rgb: &[u8], w: usize, h: usize) -> Result<(usize, usize)> {
         let v = self.vision.as_ref().ok_or_else(|| e("this model has no vision tower (no mmproj beside it)"))?;
         if rgb.len() != w * h * 3 || w == 0 || h == 0 {
@@ -1507,8 +1591,9 @@ impl<'g> Qwen35<'g> {
             return Ok((p.nx, p.ny));
         }
         let _w = self.work.lock().unwrap();
-        let last = self.devs.len() - 1;
-        let arena = &self.devs[last].arena;
+        // the tower's GPU: the first (its activations in that GPU's prompt arena)
+        let at = 0;
+        let arena = &self.devs[at].arena;
         let (mut tw, mut th) = crate::vision::target_size(w, h);
         // the work memory a picture needs: fewer tokens when the arena is smaller (it spills to the card otherwise)
         while v.work_bytes((tw / crate::vision::PATCH) * (th / crate::vision::PATCH)) > arena.len() && tw * th > crate::vision::MIN_TOKENS * 1024 {
@@ -1519,7 +1604,7 @@ impl<'g> Qwen35<'g> {
         let sized = if (tw, th) == (w, h) { pic } else { pic.resize_bicubic(tw as u32, th as u32) };
         let f: Vec<f32> = sized.data.iter().map(|b| *b as f32).collect();
         arena.reset();
-        let nsd = nextcuda_diffusion::kernels::Nsd::new(&self.devs[last].gpu)?;
+        let nsd = nextcuda_diffusion::kernels::Nsd::new(&self.devs[at].gpu)?;
         let alloc = |n: usize| arena.bytes(n);
         let (rows, (nx, ny)) = v.see(&nsd, &f, th, tw, &alloc)?;
         drop(nsd);

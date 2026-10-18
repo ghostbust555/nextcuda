@@ -817,8 +817,10 @@ impl Server {
             .collect::<nextcuda_core::Result<Vec<_>>>() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[the engine cannot make its sessions: {}]", e.0);
-                return;
+                // nothing can be answered: the server ends (its requests would wait for ever), so whoever started it
+                // sees why and starts it again when the cards have room
+                eprintln!("[the engine cannot make its sessions: {}; the server ends]", e.0);
+                std::process::exit(3);
             }
         };
         let mut rng = Rng(0x5DEECE66D);

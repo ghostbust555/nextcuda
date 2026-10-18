@@ -308,16 +308,16 @@ static void test_kda(int64_t T, int64_t H, bool snap) {
             double* Sh = &Sr[(size_t) (h * d * d)];
             const int64_t base = (t * H + h) * d;
             for (int64_t i = 0; i < d; ++i)
-                for (int64_t j = 0; j < d; ++j) Sh[i * d + j] *= g[base + i];
+                for (int64_t j = 0; j < d; ++j) Sh[j * d + i] *= g[base + i];
             for (int64_t j = 0; j < d; ++j) {
                 double kv = 0;
-                for (int64_t i = 0; i < d; ++i) kv += Sh[i * d + j] * k[base + i];
+                for (int64_t i = 0; i < d; ++i) kv += Sh[j * d + i] * k[base + i];
                 const double delta = (v[base + j] - kv) * beta[t * H + h];
-                for (int64_t i = 0; i < d; ++i) Sh[i * d + j] += k[base + i] * delta;
+                for (int64_t i = 0; i < d; ++i) Sh[j * d + i] += k[base + i] * delta;
             }
             for (int64_t j = 0; j < d; ++j) {
                 double a = 0;
-                for (int64_t i = 0; i < d; ++i) a += Sh[i * d + j] * q[base + i];
+                for (int64_t i = 0; i < d; ++i) a += Sh[j * d + i] * q[base + i];
                 o[base + j] = (float) (a / std::sqrt((double) d));
             }
         }

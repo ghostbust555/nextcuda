@@ -502,10 +502,12 @@ __global__ void __launch_bounds__(256) kda_scan_k(const float* __restrict__ qv, 
     const int j0 = (int) (c0 % 128), lane = threadIdx.x & 31, i0 = lane * KPL;
     float* Sh = S + hd * 128 * 128;
     float col[NC][KPL];
+    // the state value-column first (S [H][j][i]): a warp reads a column's 128 keys as one 512-byte sweep
 #pragma unroll
-    for (int n = 0; n < NC; ++n)
-#pragma unroll
-        for (int i = 0; i < KPL; ++i) col[n][i] = Sh[(i0 + i) * 128 + j0 + n];
+    for (int n = 0; n < NC; ++n) {
+        const float4 c = *reinterpret_cast<const float4*>(Sh + (j0 + n) * 128 + i0);
+        col[n][0] = c.x, col[n][1] = c.y, col[n][2] = c.z, col[n][3] = c.w;
+    }
     const float scale = rsqrtf(128.0f);
     for (int64_t t = 0; t < T; ++t) {
         const int64_t base = (t * H + hd) * 128;
@@ -547,15 +549,11 @@ __global__ void __launch_bounds__(256) kda_scan_k(const float* __restrict__ qv, 
         if (snap && t + 1 < T) {
             float* Sn = snap + (t * H + hd) * 128 * 128;
 #pragma unroll
-            for (int n = 0; n < NC; ++n)
-#pragma unroll
-                for (int i = 0; i < KPL; ++i) Sn[(i0 + i) * 128 + j0 + n] = col[n][i];
+            for (int n = 0; n < NC; ++n) *reinterpret_cast<float4*>(Sn + (j0 + n) * 128 + i0) = make_float4(col[n][0], col[n][1], col[n][2], col[n][3]);
         }
     }
 #pragma unroll
-    for (int n = 0; n < NC; ++n)
-#pragma unroll
-        for (int i = 0; i < KPL; ++i) Sh[(i0 + i) * 128 + j0 + n] = col[n][i];
+    for (int n = 0; n < NC; ++n) *reinterpret_cast<float4*>(Sh + (j0 + n) * 128 + i0) = make_float4(col[n][0], col[n][1], col[n][2], col[n][3]);
 }
 
 // ---- the small passes
