@@ -93,6 +93,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
+| `NS_AUTO_PULL` | 0 | 1: a request naming a model a card offers that is not downloaded starts its download (`system.models.pull`) and waits for it, a job saying `downloading <model>: N%`; 0: it is refused 409 `model_not_downloaded` (error.model, bytes, fits, pull). Read on every request, so the page's checkbox needs no restart | serve |
 | `NS_IDLE_MINUTES` | 10 | an enabled model unloads after this long without a request (0: never); the switcher uses the same unless --idle-minutes | serve, switch |
 | `NS_IMAGE_PORT` | 8086 | the image server's port, as the front door reaches it | serve |
 | `NS_IMAGE_PORT2` | 8096 | the second image server's port (`image start --slot 1`), as `NS_AUDIO_PORT2` | serve |

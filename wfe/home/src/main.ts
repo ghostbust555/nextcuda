@@ -74,7 +74,8 @@ async function poll(): Promise<void> {
     ui.error = `nextcuda serve does not answer (${String(e)})`;
   }
   render();
-  const busy = Object.keys(ui.pending).length > 0 || ui.state?.runs.some((x) => x.rc === null);
+  const pulling = (ui.state?.pulls ?? []).some((p) => !["done", "failed", "cancelled"].includes(p.state));
+  const busy = Object.keys(ui.pending).length > 0 || ui.state?.runs.some((x) => x.rc === null) || pulling;
   setTimeout(() => void poll(), busy ? 1000 : 2500);
 }
 
@@ -101,14 +102,27 @@ export async function act(what: string, model: string, extra: Record<string, unk
       ui.error = j.error ?? `HTTP ${r.status}`;
       delete ui.pending[model];
     }
-    // a change of cards is done when answered (an unload it needed was made before)
-    if (r.ok && what === "gpus") delete ui.pending[model];
+    // a change of cards is done when answered (an unload it needed was made before); a download started or
+    // cancelled too (its progress is in the state's pulls)
+    if (r.ok && ["gpus", "pull", "pull_cancel"].includes(what)) delete ui.pending[model];
     if (what === "enable" || what === "disable" || what === "gpus") void loadSpec();
   } catch (e) {
     ui.error = String(e);
     delete ui.pending[model];
   }
   render();
+  void poll();
+}
+
+/** NS_AUTO_PULL from the page's checkbox: a request for a model not downloaded fetches it (no restart needed) */
+export async function autoPull(on: boolean): Promise<void> {
+  try {
+    const r = await fetch("/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ do: "auto_pull", on }) });
+    const j = (await r.json()) as { error?: string };
+    if (!r.ok) ui.error = j.error ?? `HTTP ${r.status}`;
+  } catch (e) {
+    ui.error = String(e);
+  }
   void poll();
 }
 
