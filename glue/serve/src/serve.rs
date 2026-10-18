@@ -340,7 +340,16 @@ const MIN_CHECKPOINT: usize = 64;
 /// The token runs that begin a user turn in this tokenizer's prompts: each of nextcuda_tok::USER_TURNS whose leading
 /// special token the vocabulary has (a marker of another model's template would only match plain text)
 pub fn user_turn_marks(tok: &Tokenizer) -> Vec<Vec<u32>> {
-    nextcuda_tok::USER_TURNS.iter()
+    turn_marks(tok, nextcuda_tok::USER_TURNS)
+}
+
+/// As user_turn_marks for the assistant's turns (nextcuda_tok::ASSISTANT_TURNS)
+pub fn assistant_turn_marks(tok: &Tokenizer) -> Vec<Vec<u32>> {
+    turn_marks(tok, nextcuda_tok::ASSISTANT_TURNS)
+}
+
+fn turn_marks(tok: &Tokenizer, marks: &[&str]) -> Vec<Vec<u32>> {
+    marks.iter()
         .filter(|m| m.find('>').and_then(|e| tok.id(&m[..=e])).is_some())
         .map(|m| tok.encode(m))
         .collect()
@@ -523,14 +532,17 @@ impl Server {
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
-    /// where a user turn begins, nextcuda_tok::USER_TURNS), and its end. The end alone is seldom a prefix of the next
-    /// turn's prompt - the templates rewrite the last turns (effort notes on the last user turn, past thinking
-    /// dropped) - so the next turn mounts the start of this one's last user turn.
+    /// where a user turn begins, nextcuda_tok::USER_TURNS), where the reply it asks for begins (its last assistant
+    /// turn) and its end. The end alone is seldom a prefix of the next turn's prompt - the templates rewrite the last
+    /// turns (past thinking dropped, the reply's opening) - so the next turn mounts the start of this one's reply (a
+    /// pasted document read once: Open WebUI's follow-up on a 16.6K-token prompt read it all again) or of its last
+    /// user turn.
     fn stops(&self, ids: &[u32]) -> Vec<usize> {
         let mut v = Vec::new();
         let at = turn_starts(ids, &user_turn_marks(&self.tok));
         v.extend(at.first().copied());
         v.extend(at.last().copied());
+        v.extend(turn_starts(ids, &assistant_turn_marks(&self.tok)).last().copied());
         v.push(ids.len());
         v.retain(|p| *p >= MIN_CHECKPOINT);
         v.sort();
