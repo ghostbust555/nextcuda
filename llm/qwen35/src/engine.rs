@@ -277,8 +277,10 @@ struct Snaps {
 }
 
 /// NS_Q35_DRAFTS: tokens drafted a step (0: none; at most 7 - a verify pass is at most 8 rows)
+/// (2: with ggml-cuda's MMVQ a verify row costs more past three - a story's 256 tokens, the 5070 + 3060: drafts 0 30.9
+/// tok/s, 1 42.7, 2 44.4, 3 38.2, 5 31.3)
 fn draft_count() -> usize {
-    std::env::var("NS_Q35_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3).min(7)
+    std::env::var("NS_Q35_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).min(7)
 }
 
 /// NS_Q35_MTP: the draft block's file; else the model's own when it holds the block (blk.<layers>.nextn: ISTA-DASLab's
