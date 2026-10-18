@@ -7,6 +7,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -221,8 +222,10 @@ static void test_quants() {
 }
 
 // ---- attention: kv_store + attn against a double-precision softmax (the cache's halves as the reference's keys)
-static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv) {
-    const int64_t D = 256, cap = p0 + T + 3, all = p0 + T;
+// q8: the q8_0 cache (ns_q35_kv_store_q8 / ns_q35_attn_q8): the store against ggml's quantize_f32_q8_0_block, the
+// reference over the cache as stored
+static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv, bool q8 = false) {
+    const int64_t D = 256, cap = p0 + T + 3, all = p0 + T, RB = q8 ? D + 16 : D * 2;
     auto k = rnd((size_t) (all * Hkv * D)), v = rnd((size_t) (all * Hkv * D));
     // q rows strided: qs = Hq * D + 64 (as the engine's fused projections leave them)
     const int64_t qs = Hq * D + 64;
@@ -230,19 +233,51 @@ static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv) {
     float* K = up(k);
     float* V = up(v);
     float* Q = up(q);
-    void* KC = dev((size_t) (Hkv * cap * D) * 2);
-    void* VC = dev((size_t) (Hkv * cap * D) * 2);
+    void* KC = dev((size_t) (Hkv * cap * RB));
+    void* VC = dev((size_t) (Hkv * cap * RB));
+    auto store = q8 ? ns_q35_kv_store_q8 : ns_q35_kv_store;
+    auto attn = q8 ? ns_q35_attn_q8 : ns_q35_attn;
     // the cache in two stores: the earlier keys, then the rows' own (as decode does)
-    if (p0 > 0) ok(ns_q35_kv_store(G, K, Hkv * D, V, Hkv * D, p0, Hkv, D, cap, 0, KC, VC), "kv_store");
-    ok(ns_q35_kv_store(G, K + p0 * Hkv * D, Hkv * D, V + p0 * Hkv * D, Hkv * D, T, Hkv, D, cap, p0, KC, VC), "kv_store");
+    if (p0 > 0) ok(store(G, K, Hkv * D, V, Hkv * D, p0, Hkv, D, cap, 0, KC, VC), "kv_store");
+    ok(store(G, K + p0 * Hkv * D, Hkv * D, V + p0 * Hkv * D, Hkv * D, T, Hkv, D, cap, p0, KC, VC), "kv_store");
     const int64_t sc = ns_q35_attn_scratch(T, Hq, Hkv, D, p0);
     float* S = sc > 0 ? (float*) dev((size_t) sc * 4) : nullptr;
     float* O = (float*) dev((size_t) (T * Hq * D) * 4);
-    ok(ns_q35_attn(G, Q, qs, KC, VC, T, Hq, Hkv, D, cap, p0, O, S), "attn");
-    // the cache back: kv_store's check, and the reference's keys
-    auto kc = down<uint16_t>(KC, (size_t) (Hkv * cap * D));
-    auto vc = down<uint16_t>(VC, (size_t) (Hkv * cap * D));
-    {
+    ok(attn(G, Q, qs, KC, VC, T, Hq, Hkv, D, cap, p0, O, S), "attn");
+    // the cache back as halves [Hkv][cap][D] (a q8 row widened: its int8 times its block's half scale): the store's
+    // check, and the reference's keys
+    std::vector<uint16_t> kc, vc;
+    if (!q8) {
+        kc = down<uint16_t>(KC, (size_t) (Hkv * cap * D));
+        vc = down<uint16_t>(VC, (size_t) (Hkv * cap * D));
+    } else {
+        auto kb = down<uint8_t>(KC, (size_t) (Hkv * cap * RB)), vb = down<uint8_t>(VC, (size_t) (Hkv * cap * RB));
+        std::vector<float> got, want;
+        for (auto* pr : {&kb, &vb}) {
+            auto& out = pr == &kb ? kc : vc;
+            const auto& src = pr == &kb ? k : v;
+            out.assign((size_t) (Hkv * cap * D), 0);
+            for (int64_t t = 0; t < all; ++t)
+                for (int64_t h = 0; h < Hkv; ++h) {
+                    const uint8_t* row = pr->data() + (h * cap + t) * RB;
+                    for (int64_t d = 0; d < D; ++d) {
+                        uint16_t sh;
+                        std::memcpy(&sh, row + D + (d / 32) * 2, 2);
+                        const float x = (float) (int8_t) row[d] * h2f(sh);
+                        out[(h * cap + t) * D + d] = f2h(x);
+                        // ggml's block: d = amax / 127, q = round(x / d), the scale kept as half
+                        const float* blk = &src[(t * Hkv + h) * D + d / 32 * 32];
+                        float amax = 0;
+                        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(blk[i]));
+                        const float sd = amax / 127.0f, id = sd != 0 ? 1.0f / sd : 0.0f;
+                        got.push_back(x);
+                        want.push_back(std::round(src[(t * Hkv + h) * D + d] * id) * hround(sd));
+                    }
+                }
+        }
+        if (T == 1 && p0 == 1000) check("kv_store_q8 (ggml's q8_0 blocks)", got, want, 0);
+    }
+    if (!q8) {
         std::vector<float> got, want;
         for (int64_t t = 0; t < all; ++t)
             for (int64_t h = 0; h < Hkv; ++h)
@@ -279,10 +314,11 @@ static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv) {
         }
     const bool mma = T > 2 && Hq / Hkv <= 6;
     char name[96];
-    std::snprintf(name, sizeof name, "attn T=%lld p0=%lld Hq/Hkv=%lld (%s)", (long long) T, (long long) p0, (long long) (Hq / Hkv),
+    std::snprintf(name, sizeof name, "attn%s T=%lld p0=%lld Hq/Hkv=%lld (%s)", q8 ? " q8" : "", (long long) T, (long long) p0, (long long) (Hq / Hkv),
                   mma ? (sc > 0 ? "tensor cores, splits" : "tensor cores") : T > 16 ? "float tiles" : sc > 0 ? "splits" : "one split");
     // the tensor cores' and the float tiles' queries are halves: a looser bound
-    check(name, down<float>(O, want.size()), want, mma || T > 16 ? 3e-3 : 2e-5);
+    // (q8: the reference's values are the widened products rounded to half; the decode kernel's are float32)
+    check(name, down<float>(O, want.size()), want, mma || T > 16 ? 3e-3 : q8 ? 1e-3 : 2e-5);
     ns_free(G, K); ns_free(G, V); ns_free(G, Q); ns_free(G, KC); ns_free(G, VC); ns_free(G, O);
     if (S) ns_free(G, S);
 }
@@ -518,17 +554,20 @@ static double ms_of(int reps, const std::function<void()>& f) {
     ok(ns_sync(G), "sync");
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
 }
-static void bench_attn(int64_t T, int64_t keys) {
-    const int64_t Hq = 24, Hkv = 4, D = 256, p0 = keys - T, cap = keys;
-    void* KC = dev((size_t) (Hkv * cap * D) * 2);
-    void* VC = dev((size_t) (Hkv * cap * D) * 2);
+static void bench_attn(int64_t T, int64_t keys, bool q8 = false) {
+    const int64_t Hq = 24, Hkv = 4, D = 256, p0 = keys - T, cap = keys, RB = q8 ? D + 16 : D * 2;
+    void* KC = dev((size_t) (Hkv * cap * RB));
+    void* VC = dev((size_t) (Hkv * cap * RB));
+    ok(cudaMemset(KC, 0, (size_t) (Hkv * cap * RB)) == cudaSuccess ? 0 : -1, "memset");
+    ok(cudaMemset(VC, 0, (size_t) (Hkv * cap * RB)) == cudaSuccess ? 0 : -1, "memset");
+    auto attn = q8 ? ns_q35_attn_q8 : ns_q35_attn;
     float* Q = up(rnd((size_t) (T * Hq * D)));
     const int64_t sc = ns_q35_attn_scratch(T, Hq, Hkv, D, p0);
     float* S = sc > 0 ? (float*) dev((size_t) sc * 4) : nullptr;
     float* O = (float*) dev((size_t) (T * Hq * D) * 4);
-    const double ms = ms_of(T == 1 ? 50 : 3, [&] { ok(ns_q35_attn(G, Q, Hq * D, KC, VC, T, Hq, Hkv, D, cap, p0, O, S), "attn"); });
-    const double gb = (double) Hkv * keys * D * 2 * 2 / 1e9;
-    std::printf("attn T=%-4lld keys=%-7lld  %8.3f ms  (cache %.2f GB: %.0f GB/s)\n", (long long) T, (long long) keys, ms, gb, gb / ms * 1e3);
+    const double ms = ms_of(T == 1 ? 50 : 3, [&] { ok(attn(G, Q, Hq * D, KC, VC, T, Hq, Hkv, D, cap, p0, O, S), "attn"); });
+    const double gb = (double) Hkv * keys * RB * 2 / 1e9;
+    std::printf("attn%s T=%-4lld keys=%-7lld  %8.3f ms  (cache %.2f GB: %.0f GB/s)\n", q8 ? " q8" : "   ", (long long) T, (long long) keys, ms, gb, gb / ms * 1e3);
     ns_free(G, KC); ns_free(G, VC); ns_free(G, Q); ns_free(G, O);
     if (S) ns_free(G, S);
 }
@@ -564,6 +603,9 @@ int main(int argc, char** argv) {
     test_attn(300, 2000, 24, 4);
     test_attn(130, 0, 24, 4);
     test_attn(33, 900, 4, 4);
+    for (auto [T, p0, Hq, Hkv] : {std::array<int64_t, 4>{1, 0, 24, 4}, {1, 1000, 24, 4}, {1, 5000, 24, 4}, {2, 70, 24, 4}, {4, 300, 24, 4},
+                                  {16, 777, 24, 4}, {37, 100, 24, 4}, {300, 2000, 24, 4}, {9, 50, 8, 8}, {40, 33, 16, 2}})
+        test_attn(T, p0, Hq, Hkv, true);
     std::printf("== times\n");
     bench_attn(1, 32768);
     bench_attn(1, 131072);
@@ -574,6 +616,10 @@ int main(int argc, char** argv) {
     bench_attn(512, 32768);
     bench_attn(512, 131072);
     bench_attn(64, 131072);
+    bench_attn(1, 131072, true);
+    bench_attn(4, 131072, true);
+    bench_attn(512, 32768, true);
+    bench_attn(512, 131072, true);
     bench_kda(1);
     bench_kda(512);
     std::printf("== %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);

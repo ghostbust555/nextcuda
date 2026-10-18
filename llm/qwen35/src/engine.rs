@@ -372,6 +372,10 @@ pub struct Qwen35<'g> {
     head: usize,
     /// the prompt products by MMQ (NS_Q35_MMQ=0: by the half expansion and cuBLAS)
     mmq: bool,
+    /// the attention caches in q8_0 (NS_Q35_KV=f16: half)
+    kv_q8: bool,
+    /// bytes of a head's row in them
+    kv_row: usize,
 }
 
 /// The kernels' times by (GPU, phase, kernel): seconds, calls, bytes, arithmetic
@@ -402,6 +406,17 @@ fn chunk_setting() -> Option<usize> {
 fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
     chunk * (4 * g.n_embd + 2 * g.n_ff + g.conv_dim() + g.inner + 4 * g.v_heads * g.state + g.heads * 2 * g.head + 3 * g.heads * g.head) * 4
         + chunk * g.n_ff.max(g.conv_dim()) * 2 + 8 * g.vocab * 4 + (64 << 20)
+}
+
+/// The attention cache as llama.cpp's cache-type q8_0 (a head's row 256 int8 and 8 half scales: 272 bytes against
+/// 512), unless NS_Q35_KV=f16
+fn kv_q8_setting() -> bool {
+    !std::env::var("NS_Q35_KV").is_ok_and(|v| v == "f16")
+}
+
+/// Bytes of a key (or value) head's row in the cache
+fn kv_row_bytes(g: &Geometry, q8: bool) -> usize {
+    if q8 { g.head + g.head / 32 * 2 } else { g.head * 2 }
 }
 
 /// Room kept for a session when the chunk is chosen (a 32K context's cache on the 27B is 2 GiB)
@@ -500,8 +515,9 @@ impl<'g> Qwen35<'g> {
             // state and verify snapshots (DeltaNet)
             let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
             let mtp_on = has_mtp;
+            let row = kv_row_bytes(&g, kv_q8_setting());
             // (a layer with a matrix MMQ does not take: its GPU's half buffer as large as it)
-            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + layer_x16[l] as u64 + if g.full(l) { (2 * g.heads_kv * ctx * g.head * 2) as u64 } else {
+            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + layer_x16[l] as u64 + if g.full(l) { (2 * g.heads_kv * ctx * row) as u64 } else {
                 (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
             }).collect();
             let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
@@ -516,7 +532,7 @@ impl<'g> Qwen35<'g> {
                         over += vision_bytes;
                     }
                     if i == head_i {
-                        over += head_w + tail_x16 as u64 + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
+                        over += head_w + tail_x16 as u64 + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * row) as u64 } else { 0 };
                     }
                     free[i] as i64 - over as i64
                 }).collect();
@@ -692,10 +708,11 @@ impl<'g> Qwen35<'g> {
             },
             None => None,
         };
+        let kv_row = kv_row_bytes(&g, kv_q8_setting());
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
                     load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
-                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head,
+                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8: kv_q8_setting(), kv_row,
                     prof: ["NS_Q35_PROFILE", "NS_PROFILE"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1")).then(|| Mutex::new(Profile::default())) })
     }
 
@@ -991,12 +1008,12 @@ impl<'g> Qwen35<'g> {
                 })?;
             }
             self.op("kv store", none, 12 * t * hk * d, 0,
-                    || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                    || (if self.kv_q8 { k.kv_store_q8 } else { k.kv_store })(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                     kc.ptr(), vc.ptr()))?;
             let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
             let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
             self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                    || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                    || (if self.kv_q8 { k.attn_q8 } else { k.attn })(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                 att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
             self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                     || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
@@ -1291,14 +1308,14 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
-        let g = &self.g;
+        let (g, row) = (&self.g, self.kv_row);
         // the caches and states, checked against what is free first (a clear error before an allocation fails)
-        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * g.head * 2 } else { 0 };
+        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * row } else { 0 };
         // per GPU: its layers' share (the draft block's cache on the last)
         for (i, d) in self.devs.iter().enumerate() {
             let full = (d.lb..d.le).filter(|l| g.full(*l)).count();
             let kv = if i == self.last() { mtp_kv } else { 0 };
-            let need = (full * 2 * g.heads_kv * max_ctx * g.head * 2 + kv + (d.le - d.lb - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
+            let need = (full * 2 * g.heads_kv * max_ctx * row + kv + (d.le - d.lb - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
             let (total, free) = d.gpu.memory()?;
             let free = free.unwrap_or(total);
             if need + (512 << 20) > free {
@@ -1310,7 +1327,7 @@ impl<'g> Qwen35<'g> {
         for l in 0..g.layers {
             let gpu = &self.devs[self.layer_dev[l]].gpu;
             layers.push(if g.full(l) {
-                let n = g.heads_kv * max_ctx * g.head * 2;
+                let n = g.heads_kv * max_ctx * row;
                 LState::Full { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)? }
             } else {
                 let s = DevBuf::f32(gpu, g.v_heads * g.state * g.state)?;
@@ -1322,7 +1339,7 @@ impl<'g> Qwen35<'g> {
         }
         let mtp = match &self.mtp {
             Some(_) => {
-                let n = g.heads_kv * max_ctx * g.head * 2;
+                let n = g.heads_kv * max_ctx * row;
                 let gpu = &self.devs[self.last()].gpu;
                 let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)? };
                 ms.pending.fill(0)?;
@@ -1354,14 +1371,14 @@ impl<'g> Qwen35<'g> {
         if src.pos > dst.max_ctx {
             return Err(e(format!("a session of {} tokens into one of {}", src.pos, dst.max_ctx)));
         }
-        let g = &self.g;
+        let (g, row) = (&self.g, self.kv_row);
         for (d, s) in dst.layers.iter().zip(&src.layers) {
             match (d, s) {
                 (LState::Full { k: dk, v: dv }, LState::Full { k: sk, v: sv }) => {
                     for h in 0..g.heads_kv {
-                        let n = src.pos * g.head * 2;
-                        dk.copy_within(h * dst.max_ctx * g.head * 2, sk, h * src.max_ctx * g.head * 2, n)?;
-                        dv.copy_within(h * dst.max_ctx * g.head * 2, sv, h * src.max_ctx * g.head * 2, n)?;
+                        let n = src.pos * row;
+                        dk.copy_within(h * dst.max_ctx * row, sk, h * src.max_ctx * row, n)?;
+                        dv.copy_within(h * dst.max_ctx * row, sv, h * src.max_ctx * row, n)?;
                     }
                 }
                 (LState::Linear { s: ds, conv: dc }, LState::Linear { s: ss, conv: sc }) => {
@@ -1373,9 +1390,9 @@ impl<'g> Qwen35<'g> {
         }
         if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
             for h in 0..g.heads_kv {
-                let n = src.pos * g.head * 2;
-                d.k.copy_within(h * dst.max_ctx * g.head * 2, &sm.k, h * src.max_ctx * g.head * 2, n)?;
-                d.v.copy_within(h * dst.max_ctx * g.head * 2, &sm.v, h * src.max_ctx * g.head * 2, n)?;
+                let n = src.pos * row;
+                d.k.copy_within(h * dst.max_ctx * row, &sm.k, h * src.max_ctx * row, n)?;
+                d.v.copy_within(h * dst.max_ctx * row, &sm.v, h * src.max_ctx * row, n)?;
             }
             d.pending.copy_within(0, &sm.pending, 0, g.n_embd * 4)?;
         }
@@ -1405,6 +1422,11 @@ impl<'g> Qwen35<'g> {
     pub fn rollback(&self, s: &mut Session, keep: usize) -> Result<()> {
         let _w = self.work.lock().unwrap();
         self.rollback_in(s, keep)
+    }
+
+    /// The attention caches in q8_0 (else half)
+    pub fn kv_q8(&self) -> bool {
+        self.kv_q8
     }
 
     pub fn has_draft(&self) -> bool {
@@ -1466,16 +1488,16 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
-        let g = &self.g;
+        let (g, row) = (&self.g, self.kv_row);
         let mut bufs = Vec::new();
         for st in &s.layers {
             match st {
                 LState::Full { k, v } => {
                     for c in [k, v] {
-                        let mut b = vec![0u8; g.heads_kv * s.pos * g.head * 2];
+                        let mut b = vec![0u8; g.heads_kv * s.pos * row];
                         for h in 0..g.heads_kv {
-                            let n = s.pos * g.head * 2;
-                            c.read(h * s.max_ctx * g.head * 2, &mut b[h * n..(h + 1) * n])?;
+                            let n = s.pos * row;
+                            c.read(h * s.max_ctx * row, &mut b[h * n..(h + 1) * n])?;
                         }
                         bufs.push(b);
                     }
@@ -1491,10 +1513,10 @@ impl<'g> Qwen35<'g> {
         }
         if let Some(ms) = &s.mtp {
             for c in [&ms.k, &ms.v] {
-                let mut b = vec![0u8; g.heads_kv * s.pos * g.head * 2];
+                let mut b = vec![0u8; g.heads_kv * s.pos * row];
                 for h in 0..g.heads_kv {
-                    let n = s.pos * g.head * 2;
-                    c.read(h * s.max_ctx * g.head * 2, &mut b[h * n..(h + 1) * n])?;
+                    let n = s.pos * row;
+                    c.read(h * s.max_ctx * row, &mut b[h * n..(h + 1) * n])?;
                 }
                 bufs.push(b);
             }
@@ -1509,7 +1531,7 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn restore(&self, s: &mut Session, ck: &Checkpoint) -> Result<()> {
-        let g = &self.g;
+        let (g, row) = (&self.g, self.kv_row);
         if ck.pos > s.max_ctx {
             return Err(e(format!("a checkpoint of {} tokens into a session of {}", ck.pos, s.max_ctx)));
         }
@@ -1519,12 +1541,12 @@ impl<'g> Qwen35<'g> {
                 LState::Full { k, v } => {
                     for c in [k, v] {
                         let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
-                        let n = ck.pos * g.head * 2;
+                        let n = ck.pos * row;
                         if b.len() != g.heads_kv * n {
                             return Err(e("a checkpoint of another shape"));
                         }
                         for h in 0..g.heads_kv {
-                            c.write(h * s.max_ctx * g.head * 2, &b[h * n..(h + 1) * n])?;
+                            c.write(h * s.max_ctx * row, &b[h * n..(h + 1) * n])?;
                         }
                     }
                 }
@@ -1542,12 +1564,12 @@ impl<'g> Qwen35<'g> {
         if let Some(ms) = &s.mtp {
             for c in [&ms.k, &ms.v] {
                 let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
-                let n = ck.pos * g.head * 2;
+                let n = ck.pos * row;
                 if b.len() != g.heads_kv * n {
                     return Err(e("a checkpoint of another shape"));
                 }
                 for h in 0..g.heads_kv {
-                    c.write(h * s.max_ctx * g.head * 2, &b[h * n..(h + 1) * n])?;
+                    c.write(h * s.max_ctx * row, &b[h * n..(h + 1) * n])?;
                 }
             }
             let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's state"))?;

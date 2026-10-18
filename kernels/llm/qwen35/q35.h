@@ -30,6 +30,10 @@ int ns_q35_qk_norm_mrope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, fl
 /* The cache [Hkv][cap][D] half: rows k [T, Hkv x D] (ks floats apart) and v (vs apart) at positions p0.. */
 int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                     void* kc, void* vc);
+/* As ns_q35_kv_store into a q8_0 cache (llama.cpp's cache-type q8_0; D 256): a row [Hkv][cap] is the 256 features
+ * as int8 then the 8 half scales of its blocks of 32 (272 bytes; d = amax / 127, q = round(x / d)) */
+int ns_q35_kv_store_q8(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                       void* kc, void* vc);
 /* Floats of scratch ns_q35_attn needs for T rows of Hq heads (Hkv key heads) x D at positions p0.. (0: none; only
  * T <= 16 needs any) */
 int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
@@ -40,6 +44,9 @@ int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64
  * float32 (splits up to 16 rows, tiles past). Scratch: ns_q35_attn_scratch (0 when the pass has one split) */
 int ns_q35_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
                 int64_t cap, int64_t p0, float* out, float* scratch);
+/* As ns_q35_attn against a q8_0 cache (ns_q35_kv_store_q8's rows; each key and value widened to half as it is read) */
+int ns_q35_attn_q8(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                   int64_t cap, int64_t p0, float* out, float* scratch);
 /* The attention's output gate: out [T, H x D] *= sigmoid(gate), the gate at q_full[t * gs + h * 2D + D + d] */
 int ns_q35_gate_mul(ns_gpu* g, float* out, const float* q_full, int64_t gs, int64_t T, int64_t H, int64_t D);
 /* DeltaNet's per-head gates: eg [T, H, d] = exp(softplus(alpha + dt) * a) (each head's d copies), beta = sigmoid(beta);

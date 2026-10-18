@@ -112,7 +112,9 @@ impl Engine for engine::Qwen35<'_> {
     fn cache_fingerprint(&self) -> String {
         // checkpoints hold the draft block's cache too when it is loaded
         // nsq35-2: a checkpoint carries the session's rotary shift (pictures); -3: the DeltaNet state value-column first
-        if self.has_draft() { "qwen35 f16-kv nsq35-3 mtp".into() } else { "qwen35 f16-kv nsq35-3".into() }
+        // (the cache's type: f16-kv or q8-kv, NS_Q35_KV)
+        let kv = if self.kv_q8() { "q8-kv" } else { "f16-kv" };
+        if self.has_draft() { format!("qwen35 {kv} nsq35-3 mtp") } else { format!("qwen35 {kv} nsq35-3") }
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
         Ok(Session::new(engine::Qwen35::session(self, max_ctx)?))

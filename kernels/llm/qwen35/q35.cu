@@ -27,6 +27,59 @@ __device__ __forceinline__ float warp_max(float v) {
 }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+// ---- the cache's rows: [Hkv][cap] rows of the head's 256 features, half (512 bytes) or q8_0 (llama.cpp's
+// cache-type q8_0: 256 int8, then the 8 half scales of its blocks of 32 - 272 bytes). `row` = key head * cap + position
+constexpr int64_t Q8ROW = 256 + 16;
+
+// 8 features (c8 * 8 ..) of a row as halves
+template <bool Q8>
+__device__ __forceinline__ uint4 kv_load8(const void* __restrict__ c, int64_t row, int c8) {
+    if constexpr (!Q8) {
+        return *reinterpret_cast<const uint4*>(reinterpret_cast<const __half*>(c) + row * 256 + c8 * 8);
+    } else {
+        const unsigned char* r = reinterpret_cast<const unsigned char*>(c) + row * Q8ROW;
+        const int2 q = *reinterpret_cast<const int2*>(r + c8 * 8);
+        const float d = __half2float(reinterpret_cast<const __half*>(r + 256)[c8 >> 2]);
+        const char4 a = *reinterpret_cast<const char4*>(&q.x), b = *reinterpret_cast<const char4*>(&q.y);
+        __half2 h[4] = {__floats2half2_rn(a.x * d, a.y * d), __floats2half2_rn(a.z * d, a.w * d), __floats2half2_rn(b.x * d, b.y * d),
+                        __floats2half2_rn(b.z * d, b.w * d)};
+        return *reinterpret_cast<const uint4*>(h);
+    }
+}
+// the same 8 as floats
+template <bool Q8>
+__device__ __forceinline__ void kv_load8f(const void* __restrict__ c, int64_t row, int c8, float* f) {
+    if constexpr (!Q8) {
+        const uint4 u = kv_load8<false>(c, row, c8);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 v = __half22float2(h[i]);
+            f[2 * i] = v.x;
+            f[2 * i + 1] = v.y;
+        }
+    } else {
+        const unsigned char* r = reinterpret_cast<const unsigned char*>(c) + row * Q8ROW;
+        const int2 q = *reinterpret_cast<const int2*>(r + c8 * 8);
+        const float d = __half2float(reinterpret_cast<const __half*>(r + 256)[c8 >> 2]);
+        const char4 a = *reinterpret_cast<const char4*>(&q.x), b = *reinterpret_cast<const char4*>(&q.y);
+        f[0] = a.x * d; f[1] = a.y * d; f[2] = a.z * d; f[3] = a.w * d;
+        f[4] = b.x * d; f[5] = b.y * d; f[6] = b.z * d; f[7] = b.w * d;
+    }
+}
+// features 2 * d2, 2 * d2 + 1 of a row
+template <bool Q8>
+__device__ __forceinline__ __half2 kv_load2(const void* __restrict__ c, int64_t row, int d2) {
+    if constexpr (!Q8) {
+        return reinterpret_cast<const __half2*>(reinterpret_cast<const __half*>(c) + row * 256)[d2];
+    } else {
+        const unsigned char* r = reinterpret_cast<const unsigned char*>(c) + row * Q8ROW;
+        const char2 q = *reinterpret_cast<const char2*>(r + 2 * d2);
+        const float d = __half2float(reinterpret_cast<const __half*>(r + 256)[d2 >> 4]);
+        return __floats2half2_rn(q.x * d, q.y * d);
+    }
+}
+
 // ---- attention: decode rows (and short verify passes) - nextsycl's: a block per (row, key head, split of the keys),
 // NW warps taking the split's keys in turn, each lane DL features of the G query heads that share the key head; the
 // warps' (max, sum, weighted values) merged in shared memory, the splits by a second kernel
@@ -50,9 +103,9 @@ __host__ __device__ inline int64_t n_splits(int64_t T, int64_t kv, int64_t Hkv) 
     return kv > kb ? (kv + kb - 1) / kb : 1;
 }
 
-template <int G>
-__global__ void __launch_bounds__(NW * 32) attn_decode_k(const float* __restrict__ qp, int64_t qs, const __half* __restrict__ kc,
-                                                         const __half* __restrict__ vc, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0,
+template <int G, bool Q8>
+__global__ void __launch_bounds__(NW * 32) attn_decode_k(const float* __restrict__ qp, int64_t qs, const void* __restrict__ kc,
+                                                         const void* __restrict__ vc, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0,
                                                          int64_t ns, int64_t KB, float* __restrict__ out, float* __restrict__ part) {
     constexpr int D = 256, DL = D / 32;
     __shared__ float slm[NW * G * (D + 2)];
@@ -77,20 +130,11 @@ __global__ void __launch_bounds__(NW * 32) attn_decode_k(const float* __restrict
         m[g] = -INFINITY;
         l[g] = 0.0f;
     }
-    const __half* kb = kc + hk * cap * D + lane * DL;
-    const __half* vb = vc + hk * cap * D + lane * DL;
+    static_assert(DL == 8, "a lane's features: one load of 8");
     for (int64_t j = j0 + wi; j < j1; j += NW) {
-        const uint4 kr = *reinterpret_cast<const uint4*>(kb + j * D);
-        const uint4 vr = *reinterpret_cast<const uint4*>(vb + j * D);
-        const __half2* k2 = reinterpret_cast<const __half2*>(&kr);
-        const __half2* v2 = reinterpret_cast<const __half2*>(&vr);
         float kf[DL], vf[DL];
-#pragma unroll
-        for (int i = 0; i < DL / 2; ++i) {
-            const float2 a = __half22float2(k2[i]), b = __half22float2(v2[i]);
-            kf[2 * i] = a.x; kf[2 * i + 1] = a.y;
-            vf[2 * i] = b.x; vf[2 * i + 1] = b.y;
-        }
+        kv_load8f<Q8>(kc, hk * cap + j, lane, kf);
+        kv_load8f<Q8>(vc, hk * cap + j, lane, vf);
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             float d = 0.0f;
@@ -178,9 +222,9 @@ constexpr size_t tile_smem() {
            + (size_t) BR * G * 4;              // the rescale factors
 }
 
-template <int G>
-__global__ void __launch_bounds__(TD) attn_tile_k(const float* __restrict__ qp, int64_t qs, const __half* __restrict__ kc,
-                                                  const __half* __restrict__ vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
+template <int G, bool Q8>
+__global__ void __launch_bounds__(TD) attn_tile_k(const float* __restrict__ qp, int64_t qs, const void* __restrict__ kc,
+                                                  const void* __restrict__ vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                                                   int64_t p0, float* __restrict__ out) {
     constexpr int D = TD, NQ = BR * G, D2 = D / 2;
     extern __shared__ __align__(16) unsigned char smem[];
@@ -215,8 +259,6 @@ __global__ void __launch_bounds__(TD) attn_tile_k(const float* __restrict__ qp, 
     }
     const int64_t rlast = min(T, r0 + BR) - 1;
     const int64_t kv_end = p0 + rlast + 1;   // the last row's keys: every row's are a prefix of them
-    const __half* kh = kc + hk * cap * D;
-    const __half* vh = vc + hk * cap * D;
     for (int64_t k0 = 0; k0 < kv_end; k0 += BK) {
         __syncthreads();   // the previous tile's P and V are used
         // the key and value tiles
@@ -225,8 +267,8 @@ __global__ void __launch_bounds__(TD) attn_tile_k(const float* __restrict__ qp, 
             const int64_t key = k0 + j;
             __half2 kv2 = __float2half2_rn(0.0f), vv2 = kv2;
             if (key < kv_end) {
-                kv2 = reinterpret_cast<const __half2*>(kh + key * D)[d2];
-                vv2 = reinterpret_cast<const __half2*>(vh + key * D)[d2];
+                kv2 = kv_load2<Q8>(kc, hk * cap + key, d2);
+                vv2 = kv_load2<Q8>(vc, hk * cap + key, d2);
             }
             Ks[j * KS2 + d2] = kv2;
             reinterpret_cast<__half2*>(Vs)[j * D2 + d2] = vv2;
@@ -341,9 +383,9 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 
-template <int G>
-__global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict__ qp, int64_t qs, const __half* __restrict__ kc,
-                                                        const __half* __restrict__ vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
+template <int G, bool Q8>
+__global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict__ qp, int64_t qs, const void* __restrict__ kc,
+                                                        const void* __restrict__ vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                                                         int64_t p0, int64_t ns, int64_t KB, float* __restrict__ out, float* __restrict__ part) {
     extern __shared__ __align__(16) unsigned char smem[];
     __half* Qs = reinterpret_cast<__half*>(smem);   // [G][MR][QSTR]
@@ -370,8 +412,6 @@ __global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict_
 #pragma unroll
     for (int n = 0; n < MD / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float m_a = -INFINITY, m_b = -INFINITY, l_a = 0.0f, l_b = 0.0f;   // rows gr and gr + 8 (l: this thread's part)
-    const __half* kh = kc + hk * cap * MD;
-    const __half* vh = vc + hk * cap * MD;
     const __half* Qw = Qs + w * MR * QSTR;
     for (int64_t k0 = j0; k0 < j1; k0 += BKT) {
         __syncthreads();   // the previous tile is used
@@ -380,8 +420,8 @@ __global__ void __launch_bounds__(G * 32, 1) attn_mma_k(const float* __restrict_
             const int j = idx / (MD / 8), c = idx % (MD / 8);
             uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = kv4;
             if (k0 + j < j1) {
-                kv4 = *reinterpret_cast<const uint4*>(kh + (k0 + j) * MD + c * 8);
-                vv4 = *reinterpret_cast<const uint4*>(vh + (k0 + j) * MD + c * 8);
+                kv4 = kv_load8<Q8>(kc, hk * cap + k0 + j, c);
+                vv4 = kv_load8<Q8>(vc, hk * cap + k0 + j, c);
             }
             *reinterpret_cast<uint4*>(Ks + j * QSTR + c * 8) = kv4;
             *reinterpret_cast<uint4*>(Vs + j * QSTR + c * 8) = vv4;
@@ -599,6 +639,34 @@ __global__ void kv_store_k(const float* k, int64_t ks, const float* v, int64_t v
     vo[at] = __float2half(v[t * vs + h * D + d]);
 }
 
+// q8_0 rows (D 256): a warp a (row, head), each lane 8 features, a block of 32 over 4 lanes - ggml's
+// quantize_f32_q8_0_block: d = amax / 127, q = round(x / d)
+__global__ void kv_store_q8_k(const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t cap, int64_t p0,
+                              unsigned char* ko, unsigned char* vo) {
+    const int64_t w = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (w >= T * Hkv) return;
+    const int lane = threadIdx.x & 31;
+    const int64_t h = w % Hkv, t = w / Hkv;
+    const int64_t row = h * cap + p0 + t;
+    for (int which = 0; which < 2; ++which) {
+        const float* src = (which ? v + t * vs : k + t * ks) + h * 256 + lane * 8;
+        unsigned char* dst = (which ? vo : ko) + row * Q8ROW;
+        const float4 a = *reinterpret_cast<const float4*>(src), b = *reinterpret_cast<const float4*>(src + 4);
+        const float x[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(x[i]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        char q[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q[i] = (char) roundf(x[i] * id);
+        *reinterpret_cast<int2*>(dst + lane * 8) = *reinterpret_cast<const int2*>(q);
+        if ((lane & 3) == 0) reinterpret_cast<__half*>(dst + 256)[lane >> 2] = __float2half(d);
+    }
+}
+
 __global__ void gate_mul_k(float* out, const float* q_full, int64_t gs, int64_t T, int64_t H, int64_t D) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * H * D) return;
@@ -749,8 +817,8 @@ __global__ void swiglu_k(const float* gate, const float* up, float* out, int64_t
 
 inline unsigned blocks(int64_t n, int b = 256) { return (unsigned) ((n + b - 1) / b); }
 
-template <int G>
-int attn_launch(ns_gpu* g, const float* q, int64_t qs, const __half* k, const __half* v, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
+template <int G, bool Q8>
+int attn_launch(ns_gpu* g, const float* q, int64_t qs, const void* k, const void* v, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                 int64_t p0, float* out, float* scratch) {
     if (use_mma(T, G)) {
         constexpr size_t sm = mma_smem<G <= 6 ? G : 1>();
@@ -760,13 +828,13 @@ int attn_launch(ns_gpu* g, const float* q, int64_t qs, const __half* k, const __
             std::lock_guard<std::mutex> lk(mu);
             if (g->dev < 0 || g->dev >= 64) return ns_fail("ns_q35_attn: device ordinal");
             if (!raised[g->dev]) {
-                NS_CU(cudaFuncSetAttribute(attn_mma_k<G <= 6 ? G : 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm));
+                NS_CU(cudaFuncSetAttribute(attn_mma_k<G <= 6 ? G : 1, Q8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm));
                 raised[g->dev] = true;
             }
         }
         const int64_t kv = p0 + T, ns = mma_splits(T, kv, Hkv), KB = mma_split_keys(T, kv, Hkv);
         const dim3 grid((unsigned) ((T + MR - 1) / MR), (unsigned) Hkv, (unsigned) ns);
-        attn_mma_k<G <= 6 ? G : 1><<<grid, G * 32, sm, g->q>>>(q, qs, k, v, T, Hq, Hkv, cap, p0, ns, KB, out, scratch);
+        attn_mma_k<G <= 6 ? G : 1, Q8><<<grid, G * 32, sm, g->q>>>(q, qs, k, v, T, Hq, Hkv, cap, p0, ns, KB, out, scratch);
         NS_LAUNCH_CHECK();
         if (ns > 1) {
             attn_merge_k<<<(unsigned) (T * Hq), 256, 0, g->q>>>(scratch, ns, out);
@@ -783,23 +851,41 @@ int attn_launch(ns_gpu* g, const float* q, int64_t qs, const __half* k, const __
             std::lock_guard<std::mutex> lk(mu);
             if (g->dev < 0 || g->dev >= 64) return ns_fail("ns_q35_attn: device ordinal");
             if (!raised[g->dev]) {
-                NS_CU(cudaFuncSetAttribute(attn_tile_k<G>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm));
+                NS_CU(cudaFuncSetAttribute(attn_tile_k<G, Q8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm));
                 raised[g->dev] = true;
             }
         }
         const dim3 grid((unsigned) ((T + BR - 1) / BR), (unsigned) Hkv);
-        attn_tile_k<G><<<grid, TD, sm, g->q>>>(q, qs, k, v, T, Hq, Hkv, cap, p0, out);
+        attn_tile_k<G, Q8><<<grid, TD, sm, g->q>>>(q, qs, k, v, T, Hq, Hkv, cap, p0, out);
         NS_LAUNCH_CHECK();
         return 0;
     }
     const int64_t kv = p0 + T, ns = n_splits(T, kv, Hkv), KB = split_keys(T, kv, Hkv);
-    attn_decode_k<G><<<(unsigned) (T * Hkv * ns), NW * 32, 0, g->q>>>(q, qs, k, v, Hq, Hkv, cap, p0, ns, KB, out, scratch);
+    attn_decode_k<G, Q8><<<(unsigned) (T * Hkv * ns), NW * 32, 0, g->q>>>(q, qs, k, v, Hq, Hkv, cap, p0, ns, KB, out, scratch);
     NS_LAUNCH_CHECK();
     if (ns > 1) {
         attn_merge_k<<<(unsigned) (T * Hq), 256, 0, g->q>>>(scratch, ns, out);
         NS_LAUNCH_CHECK();
     }
     return 0;
+}
+
+template <bool Q8>
+int attn_entry(ns_gpu* g, const float* q, int64_t qs, const void* k, const void* v, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+               int64_t cap, int64_t p0, float* out, float* scratch) {
+    NS_CU(cudaSetDevice(g->dev));
+    if (T <= 0) return 0;
+    if (p0 + T > cap) return ns_fail("ns_q35_attn: past the cache's capacity");
+    if (ns_q35_attn_scratch(T, Hq, Hkv, D, p0) > 0 && !scratch) return ns_fail("ns_q35_attn: no scratch");
+    if (D != 256 || Hkv <= 0 || Hq % Hkv) return ns_fail("ns_q35_attn: head 256, the query heads a multiple of the key heads");
+    switch (Hq / Hkv) {
+        case 1: return attn_launch<1, Q8>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+        case 2: return attn_launch<2, Q8>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+        case 4: return attn_launch<4, Q8>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+        case 6: return attn_launch<6, Q8>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+        case 8: return attn_launch<8, Q8>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+        default: return ns_fail("ns_q35_attn: 1, 2, 4, 6 or 8 query heads a key head");
+    }
 }
 
 }  // namespace
@@ -842,6 +928,19 @@ int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64
     NS_CATCH
 }
 
+int ns_q35_kv_store_q8(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                       void* kc, void* vc) {
+    NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
+    if (T <= 0) return 0;
+    if (D != 256 || ks % 4 || vs % 4) return ns_fail("ns_q35_kv_store_q8: head 256, rows 16-byte aligned");
+    if (p0 + T > cap) return ns_fail("ns_q35_kv_store_q8: past the cache's capacity");
+    kv_store_q8_k<<<blocks(T * Hkv * 32), 256, 0, g->q>>>(k, ks, v, vs, T, Hkv, cap, p0, (unsigned char*) kc, (unsigned char*) vc);
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
 int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0) {
     if (T <= 0 || Hkv <= 0) return 0;
     int64_t ns = 1;
@@ -850,24 +949,18 @@ int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64
     return ns > 1 ? T * Hq * ns * (D + 2) : 0;
 }
 
+
 int ns_q35_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
                 int64_t cap, int64_t p0, float* out, float* scratch) {
     NS_TRY
-    NS_CU(cudaSetDevice(g->dev));
-    if (T <= 0) return 0;
-    if (p0 + T > cap) return ns_fail("ns_q35_attn: past the cache's capacity");
-    if (ns_q35_attn_scratch(T, Hq, Hkv, D, p0) > 0 && !scratch) return ns_fail("ns_q35_attn: no scratch");
-    const __half* k = (const __half*) kc;
-    const __half* v = (const __half*) vc;
-    if (D != 256 || Hkv <= 0 || Hq % Hkv) return ns_fail("ns_q35_attn: head 256, the query heads a multiple of the key heads");
-    switch (Hq / Hkv) {
-        case 1: return attn_launch<1>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
-        case 2: return attn_launch<2>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
-        case 4: return attn_launch<4>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
-        case 6: return attn_launch<6>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
-        case 8: return attn_launch<8>(g, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
-        default: return ns_fail("ns_q35_attn: 1, 2, 4, 6 or 8 query heads a key head");
-    }
+    return attn_entry<false>(g, q, qs, kc, vc, T, Hq, Hkv, D, cap, p0, out, scratch);
+    NS_CATCH
+}
+
+int ns_q35_attn_q8(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                   int64_t cap, int64_t p0, float* out, float* scratch) {
+    NS_TRY
+    return attn_entry<true>(g, q, qs, kc, vc, T, Hq, Hkv, D, cap, p0, out, scratch);
     NS_CATCH
 }
 
