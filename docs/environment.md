@@ -252,6 +252,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |
 | `NS_Q35_DRAFTS` | 3 | tokens drafted a step with MTP (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
 | `NS_Q35_HEAD` | last | first: the head and the draft block on the first GPU (the faster card's room to layers; measured: prompts about the same, decode slower) | llm qwen35 |
+| `NS_Q35_KV` | q8 | f16: the attention caches as half instead of q8_0 (llama.cpp's cache-type q8_0: 272 bytes a head's row against 512) | llm qwen35 |
 | `NS_Q35_MMQ` | 1 | 0: a prompt chunk's products by each matrix expanded to half and cuBLAS instead of ggml-cuda's MMQ (int8 tensor cores from the blocks) | llm qwen35 |
 | `NS_Q35_VISION` | 1 | 0: no vision tower (the mmproj beside the model left unloaded: no pictures, its memory to the context) | llm qwen35 |
 | `NS_Q38_CASES` | none | Test: a directory the Qwen3.8 template test writes each case's prompt to (compared with the jinja template by tooling) | tok (tests) |
