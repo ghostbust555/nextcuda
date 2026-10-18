@@ -139,6 +139,10 @@ export interface TimelineClip {
 
 export interface Film { file: string; mb: number; seconds: number | null; mtime: number }
 
+/** A film being joined, or joined since the studio started (GET /api/join; POST /api/join {project} starts one) */
+export interface Join { project: string; clips: number; file: string; state: "running" | "done" | "failed"; started: number; finished?: number; message: string }
+
+
 export interface ListRow {
   file: string;
   label?: string;

@@ -49,9 +49,10 @@ async function pollStatus(): Promise<void> {
 
 async function pollSlow(): Promise<void> {
   try {
-    const [summary, gpu, list, films] = await Promise.all([
-      api.summary(), api.gpu(), api.list(), api.films(),
+    const [summary, gpu, list, films, joins] = await Promise.all([
+      api.summary(), api.gpu(), api.list(), api.films(), api.joins(),
     ]);
+    state.joins = joins.joins;
     state.summary = summary;
     state.gpu = gpu;
     state.list = list;
@@ -60,7 +61,8 @@ async function pollSlow(): Promise<void> {
     /* transient */
   }
   render();
-  setTimeout(() => void pollSlow(), 30000);
+  // a join running: its film shows up sooner
+  setTimeout(() => void pollSlow(), state.joins.some((j) => j.state === "running") ? 4000 : 30000);
 }
 
 async function pollTimeline(): Promise<void> {

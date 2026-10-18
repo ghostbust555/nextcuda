@@ -1,7 +1,7 @@
 /** The whole client state in one object. Components read it; actions mutate it and call
  *  render(). No component keeps its own copy, which is what made the old page drift. */
 import type {
-  Film, Gpu, Job, JobDetail, ListRow, Plan, Status, Summary, TimelineClip,
+  Film, Join, Gpu, Job, JobDetail, ListRow, Plan, Status, Summary, TimelineClip,
 } from "./types.js";
 
 export type Tab = "create" | "jobs";
@@ -16,6 +16,8 @@ export interface AppState {
   pickGpu: number | null;
   list: ListRow[];
   films: Film[];
+  /** films being joined, and the joins since the studio started */
+  joins: Join[];
   filter: string;
 
   timelineProject: string | null;
@@ -46,6 +48,7 @@ export const state: AppState = {
   pickGpu: null,
   list: [],
   films: [],
+  joins: [],
   filter: "",
   timelineProject: null,
   timelineClips: [],
