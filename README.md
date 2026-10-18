@@ -61,7 +61,53 @@ the encoder is the fix). `docs/PHASES.md` has the history of the numbers.
 
 ## Running the LLMs
 
-One engine so far: **Nemotron 3.5 Super 120B-A12B UD-IQ1_M** (`llm/nemotronh`; Mamba-2 + latent MoE + attention) on one
+### Qwen3.8-27B over both cards
+
+**Qwen3.8-27B GSQ-RCO IQ3_S** (`llm/qwen35`; 48 gated DeltaNet + 16 gated attention layers, dense SwiGLU, its MTP
+draft head, the vision tower) whole in the two cards' VRAM, nothing streamed: the 5070 does the work (40 of the 64
+layers, the head and the draft block), the 3060 supports it (the other 24 layers, the vision tower). 80K context with
+pictures (`NS_Q35_VISION=0`: 96K text only), the cache as q8_0. The same file brainiac-llm's llama.cpp serves.
+
+```sh
+curl -s http://127.0.0.1:8000/v1/chat/completions -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+     -d '{"model": "qwen3.8-27b-gsq-iq3s", "messages": [{"role": "user", "content": "Hello"}],
+          "chat_template_kwargs": {"enable_thinking": false}}'
+```
+
+Measured on the box against llama.cpp (b11112, its `qwen3.8-vision` / `-text` presets: q8_0 cache, flash attention,
+MTP drafts) on the same prompts, greedy:
+
+| | nextcuda | llama.cpp |
+|---|---|---|
+| a 16.6K-token prompt read | **1,200 tok/s** (CLI), ~1,160 through :8000 | 925 |
+| a 3.1K-token prompt read | 1,010 tok/s | - |
+| a 256-token story written | **44 tok/s** | 35.4 |
+| written after the 16.6K prompt | 44-53 tok/s | 43.6 |
+
+What it took (2026-10-18, from 691 tok/s and 31 tok/s that morning):
+
+- **Both cards at once.** A prompt is pipelined like llama.cpp's ubatches: the 3060's layers of chunk k+1 are queued
+  before the 5070's of chunk k, the rows cross by `ns_copy_peer_async` (pinned staging, ordered by events on the
+  devices - the host never waits), chunks before the last read nothing back, token rows upload through pinned slots.
+- **One CUDA graph a card a chunk.** A chunk is ~1,000 kernels a card; launched one by one they filled the stream's
+  queue and the single host thread waited, leaving the 3060 idle ~80 ms a chunk. Captured and launched as one graph
+  each, the 3060 is busy 13.2 of 14.3 s.
+- **The work on the faster card.** The planner picks the chunk (512 rows) that leaves the 5070 the most layers; the
+  cache as q8_0 (272 bytes a head's row, not 512) made room for them.
+- **Prompt attention:** the queries in registers, key / value tiles in two `cp.async` stages, the hardware exponent:
+  25% faster on the 3060.
+- **ggml-cuda's MMQ and MMVQ** for the products (vendored from llama.cpp's tree, `kernels/llm/qwen35/third_party`): the
+  shared matrix-vector kernels read the 3060's layers at ~97 GB/s of its 360. With MMVQ two drafts a step is best.
+
+Settings (`docs/environment.md`): `NS_Q35_PIPE`, `NS_Q35_GRAPHS`, `NS_Q35_MMVQ`, `NS_Q35_KV`, `NS_Q35_DRAFTS` (2),
+`NS_Q35_CHUNK`, `NS_Q35_HEAD`, `NS_Q35_VISION`; `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every kernel by card and phase.
+`nextcuda llm generate MODEL.gguf --gpu 1,0 --ctx 81920 --prompt-file F --effort none` is the engine without the server.
+What is left: the 3060 sets the prompt's pace now (its products are llama.cpp's own speed; the q8 cache's widening is
+~18% of attention); pictures still read a pass a chunk.
+
+### Nemotron 3.5 Super
+
+**Nemotron 3.5 Super 120B-A12B UD-IQ1_M** (`llm/nemotronh`; Mamba-2 + latent MoE + attention) on one
 12 GB card. The dense weights (5.8 GiB) and the experts wanted most stay in VRAM, a cache of experts in pinned host
 memory, the rest is read from the file as decode asks for it; the 3060 on its x1 link is not used.
 
@@ -112,6 +158,7 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
 | `qwen-image-2.1-q6k` | the same with a Q6_K transformer | `qwen-image-2.1` | 12.0 GiB | listed |
 | `qwen-image-2.1-rrq4` | [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs): a Q8_0 / Q6_K / Q5_K mix | `qwen-image-2.1` | 11.9 GiB | served, checked |
 | `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B Q4_K_M, its VAE and the Lightning 4-step LoRA | `qwen-image-2512` | 17.7 GiB | served, checked |
+| `qwen3.8-27b-gsq-iq3s` | Qwen3.8-27B, ISTA-DASLab's GSQ-RCO IQ3_S with its MTP head, and the BF16 vision projector: text and pictures, thinking switch | `qwen35` | 12.2 GiB | served, checked (two cards, whole) |
 | `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | `nemotron_h_moe` | 43.0 GiB | served (one 12 GB card, experts streamed) |
 | `breeze-tts-2` | Breeze TTS 2 (~3B, CrispASR's Q8_0 GGUF) with Qwen3-TTS's 12 Hz codec: English and Chinese speech - voices designed, cloned (recording + transcript) or directed; vocal events; weights and outputs non-commercial | `breeze-tts-2` | 4.0 GiB | served, checked |
 | `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices styled by an instruction, ten languages | `qwen3-tts` | 4.2 GiB | served, checked |
@@ -247,7 +294,7 @@ nextcuda audio check <reference dump dir> --model breeze-tts-2        # referenc
 ## What is not here yet
 
 Video (H3), music, OCR and 3D: their contracts are in the tree and the control plane routes them (or answers
-not_implemented), but no engine of ours runs them yet; of the llm engines only Nemotron-H is here (no MTP drafts yet). The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
+not_implemented), but no engine of ours runs them yet; of the llm engines Qwen3.8 (qwen35, MTP drafts) and Nemotron-H (no MTP drafts yet) are here. The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
 engine behind the same contracts (`docs/PHASES.md`); the python worker of phase 1 stays as a fallback until then.
 
 ## Clocking it
@@ -279,6 +326,13 @@ nextcuda image selftest --gpu 0   # the CUDA kernels against host arithmetic
   takes the model's hidden size from it and refuses the file. A shape fix in a copy is the right size of answer.
 - **The first picture pays the page-in.** The first graph after a load streams the weights from disk to host memory
   (30-45 s for a 13 GB model); the second picture does not.
+
+- **Two cards are a pipeline, not a relay.** Splitting the layers only adds the cards' times; the speed came from the
+  first card starting the next chunk while the second finishes this one - and from nothing on the host waiting.
+- **A launch queue fills.** One host thread feeding two cards a thousand kernels each blocks in `cudaLaunchKernel`
+  (nsys showed 0.17 ms a launch); graphs, one a stage, fixed it.
+- **Measure the other runtime, kernel by kernel.** nsys on llama.cpp showed its per-card kernels were not much faster -
+  the cards overlapped - and, for decode, that its matrix-vector products were.
 
 ## Standing on
 
