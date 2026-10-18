@@ -143,6 +143,13 @@ impl Catalog {
         let keys: BTreeSet<&str> = self.files_of(m).iter().map(|f| f.1).collect();
         keys.iter().filter_map(|k| self.files.get(*k)?["size"].as_u64()).sum()
     }
+
+    /// A model's files as `pull` lays them out: (path under the models folder, bytes), each distinct file once - what
+    /// the front door watches to show a download's progress
+    pub fn file_list(&self, m: &Value) -> Vec<(String, u64)> {
+        let mut seen = BTreeSet::new();
+        self.files_of(m).into_iter().filter(|(_, k, _)| seen.insert(*k)).map(|(_, _, f)| (s(f, "path"), f["size"].as_u64().unwrap_or(0))).collect()
+    }
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -485,6 +492,19 @@ mod tests {
                     let role = &v[a + 1..b];
                     assert!(m["files"].get(role).is_some() || m["local"].get(role).is_some(), "{id}: {{{role}}}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_models_file_list_is_what_pull_lays_out() {
+        let cat = repo_cards();
+        for m in &cat.models {
+            let list = cat.file_list(m);
+            // each distinct file once, its bytes the model's download, its path the one fetch writes under the folder
+            assert_eq!(list.iter().map(|f| f.1).sum::<u64>(), cat.bytes(m), "{}", s(m, "id"));
+            for (_, key, f) in cat.files_of(m) {
+                assert!(list.iter().any(|(p, n)| *p == s(f, "path") && Some(*n) == f["size"].as_u64()), "{}: {key}", s(m, "id"));
             }
         }
     }
