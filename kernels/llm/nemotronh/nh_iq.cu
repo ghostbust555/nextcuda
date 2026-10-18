@@ -75,6 +75,7 @@ extern "C" {
 
 int ns_nh_to_half(ns_gpu* g, const float* x, void* y, int64_t n) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n > 0) to_half_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(x, (__half*) y, n);
     NS_LAUNCH_CHECK();
     return 0;
@@ -91,13 +92,14 @@ int ns_nh_mmvq_supported(int type) {
 
 int ns_nh_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* dst) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n <= 0) return 0;
     if (type == 0 || type == 1 || type == 30) {
         to_f32_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(type == 30 ? 2 : type, src, n, dst);
         NS_LAUNCH_CHECK();
         return 0;
     }
-    if (type == 19 || type == 14) return ns_fail("ns_nh_dequant_f32: IQ1_S and Q6_K have products here, not a dequantizer");
+    if (type == 19) return ns_fail("ns_nh_dequant_f32: IQ1_S has products here, not a dequantizer");
     if (n % 256 != 0 || !strata::kernels::iq_supported(type)) return ns_fail("ns_nh_dequant_f32: a type the products do not take, or n not a multiple of 256");
     strata::kernels::iq_dequant_f32(type, src, n, dst, g->q);
     NS_LAUNCH_CHECK();
@@ -107,6 +109,7 @@ int ns_nh_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* ds
 
 int ns_nh_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, void* dst) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n <= 0) return 0;
     if (type == 14 && n % 256 == 0) {
         dq_q6k_k<<<(unsigned) (n / 256), 64, 0, g->q>>>(src, (__half*) dst);
@@ -126,6 +129,7 @@ size_t ns_nh_q8_1_bytes(int64_t C, int64_t T) {
 
 int ns_nh_quantize(ns_gpu* g, const float* x, int64_t T, int64_t C, void* out) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (C % 32 != 0) return ns_fail("ns_nh_quantize: the columns a multiple of 32");
     strata::kernels::quantize_q8_1_rows(x, T, C, out, g->q);
     NS_LAUNCH_CHECK();
@@ -135,6 +139,7 @@ int ns_nh_quantize(ns_gpu* g, const float* x, int64_t T, int64_t C, void* out) {
 
 int ns_nh_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (!strata::kernels::iq_supported(type)) return ns_fail("ns_nh_mmvq: type " + std::to_string(type) + " is not one the products take");
     strata::kernels::iq_mmvq(type, w, xq, y, (int) n_in, (int) n_out, (int) ncols, g->q);
     NS_LAUNCH_CHECK();
@@ -144,6 +149,7 @@ int ns_nh_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int
 
 int ns_nh_mmvq_ptrs(ns_gpu* g, int type, const void* wptrs, const int32_t* xrow, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t n_entries) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n_entries <= 0) return 0;
     if (!strata::kernels::iq_supported(type)) return ns_fail("ns_nh_mmvq_ptrs: type " + std::to_string(type) + " is not one the products take");
     strata::kernels::iq_mmvq_ptrs(type, (const unsigned long long*) wptrs, xrow, xq, y, (int) n_in, (int) n_out, (int) n_entries, g->q);
@@ -154,6 +160,7 @@ int ns_nh_mmvq_ptrs(ns_gpu* g, int type, const void* wptrs, const int32_t* xrow,
 
 int ns_nh_embed(ns_gpu* g, int type, const void* table, int64_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd, float* out) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (!strata::kernels::embed_type_supported(type)) return ns_fail("ns_nh_embed: type " + std::to_string(type) + " is not one the embedding takes");
     strata::kernels::iq_embed_rows(type, table, (size_t) row_bytes, tokens, n_tok, n_embd, out, g->q);
     NS_LAUNCH_CHECK();

@@ -293,6 +293,7 @@ extern "C" {
 
 int ns_nh_relu2_half(ns_gpu* g, const float* x, void* y, int64_t n) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n > 0) relu2_half_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(x, (__half*) y, n);
     NS_LAUNCH_CHECK();
     return 0;
@@ -301,6 +302,7 @@ int ns_nh_relu2_half(ns_gpu* g, const float* x, void* y, int64_t n) {
 
 int ns_nh_gather_half(ns_gpu* g, const float* x, const int32_t* rows, void* out, int64_t K, int64_t n) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n > 0) gather_half_k<<<(unsigned) ((n * K + 255) / 256), 256, 0, g->q>>>(x, rows, (__half*) out, K, n);
     NS_LAUNCH_CHECK();
     return 0;
@@ -310,6 +312,7 @@ int ns_nh_gather_half(ns_gpu* g, const float* x, const int32_t* rows, void* out,
 // Y [m][n] (float32) = X [m][k] . W [n][k]^T, W and X half (row-major), accumulated in float32 on the tensor cores
 int ns_nh_gemm_f16(ns_gpu* g, const void* W, const void* X, float* Y, int64_t m, int64_t n, int64_t k) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (m <= 0) return 0;
     cublasHandle_t h = cublas_for(g);
     if (!h) return ns_fail("ns_nh_gemm_f16: no cuBLAS handle");
@@ -324,6 +327,7 @@ int ns_nh_gemm_f16(ns_gpu* g, const void* W, const void* X, float* Y, int64_t m,
 
 int ns_nh_gather_rows(ns_gpu* g, const void* x, const int32_t* rows, void* out, int64_t row_bytes, int64_t n) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n <= 0) return 0;
     if (row_bytes % 4 != 0) return ns_fail("ns_nh_gather_rows: rows of whole words");
     const int64_t rw = row_bytes / 4;
@@ -335,6 +339,7 @@ int ns_nh_gather_rows(ns_gpu* g, const void* x, const int32_t* rows, void* out, 
 
 int ns_nh_moe_combine_ids(ns_gpu* g, float* out, const float* dn, const int32_t* tp, const int32_t* ids, const float* w, int64_t T, int64_t L) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     combine_ids_k<<<(unsigned) T, 256, 0, g->q>>>(out, dn, tp, ids, w, L);
     NS_LAUNCH_CHECK();
@@ -344,6 +349,7 @@ int ns_nh_moe_combine_ids(ns_gpu* g, float* out, const float* dn, const int32_t*
 
 int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float* w, const float* b, float* out, int64_t T, int64_t C, int k) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     if (k < 2 || k > 8) return ns_fail("ns_nh_conv: a kernel of 2 to 8");
     conv_k<<<(unsigned) ((C + 127) / 128), 128, 0, g->q>>>(x, xs, state, w, b, out, T, C, k);
@@ -355,6 +361,7 @@ int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float*
 int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp, float* S,
               float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     if (N % 32 != 0 || N > 256 || H % G != 0) return ns_fail("ns_nh_ssm: d_state a multiple of 32 up to 256, the heads a multiple of the groups");
     if (T >= 8 && P == 64 && N == 128) ssm_tile_k<<<(unsigned) H, 256, 0, g->q>>>(xbc, xs, dt, dts, dt_bias, A, Dp, S, y, T, H, G);
@@ -366,6 +373,7 @@ int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t 
 
 int ns_nh_gated_norm(ns_gpu* g, const float* y, const float* z, int64_t zs, const float* w, float* out, int64_t T, int64_t C, int64_t group, float eps) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     if (C % group != 0) return ns_fail("ns_nh_gated_norm: the channels a multiple of the group");
     gated_norm_k<<<(unsigned) (T * (C / group)), WG, 0, g->q>>>(y, z, zs, w, out, C, group, eps);
@@ -376,6 +384,7 @@ int ns_nh_gated_norm(ns_gpu* g, const float* y, const float* z, int64_t zs, cons
 
 int ns_nh_relu2(ns_gpu* g, float* x, int64_t n) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n > 0) relu2_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(x, n);
     NS_LAUNCH_CHECK();
     return 0;
@@ -385,6 +394,7 @@ int ns_nh_relu2(ns_gpu* g, float* x, int64_t n) {
 int ns_nh_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                    void* kc, void* vc) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     if (p0 + T > cap) return ns_fail("ns_nh_kv_store: past the cache's capacity");
     const int64_t n = T * Hkv * D;
@@ -399,6 +409,7 @@ int64_t ns_nh_attn_max_keys(void) { return ATT_KEYS; }
 int ns_nh_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap,
                int64_t p0, float* out) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     if (p0 + T > cap) return ns_fail("ns_nh_attn: past the cache's capacity");
     if (p0 + T > ATT_KEYS) return ns_fail("ns_nh_attn: more keys than the plain kernel holds scores for");
@@ -416,6 +427,7 @@ int ns_nh_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void
 
 int ns_nh_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t T, int64_t C, float eps) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     rms_k<<<(unsigned) T, WG, 0, g->q>>>(x, w, y, C, eps);
     NS_LAUNCH_CHECK();
@@ -425,6 +437,7 @@ int ns_nh_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t 
 
 int ns_nh_add(ns_gpu* g, float* y, const float* x, int64_t n) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (n > 0) add_k<<<(unsigned) ((n + 255) / 256), 256, 0, g->q>>>(y, x, n);
     NS_LAUNCH_CHECK();
     return 0;
@@ -433,6 +446,7 @@ int ns_nh_add(ns_gpu* g, float* y, const float* x, int64_t n) {
 
 int ns_nh_gemv_f32(ns_gpu* g, const float* W, const float* x, float* y, int64_t T, int64_t R, int64_t C) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     gemv_f32_k<<<(unsigned) ((R + 7) / 8), 256, 0, g->q>>>(W, x, y, T, R, C);
     NS_LAUNCH_CHECK();
@@ -442,6 +456,7 @@ int ns_nh_gemv_f32(ns_gpu* g, const float* W, const float* x, float* y, int64_t 
 
 int ns_nh_moe_combine(ns_gpu* g, float* out, const float* dn, const int32_t* tp, const float* w, int64_t T, int64_t L) {
     NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
     if (T <= 0) return 0;
     combine_k<<<(unsigned) T, 256, 0, g->q>>>(out, dn, tp, w, L);
     NS_LAUNCH_CHECK();

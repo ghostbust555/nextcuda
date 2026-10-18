@@ -57,7 +57,7 @@ int ns_nh_to_half(ns_gpu* g, const float* x, void* y, int64_t n);
 int ns_nh_gather_half(ns_gpu* g, const float* x, const int32_t* rows, void* out, int64_t K, int64_t n);
 /* Y [m][n] (float32) = X [m][k] . W [n][k]^T, W and X half, row-major (cuBLAS, tensor cores) */
 int ns_nh_gemm_f16(ns_gpu* g, const void* W, const void* X, float* Y, int64_t m, int64_t n, int64_t k);
-/* n values of a tensor of an i-quant / Q2_0 / ... type (not Q6_K) to half (n a multiple of 256) */
+/* n values of a tensor of an i-quant / Q2_0 / Q2_K / Q6_K / ... type to half (n a multiple of 256) */
 int ns_nh_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, void* dst);
 
 /* a GGUF type's row bytes for n values (0: not one the products take) */
