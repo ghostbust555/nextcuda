@@ -65,6 +65,7 @@ struct ns_mmq_ctx {
 #include "third_party/ggml-cuda/mmq.cuh"
 #include "third_party/ggml-cuda/quantize.cuh"
 #include "third_party/ggml-cuda/quantize.cu"
+#include "third_party/ggml-cuda/mmvq.cu"
 
 // ---- what the headers need from ggml-cuda.cu / ggml.c
 const ggml_cuda_device_info& ggml_cuda_info() {
@@ -120,6 +121,27 @@ DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
 DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
 DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
 DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+
+// the types the decode products (ggml-cuda's MMVQ) take here, and their values a block
+static int mmvq_block(int t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_IQ4_NL:
+            return 32;
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_XS:
+            return 256;
+        default:
+            return 0;
+    }
+}
+
+// what mmvq.cu asks of ggml.c (its launch checks): from the table above (an F32 / F16 / BF16 one value a block)
+extern "C" int64_t ggml_blck_size(enum ggml_type type) {
+    const int b = mmvq_block(type);
+    return b > 0 ? b : 1;
+}
+extern "C" bool ggml_is_quantized(enum ggml_type type) { return mmvq_block(type) > 0; }
 
 static bool mmq_type(int t) {
     switch (t) {
@@ -185,6 +207,26 @@ int ns_q35_mmq(ns_gpu* g, int type, const void* w, int64_t n_out, int64_t K, con
         case GGML_TYPE_IQ4_XS:  mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, g->q); break;
         default: return ns_fail("ns_q35_mmq: no MMQ for this type");
     }
+    NS_LAUNCH_CHECK();
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_mmvq_supported(int type) { return mmvq_block(type) > 0 ? 1 : 0; }
+
+// y [ncols][n_out] = W [n_out][n_in] . xq [ncols] - nh's ns_nh_mmvq's arguments (xq: its Q8_1 rows, ggml's block_q8_1),
+// ggml-cuda's MMVQ (llama.cpp's decode products: up to 8 rows)
+int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
+    NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
+    const int qk = mmvq_block(type);
+    if (!qk) return ns_fail("ns_q35_mmvq: type " + std::to_string(type) + " has no MMVQ here");
+    if (n_in % qk != 0 || n_in % 32 != 0 || ncols < 1 || ncols > MMVQ_MAX_BATCH_SIZE) return ns_fail("ns_q35_mmvq: n_in a multiple of the block, 1..8 rows");
+    const int bpr = (int) (n_in / qk), yr = (int) (n_in / 32);
+    mul_mat_vec_q_switch_type(w, (ggml_type) type, xq, nullptr, ggml_cuda_mm_fusion_args_device{}, y, (int) n_in, (int) n_out, (int) ncols,
+                              bpr, yr, (int) n_out,
+                              1, 1, 1, bpr * (int) n_out, yr * (int) ncols, (int) (n_out * ncols),
+                              1, 1, bpr * (int) n_out, yr * (int) ncols, (int) (n_out * ncols), 0, g->q);
     NS_LAUNCH_CHECK();
     return 0;
     NS_CATCH

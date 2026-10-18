@@ -34,6 +34,9 @@ pub struct Api {
     // q35.h: its own
     pub qk_norm_rope: unsafe extern "C" fn(G, F, i64, i64, FM, i64, i64, i64, i64, F, f32, i64, f32, i64) -> c_int,
     pub mmq_supported: unsafe extern "C" fn(c_int) -> c_int,
+    /// ggml-cuda's MMVQ (nh's mmvq's arguments)
+    pub q35_mmvq_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub q35_mmvq: unsafe extern "C" fn(G, c_int, P, P, FM, i64, i64, i64) -> c_int,
     pub mmq_q8_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     pub mmq_quantize: unsafe extern "C" fn(G, c_int, F, i64, i64, M) -> c_int,
     pub mmq: unsafe extern "C" fn(G, c_int, P, i64, i64, P, i64, FM) -> c_int,
@@ -92,6 +95,8 @@ pub fn api() -> nextcuda_core::Result<&'static Api> {
             qk_norm_rope: sym!("ns_q35_qk_norm_rope"),
             qk_norm_mrope: sym!("ns_q35_qk_norm_mrope"),
             mmq_supported: sym!("ns_q35_mmq_supported"),
+            q35_mmvq_supported: sym!("ns_q35_mmvq_supported"),
+            q35_mmvq: sym!("ns_q35_mmvq"),
             mmq_q8_bytes: sym!("ns_q35_mmq_q8_bytes"),
             mmq_quantize: sym!("ns_q35_mmq_quantize"),
             mmq: sym!("ns_q35_mmq"),

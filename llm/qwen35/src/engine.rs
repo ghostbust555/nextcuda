@@ -391,6 +391,8 @@ pub struct Qwen35<'g> {
     kv_row: usize,
     /// over two GPUs: the two buffers on the last that pipelined chunks' rows cross into (`feed_pipelined`)
     pipe: Vec<DevBuf>,
+    /// the decode products by ggml-cuda's MMVQ (NS_Q35_MMVQ=nh: the shared kernels)
+    ggml_mmvq: bool,
 }
 
 /// The kernels' times by (GPU, phase, kernel): seconds, calls, bytes, arithmetic
@@ -740,6 +742,7 @@ impl<'g> Qwen35<'g> {
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
                     load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
                     mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8: kv_q8_setting(), kv_row, pipe,
+                    ggml_mmvq: !std::env::var("NS_Q35_MMVQ").is_ok_and(|v| v == "nh"),
                     prof: ["NS_Q35_PROFILE", "NS_PROFILE"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1")).then(|| Mutex::new(Profile::default())) })
     }
 
@@ -876,7 +879,8 @@ impl<'g> Qwen35<'g> {
                            || unsafe { (k.gemm_f16)(self.raw(), self.dev().w16.ptr(), xh.ptr(), y.fp(), t as i64, n, kk) });
         }
         // SAFETY: arithmetic only.
-        let mmvq = unsafe { (k.mmvq_supported)(w.ty.code() as i32) } != 0;
+        let ggml_mmvq = self.ggml_mmvq && unsafe { (k.q35_mmvq_supported)(w.ty.code() as i32) } != 0;
+        let mmvq = ggml_mmvq || unsafe { (k.mmvq_supported)(w.ty.code() as i32) } != 0;
         if t <= 8 && mmvq {
             // SAFETY: arithmetic only.
             let q8 = unsafe { (k.q8_1_bytes)(kk, t as i64) };
@@ -889,8 +893,10 @@ impl<'g> Qwen35<'g> {
                 }
             };
             // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
+            // ggml-cuda's MMVQ where it takes the type (NS_Q35_MMVQ=nh: the shared kernels)
+            let f = if ggml_mmvq { k.q35_mmvq } else { k.mmvq };
             return self.op("mmvq", key, wb + q8 + 4 * t * rows, flops,
-                           || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) });
+                           || unsafe { f(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) });
         }
         // a prompt's rows: ggml-cuda's MMQ from the blocks (int8 tensor cores; NS_Q35_MMQ=0: the half product)
         if self.mmq && unsafe { (k.mmq_supported)(w.ty.code() as i32) } != 0 {

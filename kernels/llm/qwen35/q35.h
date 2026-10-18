@@ -87,6 +87,12 @@ int ns_q35_mmq_quantize(ns_gpu* g, int type, const float* x, int64_t T, int64_t 
 /* y [T][n_out] = x . W^T, W [n_out][K] in `type`'s blocks, x as ns_q35_mmq_quantize made it (for that type) */
 int ns_q35_mmq(ns_gpu* g, int type, const void* w, int64_t n_out, int64_t K, const void* xq, int64_t T, float* y);
 
+/* ---- the decode / verify rows' products, ggml-cuda's MMVQ (q35_mmq.cu): nh's ns_nh_mmvq's arguments - xq its Q8_1
+ * rows (ns_nh_quantize: ggml's block_q8_1), 1..8 of them. Types: Q4_0 .. Q8_0, IQ4_NL, the K quants, IQ1_S / M, IQ2_*, IQ3_*,
+ * IQ4_XS */
+int ns_q35_mmvq_supported(int type);
+int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+
 #ifdef __cplusplus
 }
 #endif

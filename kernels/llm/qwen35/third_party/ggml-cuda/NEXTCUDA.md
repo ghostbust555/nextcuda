@@ -1,4 +1,4 @@
-# ggml-cuda's MMQ, vendored for the qwen35 engine's prompt products
+# ggml-cuda's MMQ and MMVQ, vendored for the qwen35 engine's products
 
 From the llama.cpp tree brainiac-llm builds (`~/brainiac_llm/llama.cpp`, commit 4098fdc92, 2026-09-22), MIT
 (LICENSE): `ggml/src/ggml-cuda/{mmq.cuh, mmq-config-*.cuh, mmq-load-tiles.cuh, mmq-vec-dot.cuh, mma.cuh, vecdotq.cuh,
@@ -9,3 +9,8 @@ One change: `mmq.cuh`'s launchers take `ns_mmq_ctx & ctx` instead of `ggml_backe
 use it for `ctx.pool(id)`, the stream-k fixup buffer). `../../q35_mmq.cu` defines `ns_mmq_ctx`, the few ggml-cuda.cu
 symbols the headers need (`ggml_cuda_info`, `ggml_cuda_error`, `ggml_abort`), and the C ABI the engine binds
 (q35.h: `ns_q35_mmq*`). Nothing here runs Python or ggml itself: it is the int8 tensor-core products only.
+
+MMVQ (the decode and verify rows' products, the same commit): `mmvq.cu`, `mmvq.cuh`, `unary.cuh`. One change:
+`mmvq.cu`'s two ggml-tensor entry points (`ggml_cuda_mul_mat_vec_q`, `ggml_cuda_op_mul_mat_vec_q`) are compiled out
+(`#if 0`); `../../q35_mmq.cu` calls `mul_mat_vec_q_switch_type` with the engine's own Q8_1 rows (nh's quantize: the
+same 36-byte `block_q8_1`).
