@@ -96,7 +96,9 @@ export function useSettings(j: GenerateRequest): void {
   navigate({ tab: "create" });
 }
 
-async function generate(queue: boolean): Promise<void> {
+/** Make the clip: now if the GPU is free, else at the back of the queue (the server's queue:true - without it, a busy
+ *  GPU refused the request, which was all a separate Queue button had added) */
+async function generate(): Promise<void> {
   form.engine = readyEngine();
   const body: GenerateRequest = {
     prompt: form.prompt,
@@ -111,7 +113,7 @@ async function generate(queue: boolean): Promise<void> {
     upscale: form.upscale,
     upscaler: form.upscaler,
     chain_mode: "png",
-    queue,
+    queue: true,
   };
   if (form.sampler) body.sampler = form.sampler;
   if (form.schedule) body.schedule = form.schedule;
@@ -446,11 +448,8 @@ export function Creation() {
           : null;
       })()}
       <div class="row">
-        <button type="button" on={{ click: () => void generate(false) }}>
+        <button type="button" on={{ click: () => void generate() }}>
           <span class="i" props={{ innerHTML: "&#xf0d0;" }} />Generate
-        </button>
-        <button type="button" class="secondary" on={{ click: () => void generate(true) }}>
-          <span class="i" props={{ innerHTML: "&#xf03a;" }} />Queue
         </button>
         {submitted ? <span class="hint">{submitted}</span> : null}
       </div>
