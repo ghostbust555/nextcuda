@@ -8,7 +8,7 @@ members = [
     "image/contract", "image/qwenimage21", "image/paddleocrvl", "image/unlimitedocr", "image/olmocr2",
     "video/contract", "video/h3",
     "model3d/contract", "model3d/trellis2", "model3d/hunyuan3d", "model3d/unirig", "model3d/rignet", "model3d/animateanymesh",
-    "audio/contract", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
+    "audio/contract", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2", "audio/whisper",
     "glue/models", "glue/serve",
     "cli/nextcuda",
 ]
@@ -49,6 +49,7 @@ nextcuda-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextcuda-audio-qwen3tts = { path = "audio/qwen3tts" }
 nextcuda-audio-voxcpm2 = { path = "audio/voxcpm2" }
 nextcuda-audio-breezetts2 = { path = "audio/breezetts2" }
+nextcuda-audio-whisper = { path = "audio/whisper" }
 nextcuda-models = { path = "glue/models" }
 nextcuda-serve = { path = "glue/serve" }
 serde_json = { version = "1", features = ["preserve_order"] }

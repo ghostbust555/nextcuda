@@ -638,6 +638,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextcuda-audio-whisper"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-audio",
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-tok",
+ "serde_json",
+]
+
+[[package]]
 name = "nextcuda-codec12hz"
 version = "0.0.0"
 dependencies = [
