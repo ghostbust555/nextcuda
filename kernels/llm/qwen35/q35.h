@@ -92,6 +92,8 @@ int ns_q35_swiglu(ns_gpu* g, const float* gate, const float* up, float* out, int
 int ns_q35_mmq_supported(int type);
 /* the GPU's MMQ fixup buffer allocated at its largest (none later: a CUDA graph's capture cannot allocate) */
 int ns_q35_mmq_reserve(ns_gpu* g);
+/* the q8_1 layout ns_q35_mmq_quantize makes for a type (-1: no MMQ): products of the same layout share x's */
+int ns_q35_mmq_layout(int type);
 /* bytes of x [T][K] quantized for ns_q35_mmq */
 size_t ns_q35_mmq_q8_bytes(int64_t K, int64_t T);
 /* x [T][K] float32 -> xq, in the layout a matrix of `type` reads */

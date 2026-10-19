@@ -155,6 +155,9 @@ static bool mmq_type(int t) {
 
 extern "C" {
 
+// the q8_1 layout x takes for a type's MMQ (ggml's mmq_q8_1_ds_layout; -1: none): matrices of one layout share it
+int ns_q35_mmq_layout(int type) { return mmq_type(type) ? (int) mmq_get_q8_1_ds_layout((ggml_type) type) : -1; }
+
 int ns_q35_mmq_supported(int type) {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return 0;

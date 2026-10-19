@@ -399,6 +399,10 @@ pub struct Qwen35<'g> {
     pipe: Vec<DevBuf>,
     /// the decode products by ggml-cuda's MMVQ (NS_Q35_MMVQ=nh: the shared kernels)
     ggml_mmvq: bool,
+    /// a prompt pass's inputs already quantized for MMQ: (x's address, rows, columns, layout) -> its q8_1 tiles (in
+    /// the arena), so the products that read one input (q k v, gate up, DeltaNet's) quantize it once; emptied when a
+    /// norm writes and when a layer's arena is rewound
+    xq: Mutex<Vec<((usize, usize, usize, i32), DevBuf)>>,
 }
 
 /// The kernels' times by (GPU, phase, kernel): seconds, calls, bytes, arithmetic
@@ -838,7 +842,7 @@ impl<'g> Qwen35<'g> {
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
                     load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
                     mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_ty, kv_rot, pipe,
-                    ggml_mmvq: !std::env::var("NS_Q35_MMVQ").is_ok_and(|v| v == "nh"),
+                    ggml_mmvq: !std::env::var("NS_Q35_MMVQ").is_ok_and(|v| v == "nh"), xq: Mutex::new(Vec::new()),
                     prof: ["NS_Q35_PROFILE", "NS_PROFILE"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1")).then(|| Mutex::new(Profile::default())) })
     }
 
@@ -996,10 +1000,20 @@ impl<'g> Qwen35<'g> {
         }
         // a prompt's rows: ggml-cuda's MMQ from the blocks (int8 tensor cores; NS_Q35_MMQ=0: the half product)
         if self.mmq && unsafe { (k.mmq_supported)(w.ty.code() as i32) } != 0 {
-            // SAFETY: arithmetic only; then x [t, cols] -> its q8_1 tiles; y [t, rows] = x . W^T.
-            let qb = self.arena().bytes(unsafe { (k.mmq_q8_bytes)(kk, t as i64) })?;
-            self.op("mmq quantize", key, 4 * t * cols + t * cols, 0,
-                    || unsafe { (k.mmq_quantize)(self.raw(), w.ty.code() as i32, x.fp(), t as i64, kk, qb.ptr()) })?;
+            // SAFETY: arithmetic only; then x [t, cols] -> its q8_1 tiles (once for the products of its layout that
+            // read it); y [t, rows] = x . W^T.
+            let id = (x.ptr() as usize, t, cols, unsafe { (k.mmq_layout)(w.ty.code() as i32) });
+            let found = self.xq.lock().unwrap().iter().find(|(k2, _)| *k2 == id).map(|(_, b)| b.view(0, b.len)).transpose()?;
+            let qb = match found {
+                Some(b) => b,
+                None => {
+                    let qb = self.arena().bytes(unsafe { (k.mmq_q8_bytes)(kk, t as i64) })?;
+                    self.op("mmq quantize", key, 4 * t * cols + t * cols, 0,
+                            || unsafe { (k.mmq_quantize)(self.raw(), w.ty.code() as i32, x.fp(), t as i64, kk, qb.ptr()) })?;
+                    self.xq.lock().unwrap().push((id, qb.view(0, qb.len)?));
+                    qb
+                }
+            };
             return self.op("mmq", key, wb + t * cols + 4 * t * rows, flops,
                            || unsafe { (k.mmq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), n, kk, qb.ptr(), t as i64, y.fp()) });
         }
@@ -1046,6 +1060,8 @@ impl<'g> Qwen35<'g> {
     }
 
     fn rms(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<()> {
+        // (y's quantized forms are stale now)
+        self.xq.lock().unwrap().clear();
         // SAFETY: x and y [rows, c], w c floats.
         self.op("rms norm", String::new, 8 * rows * c + 4 * c, 4 * rows * c,
                 || unsafe { (self.k.rms_norm)(self.raw(), x.fp(), w.fp(), y.fp(), rows as i64, c as i64, self.g.eps) })
@@ -1351,6 +1367,7 @@ impl<'g> Qwen35<'g> {
     fn run_layers(&self, s: &Session, range: std::ops::Range<usize>, mut x: DevBuf, t: usize, p0: usize, rope: &Rope, snaps: Option<&Snaps>,
                   tap: Tap) -> Result<DevBuf> {
         let g = &self.g;
+        self.xq.lock().unwrap().clear();
         let mut h = self.arena().f32(t * g.n_embd)?;
         let mut ffn_g = self.arena().f32(t * g.n_ff)?;
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
@@ -1394,6 +1411,7 @@ impl<'g> Qwen35<'g> {
             self.add(&x, &ffn, t * g.n_embd)?;
             tap(&format!("l_out-{l}"), &x)?;
             self.arena().rewind(mark);
+            self.xq.lock().unwrap().clear();
         }
         Ok(x)
     }
@@ -1534,6 +1552,7 @@ impl<'g> Qwen35<'g> {
                     static SAID: std::sync::Once = std::sync::Once::new();
                     SAID.call_once(|| eprintln!("[qwen35: a prompt stage as a graph failed ({why}); its kernels launched one by one]"));
                     self.arena().rewind(mark);
+                    self.xq.lock().unwrap().clear();
                 }
             }
         }
