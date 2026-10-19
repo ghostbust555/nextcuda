@@ -166,7 +166,8 @@ int ns_copy_from(ns_gpu* g, void* dst, const void* src, size_t bytes) {
 
 int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes) {
     NS_CU(use(g));
-    NS_CU(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, g->q));
+    // (cudaMemcpyDefault: either side may be pinned host memory's device address - an upload slot - as well as VRAM)
+    NS_CU(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, g->q));
     return 0;
 }
 

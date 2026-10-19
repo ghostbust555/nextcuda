@@ -320,8 +320,8 @@ struct Uploads {
     next: usize,
 }
 
-/// Upload slots a GPU: as many passes queued ahead of the GPU as there are
-const UPLOAD_SLOTS: usize = 4;
+/// Upload slots a GPU (a pass takes up to four: its tokens, the draft block's, a picture's positions and rows)
+const UPLOAD_SLOTS: usize = 8;
 
 /// A picture's tokens in a prompt: ids past the vocabulary, PICTURE | (the picture's key << 12) | its token's index,
 /// the key a hash of the picture (so a prefix with another picture is never reused for it). Rows in raster order of
@@ -346,6 +346,8 @@ fn picture_of(id: u32) -> Option<(u32, usize)> {
 enum Rope {
     From(i64),
     Rows(Vec<i32>),
+    /// Rows' positions already on the GPU's side: pinned host memory a kernel reads in place (`rope_here`)
+    Mapped(DevBuf),
 }
 
 pub struct Qwen35<'g> {
@@ -1054,8 +1056,16 @@ impl<'g> Qwen35<'g> {
             if i + n > p.nx * p.ny {
                 return Err(e(format!("picture token {} of {}", i + n - 1, p.nx * p.ny)));
             }
-            let bytes: Vec<u8> = p.rows[i * ne..(i + n) * ne].iter().flat_map(|v| v.to_le_bytes()).collect();
-            x.write(j * ne * 4, &bytes)?;
+            // through a pinned slot, queued (no wait for the GPU)
+            let rows = &p.rows[i * ne..(i + n) * ne];
+            let (b, slot) = self.upload_with(rows.len() * 4, &mut |raw| {
+                for (k, v) in rows.iter().enumerate() {
+                    raw[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                Ok(())
+            })?;
+            x.copy_within(j * ne * 4, &b, 0, rows.len() * 4)?;
+            self.release(slot)?;
             j += n;
         }
         Ok(x)
@@ -1066,7 +1076,28 @@ impl<'g> Qwen35<'g> {
         let g = &self.g;
         let row = embd.ty.bytes(g.n_embd as u64).ok_or_else(|| e("the embedding's row size"))? as usize;
         let n = tokens.len() * row;
-        // the rows into the GPU's next pinned slot (once the work that read it last is done), read there in place
+        // the rows into the GPU's next pinned slot, read there in place
+        let (src, slot) = self.upload_with(n, &mut |raw| {
+            for (i, t) in tokens.iter().enumerate() {
+                if *t as usize >= vocab {
+                    return Err(e(format!("token {t} past the vocabulary ({vocab})")));
+                }
+                file.read_into(embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
+            }
+            Ok(())
+        })?;
+        let x = self.arena().f32(tokens.len() * g.n_embd)?;
+        // SAFETY: the rows' blocks (pinned host memory, read over PCIe) -> float32.
+        self.op("dequant", String::new, n + 4 * tokens.len() * g.n_embd, 0,
+                || unsafe { (self.k.dequant_f32)(self.raw(), embd.ty.code() as i32, src.ptr(), (tokens.len() * g.n_embd) as i64, x.fp()) })?;
+        self.release(slot)?;
+        Ok(x)
+    }
+
+    /// n bytes `fill` writes into the current GPU's next pinned slot (once the work that read it last is done): a view
+    /// kernels read in place, and the slot - `release` it once the work that reads it is queued. An upload never waits
+    /// for the GPU's queue (the host queues the next chunk while the GPUs are on this one)
+    fn upload_with(&self, n: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<(DevBuf, usize)> {
         let d = self.dev();
         let mut up = d.uploads.lock().unwrap();
         let i = up.next;
@@ -1076,25 +1107,37 @@ impl<'g> Qwen35<'g> {
             d.gpu.wait_ticket(t)?;
         }
         if slot.0.as_ref().is_none_or(|b| b.len < n) {
-            slot.0 = Some(HostBuf::new(&d.gpu, n.next_power_of_two())?);
+            slot.0 = Some(HostBuf::new(&d.gpu, n.max(1).next_power_of_two())?);
         }
         let hb = slot.0.as_mut().unwrap();
-        {
-            let raw = hb.as_mut_slice();
-            for (i, t) in tokens.iter().enumerate() {
-                if *t as usize >= vocab {
-                    return Err(e(format!("token {t} past the vocabulary ({vocab})")));
-                }
-                file.read_into(embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
+        fill(&mut hb.as_mut_slice()[..n])?;
+        Ok((hb.device_view(0, n.max(1))?, i))
+    }
+
+    /// The current GPU's upload slot free again once the work queued so far is done
+    fn release(&self, slot: usize) -> Result<()> {
+        let d = self.dev();
+        let t = d.gpu.ticket()?;
+        d.uploads.lock().unwrap().slots[slot].1 = t;
+        Ok(())
+    }
+
+    /// A pass's positions for the current GPU: a picture's rows put in a pinned slot once (not written by each
+    /// attention layer), with the slot to release after the work that reads them
+    fn rope_here(&self, rope: &Rope) -> Result<(Rope, Option<usize>)> {
+        match rope {
+            Rope::Rows(p) => {
+                let (b, slot) = self.upload_with(p.len() * 4, &mut |raw| {
+                    for (i, v) in p.iter().enumerate() {
+                        raw[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    Ok(())
+                })?;
+                Ok((Rope::Mapped(b), Some(slot)))
             }
+            Rope::From(f) => Ok((Rope::From(*f), None)),
+            Rope::Mapped(b) => Ok((Rope::Mapped(b.view(0, b.len)?), None)),
         }
-        let src = hb.device_view(0, n)?;
-        let x = self.arena().f32(tokens.len() * g.n_embd)?;
-        // SAFETY: the rows' blocks (pinned host memory, read over PCIe) -> float32.
-        self.op("dequant", String::new, n + 4 * tokens.len() * g.n_embd, 0,
-                || unsafe { (self.k.dequant_f32)(self.raw(), embd.ty.code() as i32, src.ptr(), (tokens.len() * g.n_embd) as i64, x.fp()) })?;
-        slot.1 = d.gpu.ticket()?;
-        Ok(x)
     }
 
     /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]
@@ -1121,11 +1164,12 @@ impl<'g> Qwen35<'g> {
                 b.write(0, &p.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 Some(b)
             }
+            Rope::Mapped(b) => Some(b.view(0, b.len)?),
             Rope::From(_) => None,
         };
         let from = match rope {
             Rope::From(f) => *f,
-            Rope::Rows(_) => 0,
+            _ => 0,
         };
         // SAFETY: the rows and caches as named in q35.h.
         unsafe {
@@ -1375,15 +1419,17 @@ impl<'g> Qwen35<'g> {
     /// one chunk k-2 used). Each layer's state for chunk k+1 needs only its own after chunk k: the same sums as one
     /// pass a chunk. None: not this prompt's (one GPU, the head first, pictures) - `feed_until` reads it a pass a chunk
     fn feed_pipelined(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<Option<(usize, Vec<f32>)>> {
-        if self.devs.len() != 2 || self.head != 1 || self.pipe.len() != 2 || tokens.len() <= self.chunk || tokens.iter().any(|t| t & PICTURE != 0) {
+        if self.devs.len() != 2 || self.head != 1 || self.pipe.len() != 2 || tokens.len() <= self.chunk {
             return Ok(None);
         }
         let _w = self.work.lock().unwrap();
         self.snaps.lock().unwrap().of = None;
         let split = self.devs[1].lb;
         let ne = self.g.n_embd;
-        // (chunk, its p0, its rows on the last GPU) waiting for the last GPU's part
-        let mut pending: Option<(&[u32], usize, DevBuf)> = None;
+        // (chunk, its p0, its rows on the last GPU, its positions, the shift after it) waiting for the last GPU's part
+        let mut pending: Option<(&[u32], usize, DevBuf, Rope, i64)> = None;
+        // the rotary shift before the next chunk (pictures move it)
+        let mut shift = s.shift;
         let mut queued = 0;
         let mut logits = Vec::new();
         // the next chunk's first position (the session's moves on as the last GPU's parts are queued)
@@ -1401,8 +1447,13 @@ impl<'g> Qwen35<'g> {
             self.on(0);
             self.phase("embed");
             let x = self.embed_with(self.file, &self.embd, self.g.vocab, c)?;
-            let rope = Rope::From(p0 as i64 - s.shift);
-            let x = self.stage(s, 0..split, x, t, p0, &rope, k > 0, &mut *tap)?;
+            let (rope, shift_after) = self.rope_of(c, p0, shift)?;
+            shift = shift_after;
+            let (here, slot) = self.rope_here(&rope)?;
+            let x = self.stage(s, 0..split, x, t, p0, &here, k > 0, &mut *tap)?;
+            if let Some(sl) = slot {
+                self.release(sl)?;
+            }
             self.phase("GPU to GPU");
             let xb = self.pipe[k % 2].view(0, t * ne * 4)?;
             {
@@ -1417,14 +1468,14 @@ impl<'g> Qwen35<'g> {
             }
             queued += t;
             // the last GPU's part of chunk k-1
-            if let Some((pc, pp0, px)) = pending.take() {
-                self.last_part(s, pc, pp0, px, 0, k > 1, &mut *tap)?;
+            if let Some((pc, pp0, px, pr, ps)) = pending.take() {
+                self.last_part(s, pc, pp0, px, &pr, ps, 0, k > 1, &mut *tap)?;
             }
-            pending = Some((c, p0, xb));
+            pending = Some((c, p0, xb, rope, shift_after));
         }
-        if let Some((pc, pp0, px)) = pending.take() {
+        if let Some((pc, pp0, px, pr, ps)) = pending.take() {
             let all = queued == tokens.len();
-            logits = self.last_part(s, pc, pp0, px, if all { 1 } else { 0 }, true, &mut *tap)?.pop().unwrap_or_default();
+            logits = self.last_part(s, pc, pp0, px, &pr, ps, if all { 1 } else { 0 }, true, &mut *tap)?.pop().unwrap_or_default();
         }
         Ok(Some((queued, logits)))
     }
@@ -1452,16 +1503,22 @@ impl<'g> Qwen35<'g> {
     /// The last GPU's part of a pipelined chunk (rows x there, at p0 = the session's position): its layers, the
     /// session past them, the pass's end
     #[allow(clippy::too_many_arguments)]
-    fn last_part(&self, s: &mut Session, tokens: &[u32], p0: usize, x: DevBuf, n_out: usize, graph: bool, tap: Tap) -> Result<Vec<Vec<f32>>> {
+    fn last_part(&self, s: &mut Session, tokens: &[u32], p0: usize, x: DevBuf, rope: &Rope, shift_after: i64, n_out: usize, graph: bool,
+                 tap: Tap) -> Result<Vec<Vec<f32>>> {
         let t = tokens.len();
         debug_assert_eq!(p0, s.pos);
         self.devs[1].arena.reset();
         self.on(1);
-        let rope = Rope::From(p0 as i64 - s.shift);
-        let x = self.stage(s, self.devs[1].lb..self.g.layers, x, t, p0, &rope, graph, &mut *tap)?;
+        let (here, slot) = self.rope_here(rope)?;
+        let x = self.stage(s, self.devs[1].lb..self.g.layers, x, t, p0, &here, graph, &mut *tap)?;
         s.pos += t;
+        s.shift = shift_after;
         s.last_rows = t;
-        self.finish(s, x, tokens, p0, &rope, n_out, tap)
+        let out = self.finish(s, x, tokens, p0, &here, n_out, tap)?;
+        if let Some(sl) = slot {
+            self.release(sl)?;
+        }
+        Ok(out)
     }
 
     /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
