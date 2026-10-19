@@ -11,7 +11,7 @@ We stand on the shoulders of giants.
 - **Made for the cards people have** - two 12 GB cards (an RTX 5070 and an RTX 3060) run chat, pictures, OCR, speech,
   songs, video with sound and 3D: Qwen3.8-27B reads prompts at ~1,200 tok/s over both cards (llama.cpp: 925),
   MiniMax H3 makes video with sound across both, Nemotron 3.5 Super (120B) chats on one, its experts streamed
-- **Every kind behind one door** - 20 models served here, 12 more a click away (`Not downloaded` on the page), each
+- **Every kind behind one door** - 21 models served here, 7 more a click away (`Not downloaded` on the page), each
   started on the card with room when a request names it and let go when idle
 - **A single API control plane** - one service, `nextcuda.service`, answers on :8000 and starts a model server when a
   request names its model
@@ -194,14 +194,16 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
 
 ## Supported models
 
-32 model cards in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256);
+33 model cards in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256);
 `nextcuda models pull <id> [--from DIR]` downloads what is missing or hard-links a file already on the machine,
 checks it and registers the model. **Served** - running on this box today; **download** - its card is here and it
-runs once pulled; **too big** - more than these 12 GB cards hold (bigger cards).
+runs once pulled; **too big** - more than these 12 GB cards hold: the page shows it "won't run here" (why, in GiB)
+with its Download off (`system.models.pull` still fetches it, for bigger cards).
 
 | kind | id | model | on disk | here |
 |---|---|---|---|---|
 | chat | `qwen3.8-27b-gsq-iq3s` | Qwen3.8-27B, ISTA-DASLab's GSQ-RCO IQ3_S with its MTP head and the BF16 vision projector: text and pictures, thinking switch, 80K context (192K with q4_0) | 12.2 GiB | served, both cards whole |
+| chat | `qwen3.8-27b-gsq-iq3s-long` | the same files, fast / long: the cache q4_0 rotated, 160K of context (a speech model still fits beside it) | (the above's) | served |
 | chat | `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | 43.0 GiB | served (one card, experts streamed; off by default) |
 | image | `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0 with Qwen3-VL 8B: text to image, RGBA, edits from up to 8 pictures | 13.6 GiB | served |
 | image | `qwen-image-2.1-rrq4` | Qwen-Image 2.1, [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs) | 5.5 GiB | served |
@@ -231,7 +233,7 @@ runs once pulled; **too big** - more than these 12 GB cards hold (bigger cards).
 | 3D | `rignet` | RigNet: a skeleton and skin weights for a character mesh (GPLv3) | 0.2 GiB | served |
 | 3D | `animateanymesh` | AnimateAnyMesh: text-driven mesh animation, 16 frames as morph targets (Apache-2.0) | 0.9 GiB | served |
 | 3D | `trellis2` | TRELLIS.2 4B Q8_0, the 1024 cascade | 8.8 GiB | download |
-| 3D | `pixal3d` | Pixal3D Q8_0: pixel-aligned TRELLIS.2, the 1024 cascade (MIT) | 8.9 GiB | too big |
+| 3D | `pixal3d` | Pixal3D Q8_0: pixel-aligned TRELLIS.2, the 1024 cascade (MIT) | 8.9 GiB | download |
 | 3D | `hunyuan3d-2.1` | Hunyuan3D 2.1: a detailed mesh with PBR textures | 15.5 GiB | too big |
 
 Each model's guide (how to ask it, what it takes, what it answers) is in `model-cards/guides/`.
@@ -378,9 +380,8 @@ nextcuda audio check <reference dump dir> --model breeze-tts-2        # referenc
 | 3D | TRELLIS.2, Hunyuan3D-2mini, UniRig, RigNet, AnimateAnyMesh | one card each |
 
 Not here yet: `audio.transcribe` (Whisper - the platform's music and audio makers still listen locally), ACE-Step,
-VibeVoice, HunyuanImage 2.1, the video upscalers; the bigger cards' forms above. Known rough edges: the video
-studio's page still titles itself "nextsycl video" and shows its GPU line as NaN; `system.version` answers nextsycl's
-driver name (the platform reads it).
+VibeVoice, HunyuanImage 2.1, the video upscalers; the bigger cards' forms above. The answers' `nextsycl` result key keeps
+its name (the platform reads it).
 
 ## Clocking it
 
