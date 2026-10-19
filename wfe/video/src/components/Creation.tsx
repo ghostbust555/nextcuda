@@ -1,10 +1,11 @@
 /** Everything to do with making a new clip. Deliberately separate from Jobs. */
 import { jsx } from "../jsx.js";
 import { rpc } from "../api.js";
-import { render, state } from "../state.js";
+import { refresh, render, state } from "../state.js";
 import { navigate } from "../router.js";
-import type { Engine, GenerateRequest } from "../types.js";
-import { CanvasPicker } from "./CanvasPicker.js";
+import type { Canvas, Engine, GenerateRequest } from "../types.js";
+import { CanvasPicker, estimate } from "./CanvasPicker.js";
+import { ClipProgress } from "./Progress.js";
 import { Panel } from "./Panel.js";
 
 interface Form {
@@ -96,6 +97,7 @@ export function useSettings(j: GenerateRequest): void {
 }
 
 async function generate(queue: boolean): Promise<void> {
+  form.engine = readyEngine();
   const body: GenerateRequest = {
     prompt: form.prompt,
     seconds: form.seconds,
@@ -127,13 +129,39 @@ async function generate(queue: boolean): Promise<void> {
   }
   if (form.controlVideo || form.controlMask) body.control_strength = form.controlStrength;
   if (form.chain) body.first_frame = "prev";
+  submitted = "sending…";
+  render();
   try {
-    await rpc("generate", body);
+    const r = await rpc("generate", body);
+    submitted = r.queued ? `queued at position ${r.position ?? "?"}` : "started";
     state.error = null;
   } catch (e) {
+    submitted = "";
     state.error = String(e);
   }
-  render();
+  await refresh();
+}
+
+/** What the last Generate did ("started", "queued at position 2"): the click answered on the page itself */
+let submitted = "";
+
+/** The denoiser the form names, if this box has it; else the plan's default, else the first it has (the form starts
+ *  on INT8, and a box with only Q4_K_M sent INT8 jobs the engine could not run) */
+function readyEngine(): Engine {
+  const ready = (state.plan?.engines ?? []).filter((e) => e.ready).map((e) => e.quant);
+  if (!ready.length || ready.includes(form.engine)) return form.engine;
+  const d = state.plan?.defaults.engine;
+  return (d && ready.includes(d) ? d : ready[0]!) as Engine;
+}
+
+/** The canvas table's estimate for the form as it stands: null when the plan has not loaded */
+function fitNow() {
+  const plan = state.plan;
+  const want = readyEngine();
+  const e = plan?.engines.find((x) => x.ready && x.quant === want);
+  if (!plan || !e) return null;
+  const canvas = { width: form.width, height: form.height } as Canvas;
+  return { est: estimate(plan, canvas, e, form.seconds, form.steps), cap: plan.cap_gib, margin: plan.margin_gib };
 }
 
 const num = (
@@ -397,7 +425,7 @@ export function Creation() {
         <CanvasPicker
           width={form.width}
           height={form.height}
-          engine={form.engine}
+          engine={readyEngine()}
           seconds={form.seconds}
           steps={form.steps}
           onPick={(w, h, e, sec) => {
@@ -409,15 +437,25 @@ export function Creation() {
           }}
         />
       </Panel>
+      {(() => {
+        const f = fitNow();
+        return f && !f.est.fits
+          ? <div class="err">
+              {`${form.width}x${form.height} for ${form.seconds} s needs ~${f.est.gib} GiB (+${f.margin} margin) of the ${f.cap} GiB this card gives the engine: it will fail out of memory. Pick a green cell (a smaller canvas or a shorter clip).`}
+            </div>
+          : null;
+      })()}
       <div class="row">
         <button type="button" on={{ click: () => void generate(false) }}>
           <span class="i" props={{ innerHTML: "&#xf0d0;" }} />Generate
         </button>
-        <button type="button" class="tbtn" on={{ click: () => void generate(true) }}>
+        <button type="button" class="secondary" on={{ click: () => void generate(true) }}>
           <span class="i" props={{ innerHTML: "&#xf03a;" }} />Queue
         </button>
+        {submitted ? <span class="hint">{submitted}</span> : null}
       </div>
       {state.error ? <pre class="err">{state.error}</pre> : null}
+      <ClipProgress />
     </div>
   );
 }

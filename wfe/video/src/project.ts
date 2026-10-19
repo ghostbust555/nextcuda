@@ -6,7 +6,7 @@ import { here } from "./util.js";
  *  the router calls these.
  */
 import { api, rpc } from "./api.js";
-import { render, state } from "./state.js";
+import { refresh, render, state } from "./state.js";
 
 export async function loadTimeline(project?: string): Promise<void> {
   const p = project ?? state.timelineProject;
@@ -86,8 +86,7 @@ export function scrollToClip(n: number): void {
 }
 
 export async function refreshStatus(): Promise<void> {
-  state.status = await api.status();
-  render();
+  await refresh();
 }
 
 export async function holdProject(project: string, on: boolean): Promise<void> {

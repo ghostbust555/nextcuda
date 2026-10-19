@@ -73,6 +73,18 @@ export function render(): void {
   listener?.();
 }
 
+let refresher: (() => Promise<void>) | null = null;
+
+export function onRefresh(fn: () => Promise<void>): void {
+  refresher = fn;
+}
+
+/** Fetch the status now rather than at the next poll (up to 8 s away when idle): every action that changes the
+ *  queue or the running clip calls it, so what was clicked shows at once. */
+export function refresh(): Promise<void> {
+  return refresher ? refresher() : Promise.resolve();
+}
+
 /* -- persistence ----------------------------------------------------------------------
  * Every read and write is wrapped: a private window throws on localStorage access, and
  * the page has to work there too. */
