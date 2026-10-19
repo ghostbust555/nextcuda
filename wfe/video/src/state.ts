@@ -89,7 +89,7 @@ export function refresh(): Promise<void> {
  * Every read and write is wrapped: a private window throws on localStorage access, and
  * the page has to work there too. */
 
-function load<T>(key: string, fallback: T): T {
+export function load<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as T) : fallback;
@@ -98,7 +98,7 @@ function load<T>(key: string, fallback: T): T {
   }
 }
 
-function save(key: string, value: unknown): void {
+export function save(key: string, value: unknown): void {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {

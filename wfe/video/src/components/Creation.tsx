@@ -1,7 +1,7 @@
 /** Everything to do with making a new clip. Deliberately separate from Jobs. */
 import { jsx } from "../jsx.js";
 import { rpc } from "../api.js";
-import { refresh, render, state } from "../state.js";
+import { load, refresh, render, save, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { Canvas, Engine, GenerateRequest } from "../types.js";
 import { CanvasPicker, estimate } from "./CanvasPicker.js";
@@ -68,6 +68,23 @@ export const form: Form = {
   controlStrength: 1,
 };
 
+/** The settings a reload keeps (canvas, length, steps, engine, ...): the last ones used, in localStorage. References and
+ *  controls are left out - they name uploads that may be gone. */
+const KEPT = ["prompt", "seconds", "steps", "seed", "te", "width", "height", "engine", "upscale", "upscaler", "sampler",
+              "schedule"] as const;
+
+function remember(): void {
+  save("h3form", Object.fromEntries(KEPT.map((k) => [k, form[k]])));
+}
+
+{
+  const saved = load<Record<string, unknown>>("h3form", {});
+  const f = form as unknown as Record<string, unknown>;
+  // only a value of the default's type: a stale or hand-edited entry cannot break the form
+  for (const k of KEPT) if (saved && typeof saved[k] === typeof f[k]) f[k] = saved[k];
+  if (form.engine === ("Q8_0" as Engine)) form.engine = "INT8";
+}
+
 /** Fill the form from an existing job - the "use these settings" path. */
 export function useSettings(j: GenerateRequest): void {
   if (j.prompt && j.prompt !== "(recovered)") form.prompt = j.prompt;
@@ -93,6 +110,7 @@ export function useSettings(j: GenerateRequest): void {
   form.controlStrength = j.control_strength ?? 1;
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
+  remember();
   navigate({ tab: "create" });
 }
 
@@ -100,6 +118,7 @@ export function useSettings(j: GenerateRequest): void {
  *  GPU refused the request, which was all a separate Queue button had added) */
 async function generate(): Promise<void> {
   form.engine = readyEngine();
+  remember();
   const body: GenerateRequest = {
     prompt: form.prompt,
     seconds: form.seconds,
@@ -174,7 +193,7 @@ const num = (
     {label}
     <input
       attrs={{ type: "number", min, max, step, value: String(form[key]) }}
-      on={{ input: (e: Event) => { form[key] = Number((e.target as HTMLInputElement).value); render(); } }}
+      on={{ input: (e: Event) => { form[key] = Number((e.target as HTMLInputElement).value); remember(); render(); } }}
     />
   </label>
 );
@@ -190,6 +209,7 @@ function EffectPicker() {
       <select on={{ change: (e: Event) => {
         const el = e.target as HTMLSelectElement;
         if (el.value) form.prompt = `${form.prompt}${form.prompt.endsWith(" ") ? "" : " "}embedding:minimaxh3_${el.value} `;
+        remember();
         el.value = "";
         render();
       } }}>
@@ -342,7 +362,7 @@ function ControlNet() {
 const named = (label: string, key: "sampler" | "schedule", names: string[] | undefined, dflt: string, title: string) => (
   <label attrs={{ title }}>
     {label}
-    <select on={{ change: (e: Event) => { form[key] = (e.target as HTMLSelectElement).value; render(); } }}>
+    <select on={{ change: (e: Event) => { form[key] = (e.target as HTMLSelectElement).value; remember(); render(); } }}>
       <option attrs={{ value: "", selected: form[key] === "" }}>{dflt}</option>
       {(names ?? []).map((n) => <option attrs={{ value: n, selected: form[key] === n }}>{n}</option>)}
     </select>
@@ -355,7 +375,7 @@ export function Creation() {
       <textarea
         attrs={{ spellcheck: false }}
         props={{ value: form.prompt }}
-        on={{ input: (e: Event) => { form.prompt = (e.target as HTMLTextAreaElement).value; } }}
+        on={{ input: (e: Event) => { form.prompt = (e.target as HTMLTextAreaElement).value; remember(); } }}
       />
       <div class="hint">
         Dialogue: <code>{"(S1) says: <d>[English] line</d>"}</code> · no negations (cfg is 1.0,
@@ -368,7 +388,7 @@ export function Creation() {
         {num("upscale", "upscale", 1, 4, 0.5)}
         <label attrs={{ title: "ESRGAN: decoded at the sampled size, the frames enlarged by a network on the GPU - about half the decode stage's time (a 5 s clip at 1152x864 on a B65: 19.6 s against 41.9). latent: the latents enlarged, then decoded at the larger size - the decoder's own fine texture." }}>
           upscaler
-          <select on={{ change: (e: Event) => { form.upscaler = (e.target as HTMLSelectElement).value; render(); } }}>
+          <select on={{ change: (e: Event) => { form.upscaler = (e.target as HTMLSelectElement).value; remember(); render(); } }}>
             <option attrs={{ value: "esrgan-general", selected: form.upscaler === "esrgan-general" }}>ESRGAN general-x4v3 (default)</option>
             <option attrs={{ value: "esrgan-anime", selected: form.upscaler === "esrgan-anime" }}>ESRGAN animevideov3 (sharper, drawn look)</option>
             <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (slowest, most natural texture)</option>
@@ -381,7 +401,7 @@ export function Creation() {
           "The sigma schedule. shifted is the model's own; karras and exponential suit noise-prediction models and do poorly here.")}
         <label>
           encoder
-          <select on={{ change: (e: Event) => { form.te = (e.target as HTMLSelectElement).value as "teacher" | "student"; render(); } }}>
+          <select on={{ change: (e: Event) => { form.te = (e.target as HTMLSelectElement).value as "teacher" | "student"; remember(); render(); } }}>
             <option attrs={{ value: "teacher", selected: form.te === "teacher" }}>teacher 32B</option>
             <option attrs={{ value: "student", selected: form.te === "student" }}>student 4B</option>
           </select>
@@ -435,6 +455,7 @@ export function Creation() {
             form.height = h;
             form.engine = e as Engine;
             form.seconds = sec;
+            remember();
             render();
           }}
         />
