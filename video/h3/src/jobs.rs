@@ -1445,7 +1445,8 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
             let _ = write_preview(&preview, dv, shape);
             Ok(())
         }, &mut |i, b| {
-            if b == 0 || b == nblocks / 2 {
+            // every 5 blocks (a tenth of a step): twice a step left a cancel waiting ~10 s on a big clip
+            if b % 5 == 0 {
                 dev.wait()?;
                 if cancel.load(Ordering::Relaxed) {
                     return Err(Error("cancelled".into()));
