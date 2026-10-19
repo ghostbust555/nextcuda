@@ -2,7 +2,7 @@
  *  cell shows what that combination costs (seconds of GPU per second of video) and its peak VRAM; cells that will
  *  not fit are disabled rather than hidden, so the shape of the wall is visible. Two switches above it: the GPU,
  *  and the denoiser (INT8, or a GGUF k-quant that holds less of the card - more cells fit, slower steps). The
- *  numbers are the cells `nextsycl video plan measure` ran on that GPU with that denoiser; unmeasured pairs fall back to
+ *  numbers are the cells `nextcuda video plan measure` ran on that GPU with that denoiser; unmeasured pairs fall back to
  *  the plan's own curve.
  */
 import { jsx } from "../jsx.js";
@@ -47,7 +47,7 @@ export function estimate(
   const tokens = tokensFor(canvas.width, canvas.height, seconds);
   const key = `${engine.quant}|${canvas.width}x${canvas.height}|${Math.round(seconds)}`;
   const hit = gpu ? undefined : plan.measured[key];
-  // a cell measured on this GPU (nextsycl video plan measure) beats the GPU's curve
+  // a cell measured on this GPU (nextcuda video plan measure) beats the GPU's curve
   const cell = gpu?.cells?.[`${canvas.width}x${canvas.height}|${seconds}`];
   if (cell) {
     const gibc = cell.over ? engine.gib + tokens * plan.gib_per_token : cell.gib ?? 0;
@@ -115,7 +115,7 @@ export function CanvasPicker(props: CanvasPickerProps) {
             on={{ click: () => { state.pickGpu = g.gpu; render(); } }}
           >{`${short(g.name)}${g.shared ? " (shared)" : ""}`}</button>
         ))
-        : <span class="hint">not measured yet (nextsycl video plan measure)</span>}
+        : <span class="hint">not measured yet (nextcuda video plan measure)</span>}
       <span class="k"><span class="i dim" props={{ innerHTML: "&#xf1c0;" }} /> denoiser</span>
       {engines.map((e) => (
         <button
@@ -214,7 +214,7 @@ export function CanvasPicker(props: CanvasPickerProps) {
         <span class="best-key">dashed</span>
         {" = best ratio in that row. "}
         {gpu
-          ? `* = measured on the ${short(gpu.name)} (nextsycl video plan measure), everything else from its measured step curve. Sampling only - the text encoder, decode and upscale come on top. `
+          ? `* = measured on the ${short(gpu.name)} (nextcuda video plan measure), everything else from its measured step curve. Sampling only - the text encoder, decode and upscale come on top. `
           : "* = measured, everything else extrapolated from those. "}
         {`Greyed = past the ${plan.cap_gib} GiB cap.`}
       </div>

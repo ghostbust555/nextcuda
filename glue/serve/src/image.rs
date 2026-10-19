@@ -262,7 +262,7 @@ impl ImageServer {
                 http::respond_with(&mut s, if loaded { 200 } else { 503 }, &json!({"status": if loaded { "ok" } else { "loading" }}), &cors)
             }
             ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
-                {"id": self.model, "object": "model", "owned_by": "nextsycl", "created": 0}]}), &cors),
+                {"id": self.model, "object": "model", "owned_by": "nextcuda", "created": 0}]}), &cors),
             ("GET", "/api/info") => http::respond_with(&mut s, 200, &self.info(), &cors),
             ("GET", "/api/progress") => {
                 let mut p = self.progress.lock().unwrap().clone();

@@ -177,7 +177,7 @@ impl AudioServer {
             ("GET", "/api/gpu") => http::respond_with(&mut s, 200, &self.gpu_json(), &cors),
             ("GET", "/health") => http::respond_with(&mut s, 200, &json!({"status": "ok"}), &cors),
             ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
-                {"id": self.model, "object": "model", "owned_by": "nextsycl", "created": 0}]}), &cors),
+                {"id": self.model, "object": "model", "owned_by": "nextcuda", "created": 0}]}), &cors),
             ("GET", "/api/info") => http::respond_with(&mut s, 200, &self.info(), &cors),
             ("GET", "/api/progress") => {
                 let mut p = self.progress.lock().unwrap().clone();

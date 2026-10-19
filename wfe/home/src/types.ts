@@ -83,6 +83,8 @@ export interface Available {
   /** the drive and folder it would go to, whether it has the room, its free bytes */
   drive: string; folder: string; fits: boolean; free: number;
   pull: Pull | null;
+  /** whether this box's cards can run it (its memory against theirs), and why not */
+  runs_here?: boolean; why_not?: string | null;
 }
 
 export interface Pull {

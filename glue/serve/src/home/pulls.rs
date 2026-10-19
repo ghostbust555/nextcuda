@@ -312,8 +312,41 @@ impl Home {
         let bytes: u64 = files.iter().map(|f| f.1).sum();
         let (folder, drive, fits, free) = self.pull_place(&all, bytes).unwrap_or_default();
         let pull = self.pulls.active(id).map(|p| p.view());
+        // a video model loads stage by stage (its text encoder, then the denoiser...): its largest file is what a card holds
+        let held = if card["kind"] == "video" { files.iter().map(|f| f.1).max().unwrap_or(bytes) } else { bytes };
+        let (runs_here, why_not) = self.runs_here(&card, held);
         Some(json!({"id": id, "kind": card["kind"], "title": card["title"], "about": card["about"], "gpus": card["gpus"], "bytes": bytes,
-                    "downloaded": false, "drive": drive, "folder": folder, "fits": fits, "free": free, "pull": pull}))
+                    "downloaded": false, "drive": drive, "folder": folder, "fits": fits, "free": free, "pull": pull,
+                    "runs_here": runs_here, "why_not": why_not}))
+    }
+
+    /// Whether a card's model can run on this box's cards: what it needs on each card (its `vram_gib`, else its files:
+    /// whole on one card, or a split's share on each) against the largest of its cards less a GiB - and why not.
+    /// (Its download stays possible through the API: a bigger card may come; the page's button is off.)
+    fn runs_here(&self, card: &Value, bytes: u64) -> (bool, Option<String>) {
+        let cards = self.cards.lock().unwrap().clone();
+        let total = |g: usize| cards.get(g).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(0);
+        let gpus: Vec<usize> = card["gpus"].as_str().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .or_else(|| card["gpus"].as_u64().map(|g| vec![g as usize])).unwrap_or_else(|| vec![0]);
+        let present: Vec<usize> = gpus.iter().copied().filter(|g| total(*g) > 0).collect();
+        if present.is_empty() {
+            return (true, None); // the cards not known yet: no verdict
+        }
+        let split = card["split"] == true && present.len() > 1;
+        let gib = |mb: u64| mb as f64 / 1024.0;
+        let need_mb = match card["vram_gib"].as_f64() {
+            Some(g) => (g * 1024.0) as u64,
+            None => (bytes >> 20) * 11 / 10 / if split { present.len() as u64 } else { 1 },
+        };
+        let best = present.iter().map(|g| total(*g)).max().unwrap_or(0);
+        let room = if split { present.iter().map(|g| total(*g)).min().unwrap_or(0) } else { best }.saturating_sub(1024);
+        if need_mb <= room {
+            return (true, None);
+        }
+        let name = |g: usize| cards.get(g).and_then(|c| c["name"].as_str()).unwrap_or("its card").replace("NVIDIA GeForce ", "");
+        let on = present.iter().map(|g| name(*g)).collect::<Vec<_>>().join(" + ");
+        (false, Some(format!("needs ~{:.1} GiB {}; {on} {} {:.1} GiB", gib(need_mb), if split { "on each card" } else { "on one card" },
+                             if split { "hold" } else { "holds at most" }, gib(room + 1024))))
     }
 
     /// Every card model not downloaded (system.models, the page's "Not downloaded")

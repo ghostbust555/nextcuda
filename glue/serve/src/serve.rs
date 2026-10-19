@@ -706,7 +706,7 @@ impl Server {
                 respond(&mut s, 200, &json!({"stopping": true, "running": self.inflight.load(Ordering::SeqCst) > 0}))
             }
             ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
-                {"id": self.name, "object": "model", "owned_by": "nextsycl", "created": now(), "status": {"value": "loaded"},
+                {"id": self.name, "object": "model", "owned_by": "nextcuda", "created": now(), "status": {"value": "loaded"},
                  "context": self.max_ctx}]}), &cors),
             ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") | ("POST", "/api/chat") => {
                 let api = if path == "/api/chat" { Api::Lines } else { Api::OpenAi };

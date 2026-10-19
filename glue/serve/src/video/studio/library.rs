@@ -297,7 +297,13 @@ impl Studio {
                 }
                 v
             }
-            None => json!({"error": format!("no telemetry at {}; is a gpustat service running?", self.gpustat.display())}),
+            // no sampler writing the file (nextsycl ran one as a service; nextcuda's front door samples in process):
+            // the first card sampled here, as `nextcuda gpustat` would write it - the page's pill read the error
+            // object as numbers and showed NaN
+            None => match crate::gpustat::find_card() {
+                Some(pci) => crate::gpustat::Card::open(&pci, None).sample(std::time::Duration::from_secs(1)).0,
+                None => json!({"error": format!("no telemetry at {} and no NVIDIA card to sample", self.gpustat.display())}),
+            },
         };
         c.gpu = Some((now(), v.clone()));
         v

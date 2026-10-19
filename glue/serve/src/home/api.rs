@@ -1373,7 +1373,7 @@ impl Home {
             ("GET", "/v1/models") => {
                 let mut data: Vec<Value> = Vec::new();
                 for m in all.iter().filter(|m| m["enabled"] != false && matches!(registry::kind_of(m), "llm" | "image" | "audio")) {
-                    data.push(json!({"id": m["id"], "object": "model", "owned_by": "nextsycl", "created": 0, "kind": registry::kind_of(m), "name": m["title"]}));
+                    data.push(json!({"id": m["id"], "object": "model", "owned_by": "nextcuda", "created": 0, "kind": registry::kind_of(m), "name": m["title"]}));
                 }
                 http::respond(s, 200, &json!({"object": "list", "data": data}));
                 Ok(())

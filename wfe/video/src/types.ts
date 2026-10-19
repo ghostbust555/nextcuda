@@ -188,7 +188,7 @@ export interface MeasuredCell {
   name: string;
 }
 
-/** One GPU's measured step cost (`nextsycl video plan measure`): the 50 blocks at each token count, and the factor a
+/** One GPU's measured step cost (`nextcuda video plan measure`): the 50 blocks at each token count, and the factor a
  *  real clip's step is of them. */
 export interface GpuPlan {
   gpu: number;
@@ -221,7 +221,7 @@ export interface Plan {
   chain_modes: Record<string, string>;
   /** keyed "<engine>|<W>x<H>|<seconds>" - cells this box has actually run */
   measured: Record<string, MeasuredCell | undefined>;
-  /** measured per GPU; empty until `nextsycl video plan measure` has run on the box */
+  /** measured per GPU; empty until `nextcuda video plan measure` has run on the box */
   gpus?: GpuPlan[];
 }
 

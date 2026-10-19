@@ -239,6 +239,7 @@ function AvailableRow(a: Available) {
       <div class="mname">
         <div class="name">{a.title ?? a.id}</div>
         <div class="sub">{a.id} · {size(a.bytes)} · to {a.drive}{a.fits ? "" : <span class="bad"> - not enough room ({size(a.free)} free)</span>}</div>
+        {a.runs_here === false ? <div class="hint bad">won't run here: {a.why_not}</div> : null}
         {going && d
           ? <div>
               <div class="meter" attrs={{ title: `${size(d.bytes_done)} of ${size(d.bytes_total)}` }}>
@@ -251,12 +252,14 @@ function AvailableRow(a: Available) {
           : null}
         {failed ? <div class="hint bad" attrs={{ title: failed.error ?? "" }}>the last download failed: {failed.error}</div> : null}
       </div>
-      <div class="mstate"><span class="tag">{going ? (d?.state ?? "downloading") : "not downloaded"}</span></div>
+      <div class="mstate"><span class="tag">{going ? (d?.state ?? "downloading") : a.runs_here === false ? "won't run here" : "not downloaded"}</span></div>
       <div class="acts">
         {going
           ? <button class="ghost" attrs={{ disabled: !!p, title: "stop it: what was fetched is kept, a download again resumes it" }}
               on={{ click: () => void act("pull_cancel", a.id) }}>{p ? <span class="spin" /> : null}cancel</button>
-          : <button attrs={{ disabled: !!p || !a.fits, title: a.fits ? `download ${size(a.bytes)} into ${a.folder}, check it, and register it (enabled)` : "no models folder has the room (NS_MODEL_DIRS adds folders)" }}
+          : <button attrs={{ disabled: !!p || !a.fits || a.runs_here === false,
+                             title: a.runs_here === false ? `these cards cannot run it (${a.why_not}); system.models.pull still fetches it`
+                               : a.fits ? `download ${size(a.bytes)} into ${a.folder}, check it, and register it (enabled)` : "no models folder has the room (NS_MODEL_DIRS adds folders)" }}
               on={{ click: () => void act("pull", a.id) }}>{p ? <span class="spin" /> : <span class="i" props={{ innerHTML: "&#xf019;" }} />} {failed ? "retry" : "download"}</button>}
       </div>
     </div>

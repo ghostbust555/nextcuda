@@ -216,11 +216,11 @@ impl Switch {
             let models = (self.models)();
             let cur = self.loaded();
             let on = cur.as_deref().and_then(|c| self.served(c, &models));
-            let mut data: Vec<Value> = models.iter().map(|m| json!({"id": m.id, "object": "model", "owned_by": "nextsycl", "name": m.title,
+            let mut data: Vec<Value> = models.iter().map(|m| json!({"id": m.id, "object": "model", "owned_by": "nextcuda", "name": m.title,
                                                                      "loaded": on.as_deref() == Some(m.id.as_str())})).collect();
             // the image server's model, while it answers
             if let Some(v) = self.images.as_ref().and_then(|t| http::call_for(t, "GET", "/v1/models", None, 2).ok()) {
-                data.extend(v["data"].as_array().into_iter().flatten().map(|m| json!({"id": m["id"], "object": "model", "owned_by": "nextsycl",
+                data.extend(v["data"].as_array().into_iter().flatten().map(|m| json!({"id": m["id"], "object": "model", "owned_by": "nextcuda",
                                                                                       "name": m["id"], "loaded": true, "kind": "image"})));
             }
             return http::respond(&mut s, 200, &json!({"object": "list", "data": data}));

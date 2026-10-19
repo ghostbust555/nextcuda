@@ -19,6 +19,8 @@ import { Timeline } from "./Timeline.js";
 function GpuPill() {
   const g = state.gpu;
   if (!g) return <div class="pill"><span class="dot off" /><span>GPU telemetry…</span></div>;
+  // an error answer (no telemetry) has no numbers: say so rather than show NaN
+  if (typeof g.vram_total_mb !== "number") return <div class="pill"><span class="dot off" /><span>GPU telemetry unavailable</span></div>;
   const used = Math.round((g.vram_used_mb / Math.max(g.vram_total_mb, 1)) * 100);
   const p = g.pcie;
   const link = p && p.cur.gen ? `PCIe ${p.cur.gen}.0 x${p.cur.width}` : null;
@@ -62,7 +64,7 @@ export function App() {
   return (
     <div id="app">
       <div class="top">
-        <h1><span class="i" props={{ innerHTML: "&#xf03d;" }} /> nextsycl video — MiniMax H3</h1>
+        <h1><span class="i" props={{ innerHTML: "&#xf03d;" }} /> nextcuda video — MiniMax H3</h1>
         <GpuPill />
       </div>
       <Stats summary={state.summary} />
