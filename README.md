@@ -209,6 +209,7 @@ with its Download off (`system.models.pull` still fetches it, for bigger cards).
 | image | `qwen-image-2.1-rrq4` | Qwen-Image 2.1, [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs) | 5.5 GiB | served |
 | image | `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B and the Lightning 4-step LoRA | 17.7 GiB | served |
 | image | `qwen-image-2.1-q6k` | Qwen-Image 2.1 with a Q6_K transformer | 12.0 GiB | download |
+| image | `ming-image-0.1-design` | Ming-Image-0.1-Design: UI, posters, infographics - text spelled right; over both cards | 16.3 GiB | served |
 | OCR | `unlimited-ocr-q8` | Unlimited-OCR Q8_0: pages to Markdown | 3.7 GiB | served |
 | OCR | `unlimited-ocr-q4` | Unlimited-OCR Q4_K_M | 2.6 GiB | served |
 | OCR | `paddleocr-vl-1.6` | PaddleOCR-VL 1.6: pages, tables, formulas, charts, seals | 1.7 GiB | served |
@@ -380,12 +381,35 @@ openai's greedy decoding rules and long-form 30 s loop, words timed by the align
 - **Speed** (RTX 5070): a 148 s song heard in 1.8 s, 2.5 GB at the peak; the platform's songs listen here now (its
   local word pass took 28.5 s for the same take).
 
+## Designs: Ming-Image-0.1-Design
+
+inclusionAI's design model (`image/mingimage`): Z-Image's 6B single-stream DiT conditioned by Ling-Mini-2.0 (a 16B MoE,
+1.4B active, 256 experts a layer routed on the host) through a 1.5B connector, and an RGBA VAE (Wan 2.1's decoder) -
+inclusionAI's pipeline on the shared kernels and its own (`kernels/image/mingimage`). The DiT and the VAE on the 5070,
+the text encoder on the 3060, every weight resident in its GGUF's type.
+
+- **Checked** (2026-10-19) against inclusionAI's own DiT class and its text side line for line, in float32 on the
+  CPU on the same files (`reference/mingimage/ref.py`): tokens identical; the direct condition 8e-3, the query
+  features 5e-2 (the MoE's routing ties: 3 % of the query tokens' expert picks differ by the last layer); the DiT's
+  velocity 1e-3 (cos 0.999999) at steps 0 and 5; the VAE 2.4e-4; the whole pipeline's picture from the same noise 1.5e-2
+  (cos 0.99989) - the same picture by eye.
+- **Its schedule is the official code's**, not the scheduler config's intent: FlowMatchEuler at a static shift of 6
+  (the pipeline's dynamic-shift switch is set on a frozen config and never reaches the scheduler), 12 steps of which
+  the last runs at sigma 0.
+- **Half's range:** the MLPs' gated products and the last blocks' values reach past 65,504 (infinities from block 12, or
+  28 on some prompts): both are made at 1/256 in half and multiplied back in float32 (the norms' epsilon scaled with
+  them), so the tensor cores keep half.
+- **Speed** (RTX 5070 + 3060): 1024 x 1024 in 17.7 s (1.49 s a step), 2048 x 2048 in 164 s; 9.5 GB / 10.0 GB at
+  1024, 10.9 GB on the 5070 at 2048. Loads in 10 s.
+- **Transparency:** RGBA is decoded, but with these GGUF files the model's alpha comes back opaque (as through
+  ComfyUI on the same files); the official phrase is put before the prompt when RGBA is asked.
+
 ## What runs where
 
 | kind | engines | on the two cards |
 |---|---|---|
 | chat | `qwen35` (Qwen3.8: DeltaNet + attention, MTP drafts, vision), `nemotron_h_moe` | Qwen3.8 over both, pipelined; Nemotron on the 5070 |
-| image, OCR | stable-diffusion.cpp's ggml-cuda (Qwen-Image), our Rust + CUDA engines (Qwen-Image 2.1 `rust`, Unlimited-OCR, PaddleOCR-VL, olmOCR-2) | one card each; olmOCR-2 the decoder on one, the vision tower on the other |
+| image, OCR | stable-diffusion.cpp's ggml-cuda (Qwen-Image), our Rust + CUDA engines (Qwen-Image 2.1 `rust`, Ming-Image, Unlimited-OCR, PaddleOCR-VL, olmOCR-2) | one card each; olmOCR-2 the decoder on one, the vision tower on the other; Ming-Image the DiT on the 5070, its text encoder on the 3060 |
 | speech | `breeze-tts-2`, `qwen3-tts`, `voxcpm2` | one card each; VoxCPM2 int8 fits beside the chat model |
 | songs | `minimax-music3` (int8) | the language model on the 5070, the flow stage and decoder on the 3060 |
 | video | `minimax-h3` (the native daemon, `--span`) and the video studio (scenes, plans, a film's clips joined) | the denoiser over both cards, nothing streamed: a clip in ~62 s from the SSD |
