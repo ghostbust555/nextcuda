@@ -20,12 +20,15 @@ nextcuda audio voice add NAME --sample FILE [--text \"what it says\"] [--descrip
 nextcuda audio voice design NAME --instructions \"the voice\" [--text \"what the sample says\"] [--language L] [--seed N] [--replace]
                    a voice made up from a description (the front door's voice-design model reads a sample)
 nextcuda audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
-nextcuda audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec] [--gpu N]
+nextcuda audio transcribe FILE [--model ID | --dir DIR] [--language L] [--translate] [--no-words] [--prompt TEXT] [--opt-NAME VALUE]...
+                   [--json] [--gpu N]   (speech to text: a recogniser, whisper-large-v3-turbo; any rate, WAV, MP3, FLAC, Ogg, M4A)
+nextcuda audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe] [--gpu N]
 nextcuda audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextcuda_audio::AudioKind> {
-    vec![nextcuda_audio_minimaxmusic3::kind(), nextcuda_audio_breezetts2::kind(), nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind()]
+    vec![nextcuda_audio_minimaxmusic3::kind(), nextcuda_audio_breezetts2::kind(), nextcuda_audio_qwen3tts::kind(), nextcuda_audio_voxcpm2::kind(),
+         nextcuda_audio_whisper::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -37,7 +40,10 @@ fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
 fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
     if let Some(d) = opt(args, "--dir") {
         let dir = Path::new(d);
-        let (arch, files) = if let Ok(f) = nextcuda_audio_breezetts2::files_in(dir) {
+        let whisper = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("\"model_type\": \"whisper\""));
+        let (arch, files) = if whisper {
+            (nextcuda_audio_whisper::ARCH, nextcuda_audio_whisper::files_in(dir).map_err(|e| e.0)?)
+        } else if let Ok(f) = nextcuda_audio_breezetts2::files_in(dir) {
             (nextcuda_audio_breezetts2::ARCH, f)
         } else if dir.join("audiovae.pth").exists() {
             (nextcuda_audio_voxcpm2::ARCH, nextcuda_audio_voxcpm2::files_in(dir).map_err(|e| e.0)?)
@@ -228,6 +234,62 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `nextcuda audio transcribe FILE`: the recording written down by a recogniser in this process (inside the image)
+fn transcribe(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let file = args.first().filter(|p| !p.starts_with("--")).ok_or(USAGE)?.clone();
+    nextcuda_core::use_kind("audio");
+    let mut margs = args.to_vec();
+    let all = models::all(cfg)?;
+    // no model named: the first registered recogniser
+    if opt(args, "--model").is_none() && opt(args, "--dir").is_none() {
+        let m = all.iter().find(|m| m["arch"] == nextcuda_audio_whisper::ARCH).ok_or("no recogniser registered (nextcuda models pull whisper-large-v3-turbo)")?;
+        margs.extend(["--model".to_string(), m["id"].as_str().unwrap_or("").to_string()]);
+    }
+    let (m, files) = model(cfg, &margs)?;
+    let ks = engines();
+    let k = nextcuda_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
+    let gs = gpus(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let e = (k.load)(&files, &gs, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    if e.recogniser().is_none() {
+        return Err(format!("{} makes sound; transcribe needs a recogniser (--model whisper-large-v3-turbo)", m["id"].as_str().unwrap_or("?")));
+    }
+    let b = std::fs::read(&file).map_err(|e| format!("{file}: {e}"))?;
+    let (samples, rate) = nextcuda_audio::decode_audio(&b).map_err(|e| format!("{file}: {e}"))?;
+    let given: nextcuda_core::options::Given = nextcuda_core::options::given(args).into_iter()
+        .filter(|(n, _)| k.options.iter().any(|o| (o.name == n.as_str() || o.env == n.as_str()) && o.at != nextcuda_core::At::Load)).collect();
+    nextcuda_core::options::resolve(&given, k.options, nextcuda_core::At::Request, k.name)?;
+    let req = nextcuda_audio::TranscribeRequest {
+        samples,
+        rate,
+        language: opt(args, "--language").map(str::to_string),
+        translate: args.iter().any(|a| a == "--translate"),
+        words: !args.iter().any(|a| a == "--no-words"),
+        prompt: opt(args, "--prompt").map(str::to_string),
+        extra: nextcuda_core::options::by_name(&given, k.options),
+    };
+    let t0 = std::time::Instant::now();
+    let t = e.transcribe(&req, &mut |s| {
+        eprint!("\r{} {}/{} frames  {:.1} s   ", s.phase, s.at, s.of, s.seconds);
+        Ok(())
+    }).map_err(|e| e.0)?;
+    eprintln!();
+    let took = t0.elapsed().as_secs_f64();
+    if args.iter().any(|a| a == "--json") {
+        let timed = |v: &[nextcuda_audio::Timed]| -> Vec<serde_json::Value> {
+            v.iter().map(|x| serde_json::json!({"start": x.start, "end": x.end, "text": x.text, "probability": x.probability})).collect()
+        };
+        println!("{}", serde_json::json!({"text": t.text, "language": t.language, "duration": t.duration, "took": took,
+                                          "segments": timed(&t.segments), "words": timed(&t.words)}));
+    } else {
+        for s in &t.segments {
+            println!("[{:8.2} - {:8.2}] {}", s.start, s.end, s.text);
+        }
+        eprintln!("{:.1} s of recording ({}) in {took:.1} s, {} segments, {} words", t.duration, t.language, t.segments.len(), t.words.len());
+    }
+    Ok(())
+}
+
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?);
     nextcuda_core::use_kind("audio");
@@ -251,9 +313,13 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,prefill,patches,vae").split(',').collect();
         let e = nextcuda_audio_voxcpm2::VoxCpm2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextcuda_audio_voxcpm2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextcuda_audio_whisper::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("mel,encoder,logits,transcribe").split(',').collect();
+        let e = nextcuda_audio_whisper::Whisper::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextcuda_audio_whisper::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {} and {}", nextcuda_audio_minimaxmusic3::ARCH, nextcuda_audio_breezetts2::ARCH, nextcuda_audio_qwen3tts::ARCH,
-                           nextcuda_audio_voxcpm2::ARCH));
+        return Err(format!("check knows {}, {}, {}, {} and {}", nextcuda_audio_minimaxmusic3::ARCH, nextcuda_audio_breezetts2::ARCH, nextcuda_audio_qwen3tts::ARCH,
+                           nextcuda_audio_voxcpm2::ARCH, nextcuda_audio_whisper::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
@@ -346,7 +412,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_"))
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_")).chain(cfg.with_prefix("NS_WH_"))
         .chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
@@ -457,6 +523,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         }
         Some("selftest") => selftest(rest),
         Some("gen") => gen(cfg, rest),
+        Some("transcribe" | "stt") => transcribe(cfg, rest),
         Some("check") => check(cfg, rest),
         Some("voice" | "voices") => voice(cfg, rest),
         Some("addvoice" | "clonevoice") => voice(cfg, &[&["add".to_string()], rest].concat()),

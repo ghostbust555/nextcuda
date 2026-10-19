@@ -551,6 +551,7 @@ dependencies = [
  "nextcuda-audio-minimaxmusic3",
  "nextcuda-audio-qwen3tts",
  "nextcuda-audio-voxcpm2",
+ "nextcuda-audio-whisper",
  "nextcuda-core",
  "nextcuda-gguf",
  "nextcuda-image",
@@ -627,6 +628,18 @@ dependencies = [
 
 [[package]]
 name = "nextcuda-audio-voxcpm2"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-audio",
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-tok",
+ "serde_json",
+]
+
+[[package]]
+name = "nextcuda-audio-whisper"
 version = "0.0.0"
 dependencies = [
  "nextcuda-audio",
