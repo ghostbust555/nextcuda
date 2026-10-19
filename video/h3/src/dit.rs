@@ -350,6 +350,17 @@ impl Blocks {
         let mut room: Vec<u64> = devs.iter().enumerate()
             .map(|(d, dev)| dev.mem_cap().saturating_sub(dev.mem_used()).saturating_sub(reserve.get(d).copied().unwrap_or(0)).saturating_sub(if kquant.is_some() { widest } else { 0 }))
             .collect();
+        // the cards left the same room beside the blocks (each at least its reserve): filling the first card to its
+        // reserve left the 5070 2 GiB for a clip's buffers (a 10 s pass at 384x288, 8,600 tokens, did not get them)
+        // while the 3060 kept 6
+        let total: u64 = (0..n).map(|j| Self::block_bytes(ck, "blocks", j)).sum();
+        let extra = room.iter().sum::<u64>().saturating_sub(total) / devs.len() as u64;
+        let last = devs.len() - 1;
+        for (di, r) in room.iter_mut().enumerate() {
+            if di < last {
+                *r = r.saturating_sub(extra);
+            }
+        }
         let mut dev_of = Vec::with_capacity(n);
         let mut d = 0;
         for i in 0..n {
