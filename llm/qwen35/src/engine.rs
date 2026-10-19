@@ -137,6 +137,8 @@ struct Linear {
 }
 
 struct Layer {
+    /// the allocation its tensors are in (they are views of it)
+    _slab: Arc<DevBuf>,
     attn_norm: DevBuf,
     post_norm: DevBuf,
     full: Option<Full>,
@@ -387,10 +389,8 @@ pub struct Qwen35<'g> {
     head: usize,
     /// the prompt products by MMQ (NS_Q35_MMQ=0: by the half expansion and cuBLAS)
     mmq: bool,
-    /// the attention caches in q8_0 (NS_Q35_KV=f16: half)
-    kv_q8: bool,
-    /// bytes of a head's row in them
-    kv_row: usize,
+    /// each GPU's attention caches in q8_0 (else half; NS_Q35_KV)
+    kv_q8: Vec<bool>,
     /// over two GPUs: the two buffers on the last that pipelined chunks' rows cross into (`feed_pipelined`)
     pipe: Vec<DevBuf>,
     /// the decode products by ggml-cuda's MMVQ (NS_Q35_MMVQ=nh: the shared kernels)
@@ -427,10 +427,23 @@ fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
         + chunk * g.n_ff.max(g.conv_dim()) * 2 + 8 * g.vocab * 4 + (64 << 20)
 }
 
-/// The attention cache as llama.cpp's cache-type q8_0 (a head's row 256 int8 and 8 half scales: 272 bytes against
-/// 512), unless NS_Q35_KV=f16
-fn kv_q8_setting() -> bool {
-    !std::env::var("NS_Q35_KV").is_ok_and(|v| v == "f16")
+/// The attention cache's type a GPU (NS_Q35_KV): q8 - llama.cpp's cache-type q8_0 (a head's row 256 int8 and 8 half
+/// scales: 272 bytes against 512) on every GPU; f16 - half on every one; auto (the default) - q8_0 on the GPU the plan
+/// fills first (the last: memory is what bounds it), half on the others where it fits (no widening as attention reads
+/// it: the slower card's attention ~18% faster)
+#[derive(Clone, Copy, PartialEq)]
+enum KvMode {
+    Q8,
+    F16,
+    Auto,
+}
+
+fn kv_mode() -> KvMode {
+    match std::env::var("NS_Q35_KV").as_deref() {
+        Ok("q8") => KvMode::Q8,
+        Ok("f16") => KvMode::F16,
+        _ => KvMode::Auto,
+    }
 }
 
 /// Bytes of a key (or value) head's row in the cache
@@ -458,11 +471,13 @@ impl<'g> Qwen35<'g> {
         // the context's own)
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
         let weights: u64 = f.tensors.iter().filter(|t| t.name != "token_embd.weight" && !t.name.starts_with(&format!("blk.{}.", g.layers))).map(|t| t.bytes).sum();
-        let layer_w: Vec<u64> = (0..g.layers).map(|l| {
+        // a layer's weights as they are on the GPU: one allocation a layer (its tensors in it, `vec_mat`'s slab), the
+        // float tensors as float32
+        let layer_w: Vec<u64> = (0..g.layers).map(|l| layer_slab_bytes(f, l) as u64).collect();
+        let head_w = weights - (0..g.layers).map(|l| {
             let p = format!("blk.{l}.");
-            f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum()
-        }).collect();
-        let head_w = weights - layer_w.iter().sum::<u64>();
+            f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum::<u64>()
+        }).sum::<u64>();
         // the half buffer a prompt chunk expands a matrix into: with MMQ only the matrices it does not take (the file's
         // IQ1_M, the float32 ones), so each GPU's is its own layers' largest such (without MMQ: the largest matrix)
         let mmq_on = !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0");
@@ -518,7 +533,7 @@ impl<'g> Qwen35<'g> {
         // there; decode reads the head and the draft block from the slower card)
         let head_first = gpus.len() > 1 && std::env::var("NS_Q35_HEAD").is_ok_and(|v| v == "first");
         let head_i = if head_first { 0 } else { gpus.len() - 1 };
-        let (chunk, bounds) = if gpus.len() == 1 {
+        let (chunk, bounds, kv_q8s) = if gpus.len() == 1 {
             let fixed = weights + mtp_bytes + vision_bytes + w16_bytes as u64 + margin;
             let chunk = chunk_setting().unwrap_or_else(|| {
                 [2048, 1024].into_iter().find(|c| fixed + arena_bytes(&g, *c) as u64 + SESSION_ROOM <= free[0]).unwrap_or(512)
@@ -528,20 +543,33 @@ impl<'g> Qwen35<'g> {
                 return Err(e(format!("{} needs about {:.1} GiB on {} ({:.1} GiB of weights); {:.1} GiB are free", f.architecture(), gib(need),
                                      gpus[0].name, gib(weights), gib(free[0]))));
             }
-            (chunk, vec![(0, g.layers)])
+            // (one GPU: q8_0 unless half is asked for)
+            (chunk, vec![(0, g.layers)], vec![kv_mode() != KvMode::F16])
         } else {
             // a layer's cost where it lands: its weights, its cache for the planned context (full attention) or its
             // state and verify snapshots (DeltaNet)
             let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
             let mtp_on = has_mtp;
-            let row = kv_row_bytes(&g, kv_q8_setting());
+            let mode = kv_mode();
             // (a layer with a matrix MMQ does not take: its GPU's half buffer as large as it)
-            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + layer_x16[l] as u64 + if g.full(l) { (2 * g.heads_kv * ctx * row) as u64 } else {
-                (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
-            }).collect();
+            let cost_of = |q8: bool| -> Vec<u64> {
+                let row = kv_row_bytes(&g, q8);
+                (0..g.layers).map(|l| layer_w[l] + layer_x16[l] as u64 + if g.full(l) { (2 * g.heads_kv * ctx * row) as u64 } else {
+                    (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
+                }).collect()
+            };
+            let (cost8, cost16) = (cost_of(true), cost_of(false));
+            // the cache a GPU starts with in the plan: q8 on the last (filled first) unless f16 is asked for, half on
+            // the others unless q8 is
+            let first_q8 = |i: usize, n: usize| match mode {
+                KvMode::Q8 => true,
+                KvMode::F16 => false,
+                KvMode::Auto => i + 1 == n,
+            };
             let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-            let plan = |c: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
+            let plan = |c: usize| -> std::result::Result<(Vec<(usize, usize)>, Vec<bool>, Vec<(i64, u64)>), String> {
                 let n = gpus.len();
+                let mut q8s: Vec<bool> = (0..n).map(|i| first_q8(i, n)).collect();
                 // what each GPU has for layers: its free memory less the spare, its half buffer and work memory; the
                 // last's less the head and the draft block (its weights, its cache)
                 let room: Vec<i64> = (0..n).map(|i| {
@@ -551,7 +579,12 @@ impl<'g> Qwen35<'g> {
                         over += vision_bytes;
                     }
                     if i == head_i {
-                        over += head_w + tail_x16 as u64 + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * row) as u64 } else { 0 };
+                        // (the draft block's cache the type its GPU starts with; one that ends q8 needs less)
+                        over += head_w + tail_x16 as u64 + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * kv_row_bytes(&g, first_q8(i, n))) as u64 } else { 0 };
+                    }
+                    if n == 2 && head_i == 1 && i == 1 {
+                        // the two buffers a pipelined prompt's rows cross into (`pipe`)
+                        over += (2 * c * g.n_embd * 4) as u64;
                     }
                     free[i] as i64 - over as i64
                 }).collect();
@@ -575,6 +608,7 @@ impl<'g> Qwen35<'g> {
                         if i == 0 {
                             lb = 0;
                         } else {
+                            let cost = if q8s[i] { &cost8 } else { &cost16 };
                             let mut have = room[i];
                             while lb > 0 && cost[lb - 1] as i64 <= have {
                                 have -= cost[lb - 1] as i64;
@@ -587,8 +621,14 @@ impl<'g> Qwen35<'g> {
                     rev.reverse();
                     bounds = rev;
                 }
+                let mut seen = Vec::with_capacity(n);
                 for (i, &(lb, le)) in bounds.iter().enumerate() {
-                    let need: u64 = cost[lb..le].iter().sum();
+                    // a half cache that does not fit: q8_0 there (auto)
+                    if !q8s[i] && mode == KvMode::Auto && cost16[lb..le].iter().sum::<u64>() as i64 > room[i] {
+                        q8s[i] = true;
+                    }
+                    let need: u64 = if q8s[i] { &cost8 } else { &cost16 }[lb..le].iter().sum();
+                    seen.push((room[i], need));
                     if le <= lb {
                         // a GPU before the last with no layers left for it is dropped (`load`)
                         if i + 1 < n && split_env.is_none() {
@@ -601,7 +641,7 @@ impl<'g> Qwen35<'g> {
                                            gib(room[i].max(0) as u64)));
                     }
                 }
-                Ok(bounds)
+                Ok((bounds, q8s, seen))
             };
             let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
             let mut last_err = String::new();
@@ -609,22 +649,31 @@ impl<'g> Qwen35<'g> {
             // first) the most layers - the work goes to the faster card, the slower one takes what is left; a larger
             // chunk on a tie (measured, the 5070 + 3060 at 80K: 2,048 rows 35 layers there 707 tok/s, 512 rows 40
             // layers 732)
-            let mut found: Option<(usize, Vec<(usize, usize)>)> = None;
+            let mut found: Option<(usize, Vec<(usize, usize)>, Vec<bool>, Vec<(i64, u64)>)> = None;
             for c in tries {
                 match plan(c) {
-                    Ok(b) => {
+                    Ok((b, q, seen)) => {
                         let last_layers = |b: &[(usize, usize)]| b.last().map_or(0, |x| x.1 - x.0);
-                        if found.as_ref().is_none_or(|(_, fb)| last_layers(&b) > last_layers(fb)) {
-                            found = Some((c, b));
+                        if found.as_ref().is_none_or(|(_, fb, _, _)| last_layers(&b) > last_layers(fb)) {
+                            found = Some((c, b, q, seen));
                         }
                     }
                     Err(x) => last_err = x,
                 }
             }
-            found.ok_or_else(|| e(format!("{} over {} GPUs at a {ctx}-token context: {last_err}", f.architecture(), gpus.len())))?
+            let (c, b, q, seen) = found.ok_or_else(|| e(format!("{} over {} GPUs at a {ctx}-token context: {last_err}", f.architecture(), gpus.len())))?;
+            if std::env::var("NS_Q35_PLAN_LOG").is_ok_and(|v| v == "1") {
+                for (i, (room, need)) in seen.iter().enumerate() {
+                    log(format!("qwen35 plan: {} room {:.0} MiB for layers, they need {:.0} (chunk {c})", gpus[i].name, *room as f64 / 1048576.0, *need as f64 / 1048576.0));
+                }
+            }
+            (c, b, q)
         };
         let given = gpus.len();
-        let (gpus, bounds): (Vec<Arc<Gpu>>, Vec<(usize, usize)>) = gpus.iter().cloned().zip(bounds).filter(|(_, b)| b.1 > b.0).unzip();
+        let kept: Vec<(Arc<Gpu>, (usize, usize), bool)> = gpus.iter().cloned().zip(bounds).zip(kv_q8s).map(|((g, b), q)| (g, b, q)).filter(|(_, b, _)| b.1 > b.0).collect();
+        let gpus: Vec<Arc<Gpu>> = kept.iter().map(|k| k.0.clone()).collect();
+        let bounds: Vec<(usize, usize)> = kept.iter().map(|k| k.1).collect();
+        let kv_q8: Vec<bool> = kept.iter().map(|k| k.2).collect();
         if gpus.len() < given {
             log(format!("qwen35: all of it fits {}: {} of the {given} GPUs not used", gpus.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(" + "),
                         given - gpus.len()));
@@ -639,11 +688,24 @@ impl<'g> Qwen35<'g> {
         let head = if head_first { 0 } else { gpus.len() - 1 };
         let lastg = gpus[head].clone();
         let mut loaded = 0u64;
+        // NS_Q35_PLAN_LOG=1: each GPU's free memory after each step of the load (what the plan did not see)
+        let plan_log = std::env::var("NS_Q35_PLAN_LOG").is_ok_and(|v| v == "1");
+        let mem = |what: &str, log: &mut dyn FnMut(String)| {
+            if plan_log {
+                let v: Vec<String> = gpus.iter().map(|g| g.memory().map(|(t, f)| format!("{} {:.0} MiB", g.name, f.unwrap_or(t) as f64 / 1048576.0)).unwrap_or_default()).collect();
+                log(format!("qwen35 plan: free after {what}: {}", v.join(", ")));
+            }
+        };
+        mem("planning", &mut *log);
         let mut layers = Vec::with_capacity(g.layers);
         for l in 0..g.layers {
             let gpu = &gpus[layer_dev[l]];
             let n = |s: &str| format!("blk.{l}.{s}.weight");
-            let mut read = |name: &str| -> Result<Mat> { vec_mat(f, gpu, k, name, &mut loaded) };
+            // the layer's tensors in one allocation (one cudaMalloc each rounded to 2 MiB pages: ~6.5 MB a layer
+            // lost, 260 MB over the 5070's 40)
+            let slab = Arc::new(DevBuf::new(gpu, layer_slab_bytes(f, l))?);
+            let at = std::cell::Cell::new(0usize);
+            let mut read = |name: &str| -> Result<Mat> { vec_mat_in(f, gpu, k, name, &mut loaded, Some((&slab, &at))) };
             let full = if g.full(l) {
                 Some(Full { q: read(&n("attn_q"))?, k: read(&n("attn_k"))?, v: read(&n("attn_v"))?, o: read(&n("attn_output"))?,
                             q_norm: read(&n("attn_q_norm"))?.buf, k_norm: read(&n("attn_k_norm"))?.buf })
@@ -667,6 +729,7 @@ impl<'g> Qwen35<'g> {
                 })
             };
             layers.push(Layer {
+                _slab: slab.clone(),
                 attn_norm: read(&n("attn_norm"))?.buf,
                 post_norm: read(&n("post_attention_norm"))?.buf,
                 full,
@@ -679,6 +742,7 @@ impl<'g> Qwen35<'g> {
                 log(format!("qwen35: layer {} of {} ({:.1} GiB, {:.0} s)", l + 1, g.layers, loaded as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64()));
             }
         }
+        mem("the layers", &mut *log);
         // alpha and beta stacked (their bytes one after the other) where they share a block type
         for ly in layers.iter_mut() {
             if let Some(a) = ly.linear.as_mut() {
@@ -697,6 +761,7 @@ impl<'g> Qwen35<'g> {
             Some(m) => Some(load_mtp(m, &g, &lastg, k, in_file, &mut loaded)?),
             None => None,
         };
+        mem("the head and the draft block", &mut *log);
         let drafts = if mtp.is_some() { drafts } else { 0 };
         let mut snap_layers = Vec::new();
         if drafts > 0 {
@@ -710,6 +775,7 @@ impl<'g> Qwen35<'g> {
             None if draft => "qwen35: no MTP file (NS_Q35_MTP or an MTP/ folder beside the model): no drafts".into(),
             None => "qwen35: drafts off".into(),
         });
+        mem("the snapshots", &mut *log);
         let vh = DevBuf::f32(&lastg, 8 * g.n_embd)?;
         let mut devs = Vec::with_capacity(gpus.len());
         for (i, (gpu, &(lb, le))) in gpus.iter().zip(&bounds).enumerate() {
@@ -719,9 +785,12 @@ impl<'g> Qwen35<'g> {
             devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, own)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le,
                                 uploads: Mutex::new(Uploads { slots: (0..UPLOAD_SLOTS).map(|_| (None, None)).collect(), next: 0 }) });
         }
+        mem("the work memory", &mut *log);
         let load_s = t0.elapsed().as_secs_f64();
-        let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
-            .collect::<Vec<_>>().join(", ");
+        let wh = devs.iter().zip(&kv_q8).map(|(d, q)| {
+            let kv = if *q { "q8_0 cache" } else { "half cache" };
+            if d.lb == 0 && d.le == g.layers { format!("{} ({kv})", d.gpu.name) } else { format!("{} (layers {}-{}, {kv})", d.gpu.name, d.lb, d.le - 1) }
+        }).collect::<Vec<_>>().join(", ");
         log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), gib(loaded)));
         let vision = match &mmproj {
@@ -734,7 +803,6 @@ impl<'g> Qwen35<'g> {
             },
             None => None,
         };
-        let kv_row = kv_row_bytes(&g, kv_q8_setting());
         let pipe = if devs.len() == 2 && head == 1 {
             (0..2).map(|_| DevBuf::new(&devs[1].gpu, chunk * g.n_embd * 4)).collect::<Result<Vec<_>>>()?
         } else {
@@ -743,7 +811,7 @@ impl<'g> Qwen35<'g> {
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(None), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), load_s,
                     load_bytes: loaded, pictures: Mutex::new(HashMap::new()), vision,
-                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8: kv_q8_setting(), kv_row, pipe,
+                    mmq: !std::env::var("NS_Q35_MMQ").is_ok_and(|v| v == "0"), head, kv_q8, pipe,
                     ggml_mmvq: !std::env::var("NS_Q35_MMVQ").is_ok_and(|v| v == "nh"),
                     prof: ["NS_Q35_PROFILE", "NS_PROFILE"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1")).then(|| Mutex::new(Profile::default())) })
     }
@@ -1069,13 +1137,15 @@ impl<'g> Qwen35<'g> {
                                              w.fp(), g.eps, g.n_rot as i64, g.theta, from),
                 })?;
             }
+            // the cache's type: its row (q8_0's 272 bytes, half's 512)
+            let q8 = kc.len == hk * cap * kv_row_bytes(g, true);
             self.op("kv store", none, 12 * t * hk * d, 0,
-                    || (if self.kv_q8 { k.kv_store_q8 } else { k.kv_store })(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                    || (if q8 { k.kv_store_q8 } else { k.kv_store })(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                     kc.ptr(), vc.ptr()))?;
             let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
             let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
             self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                    || (if self.kv_q8 { k.attn_q8 } else { k.attn })(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                    || (if q8 { k.attn_q8 } else { k.attn })(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                 att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
             self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                     || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
@@ -1499,13 +1569,14 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
-        let (g, row) = (&self.g, self.kv_row);
+        let g = &self.g;
         // the caches and states, checked against what is free first (a clear error before an allocation fails)
-        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * row } else { 0 };
+        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * self.mtp_row() } else { 0 };
         // per GPU: its layers' share (the draft block's cache on the last)
         for (i, d) in self.devs.iter().enumerate() {
             let full = (d.lb..d.le).filter(|l| g.full(*l)).count();
             let kv = if i == self.last() { mtp_kv } else { 0 };
+            let row = kv_row_bytes(g, self.kv_q8[i]);
             let need = (full * 2 * g.heads_kv * max_ctx * row + kv + (d.le - d.lb - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
             let (total, free) = d.gpu.memory()?;
             let free = free.unwrap_or(total);
@@ -1518,7 +1589,7 @@ impl<'g> Qwen35<'g> {
         for l in 0..g.layers {
             let gpu = &self.devs[self.layer_dev[l]].gpu;
             layers.push(if g.full(l) {
-                let n = g.heads_kv * max_ctx * row;
+                let n = g.heads_kv * max_ctx * self.row_of(l);
                 LState::Full { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)? }
             } else {
                 let s = DevBuf::f32(gpu, g.v_heads * g.state * g.state)?;
@@ -1530,7 +1601,7 @@ impl<'g> Qwen35<'g> {
         }
         let mtp = match &self.mtp {
             Some(_) => {
-                let n = g.heads_kv * max_ctx * row;
+                let n = g.heads_kv * max_ctx * self.mtp_row();
                 let gpu = &self.devs[self.last()].gpu;
                 let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)? };
                 ms.pending.fill(0)?;
@@ -1562,10 +1633,13 @@ impl<'g> Qwen35<'g> {
         if src.pos > dst.max_ctx {
             return Err(e(format!("a session of {} tokens into one of {}", src.pos, dst.max_ctx)));
         }
-        let (g, row) = (&self.g, self.kv_row);
+        let g = &self.g;
+        // (a cache's row: its bytes over its rows - the type of its GPU)
+        let row_in = |b: &DevBuf, ctx: usize| b.len / (g.heads_kv * ctx);
         for (d, s) in dst.layers.iter().zip(&src.layers) {
             match (d, s) {
                 (LState::Full { k: dk, v: dv }, LState::Full { k: sk, v: sv }) => {
+                    let row = row_in(sk, src.max_ctx);
                     for h in 0..g.heads_kv {
                         let n = src.pos * row;
                         dk.copy_within(h * dst.max_ctx * row, sk, h * src.max_ctx * row, n)?;
@@ -1580,6 +1654,7 @@ impl<'g> Qwen35<'g> {
             }
         }
         if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
+            let row = row_in(&sm.k, src.max_ctx);
             for h in 0..g.heads_kv {
                 let n = src.pos * row;
                 d.k.copy_within(h * dst.max_ctx * row, &sm.k, h * src.max_ctx * row, n)?;
@@ -1624,9 +1699,17 @@ impl<'g> Qwen35<'g> {
         self.rollback_in(s, keep)
     }
 
-    /// The attention caches in q8_0 (else half)
-    pub fn kv_q8(&self) -> bool {
-        self.kv_q8
+    /// Each GPU's attention cache type, in layer order ("q8" / "f16", comma-separated; the checkpoints' shape)
+    pub fn kv_types(&self) -> String {
+        self.kv_q8.iter().map(|q| if *q { "q8" } else { "f16" }).collect::<Vec<_>>().join(",")
+    }
+
+    /// Bytes of a head's cache row of layer l (its GPU's type), and of the draft block's (the head's GPU)
+    fn row_of(&self, l: usize) -> usize {
+        kv_row_bytes(&self.g, self.kv_q8[self.layer_dev[l]])
+    }
+    fn mtp_row(&self) -> usize {
+        kv_row_bytes(&self.g, self.kv_q8[self.head])
     }
 
     pub fn has_draft(&self) -> bool {
@@ -1688,12 +1771,13 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
-        let (g, row) = (&self.g, self.kv_row);
+        let g = &self.g;
         let mut bufs = Vec::new();
         for st in &s.layers {
             match st {
                 LState::Full { k, v } => {
                     for c in [k, v] {
+                        let row = c.len / (g.heads_kv * s.max_ctx);
                         let mut b = vec![0u8; g.heads_kv * s.pos * row];
                         for h in 0..g.heads_kv {
                             let n = s.pos * row;
@@ -1713,6 +1797,7 @@ impl<'g> Qwen35<'g> {
         }
         if let Some(ms) = &s.mtp {
             for c in [&ms.k, &ms.v] {
+                let row = c.len / (g.heads_kv * s.max_ctx);
                 let mut b = vec![0u8; g.heads_kv * s.pos * row];
                 for h in 0..g.heads_kv {
                     let n = s.pos * row;
@@ -1731,7 +1816,7 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn restore(&self, s: &mut Session, ck: &Checkpoint) -> Result<()> {
-        let (g, row) = (&self.g, self.kv_row);
+        let g = &self.g;
         if ck.pos > s.max_ctx {
             return Err(e(format!("a checkpoint of {} tokens into a session of {}", ck.pos, s.max_ctx)));
         }
@@ -1741,6 +1826,7 @@ impl<'g> Qwen35<'g> {
                 LState::Full { k, v } => {
                     for c in [k, v] {
                         let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
+                        let row = c.len / (g.heads_kv * s.max_ctx);
                         let n = ck.pos * row;
                         if b.len() != g.heads_kv * n {
                             return Err(e("a checkpoint of another shape"));
@@ -1764,6 +1850,7 @@ impl<'g> Qwen35<'g> {
         if let Some(ms) = &s.mtp {
             for c in [&ms.k, &ms.v] {
                 let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
+                let row = c.len / (g.heads_kv * s.max_ctx);
                 let n = ck.pos * row;
                 if b.len() != g.heads_kv * n {
                     return Err(e("a checkpoint of another shape"));
@@ -1889,7 +1976,34 @@ impl<'g> Qwen35<'g> {
 
 /// A tensor read onto the GPU: its blocks, or float32 for F32 / F16 / BF16
 fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &mut u64) -> Result<Mat> {
+    vec_mat_in(f, gpu, k, name, loaded, None)
+}
+
+/// Bytes a tensor takes on the GPU (a float one as float32), at a 256-byte boundary
+fn gpu_bytes(t: &Tensor) -> usize {
+    let b = if matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) { t.elements() as usize * 4 } else { t.bytes as usize };
+    b.next_multiple_of(256)
+}
+
+/// Layer l's tensors as they are on the GPU, together (its slab)
+fn layer_slab_bytes(f: &Gguf, l: usize) -> usize {
+    let p = format!("blk.{l}.");
+    f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(gpu_bytes).sum::<usize>().max(256)
+}
+
+/// `vec_mat` into a slab (its next `gpu_bytes` at `at`) when given, else its own allocation
+fn vec_mat_in(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &mut u64, slab: Option<(&DevBuf, &std::cell::Cell<usize>)>) -> Result<Mat> {
     let t = f.tensor(name).ok_or_else(|| e(format!("no {name}")))?;
+    let place = |n: usize| -> Result<DevBuf> {
+        match slab {
+            Some((b, at)) => {
+                let o = at.get();
+                at.set(o + n.next_multiple_of(256));
+                b.view(o, n)
+            }
+            None => DevBuf::new(gpu, n),
+        }
+    };
     // outermost first: [rows (outputs), cols (inputs)]; a vector is one row
     let (rows, cols) = match t.shape.len() {
         1 => (1, t.shape[0] as usize),
@@ -1900,13 +2014,13 @@ fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &mut u64)
     if matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
         let src = DevBuf::new(gpu, raw.len())?;
         src.write(0, &raw)?;
-        let out = DevBuf::f32(gpu, rows * cols)?;
+        let out = place(rows * cols * 4)?;
         // SAFETY: src holds the tensor, out its elements as float32.
         ffi::check(unsafe { (k.dequant_f32)(gpu.raw(), t.ty.code() as i32, src.ptr(), (rows * cols) as i64, out.fp()) }, name)?;
         gpu.sync()?;
         return Ok(Mat { buf: out, ty: GType::F32, rows, cols });
     }
-    let buf = DevBuf::new(gpu, raw.len())?;
+    let buf = place(raw.len())?;
     buf.write(0, &raw)?;
     Ok(Mat { buf, ty: t.ty, rows, cols })
 }

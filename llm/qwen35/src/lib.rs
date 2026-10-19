@@ -112,8 +112,8 @@ impl Engine for engine::Qwen35<'_> {
     fn cache_fingerprint(&self) -> String {
         // checkpoints hold the draft block's cache too when it is loaded
         // nsq35-2: a checkpoint carries the session's rotary shift (pictures); -3: the DeltaNet state value-column first
-        // (the cache's type: f16-kv or q8-kv, NS_Q35_KV)
-        let kv = if self.kv_q8() { "q8-kv" } else { "f16-kv" };
+        // (each GPU's cache type: f16-kv, q8-kv, f16,q8-kv ... - NS_Q35_KV)
+        let kv = format!("{}-kv", self.kv_types());
         if self.has_draft() { format!("qwen35 {kv} nsq35-3 mtp") } else { format!("qwen35 {kv} nsq35-3") }
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
