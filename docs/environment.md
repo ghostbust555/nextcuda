@@ -252,7 +252,9 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |
 | `NS_Q35_DRAFTS` | 2 | tokens drafted a step with MTP (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
 | `NS_Q35_HEAD` | last | first: the head and the draft block on the first GPU (the faster card's room to layers; measured: prompts about the same, decode slower) | llm qwen35 |
-| `NS_Q35_KV` | q8 | f16: the attention caches as half instead of q8_0 (llama.cpp's cache-type q8_0: 272 bytes a head's row against 512) | llm qwen35 |
+| `NS_Q35_KV` | auto | the attention cache's format a card: auto - q8_0 (272 bytes a head's row) on the card the plan fills first, half (512) on the others where it fits; auto-q4 - q4_0 (144) there instead; q8, q4, f16 - that on every card | llm qwen35 |
+| `NS_Q35_KV_ROT` | 0 | 1: a quantized cache rotated (a 32-value Hadamard transform a block on keys, values and queries, the output turned back: q4_0's error a third smaller) | llm qwen35 |
+| `NS_Q35_PLAN_LOG` | 0 | Debug: 1 - the plan's room and need a GPU, and each GPU's free memory after each step of the load | llm qwen35 |
 | `NS_Q35_GRAPHS` | 1 | 0: a pipelined prompt's stages launched kernel by kernel instead of as one CUDA graph each | llm qwen35 |
 | `NS_Q35_MMVQ` | ggml | nh: the decode and verify products by the shared kernels instead of ggml-cuda's MMVQ | llm qwen35 |
 | `NS_Q35_PIPE` | 1 | 0: a prompt over two GPUs a pass a chunk instead of pipelined (the first GPU on chunk k+1 beside the last on k) | llm qwen35 |

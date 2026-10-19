@@ -99,11 +99,27 @@ What it took (2026-10-18, from 691 tok/s and 31 tok/s that morning):
 - **ggml-cuda's MMQ and MMVQ** for the products (vendored from llama.cpp's tree, `kernels/llm/qwen35/third_party`): the
   shared matrix-vector kernels read the 3060's layers at ~97 GB/s of its 360. With MMVQ two drafts a step is best.
 
-Settings (`docs/environment.md`): `NS_Q35_PIPE`, `NS_Q35_GRAPHS`, `NS_Q35_MMVQ`, `NS_Q35_KV`, `NS_Q35_DRAFTS` (2),
+Settings (`docs/environment.md`): `NS_Q35_PIPE`, `NS_Q35_GRAPHS`, `NS_Q35_MMVQ`, `NS_Q35_KV`, `NS_Q35_KV_ROT`, `NS_Q35_DRAFTS` (2),
 `NS_Q35_CHUNK`, `NS_Q35_HEAD`, `NS_Q35_VISION`; `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every kernel by card and phase.
 `nextcuda llm generate MODEL.gguf --gpu 1,0 --ctx 81920 --prompt-file F --effort none` is the engine without the server.
-What is left: the 3060 sets the prompt's pace now (its products are llama.cpp's own speed; the q8 cache's widening is
-~18% of attention); pictures still read a pass a chunk.
+**The context's format** (`NS_Q35_KV`, `NS_Q35_KV_ROT`): per card, chosen by the plan. Measured after the 16.6K prompt,
+256 tokens teacher-forced (`llm generate --score TEXT --ref OUT`) against the half cache, where only changing the chunk
+size gives KL 0.00093:
+
+| `NS_Q35_KV` | 3060 / 5070 | KL mean (max) | top-1 same | 80K: 5070 layers, prompt | 192K |
+|---|---|---|---|---|---|
+| `auto` (default) | half / q8_0 | 0.00054 (0.003) | 97.3% | 40, 1,230 tok/s | q8 / q8: 873 tok/s |
+| `q8` | q8_0 / q8_0 | 0.00080 (0.005) | 97.7% | | |
+| `q4` | q4_0 / q4_0 | 0.0082 (0.24) | 93.4% | | |
+| `q4` + `NS_Q35_KV_ROT=1` | q4_0 rotated | 0.0055 (0.21) | 97.3% | | |
+| `auto-q4` + `NS_Q35_KV_ROT=1` | half / q4_0 rotated | 0.0032 (0.017) | 96.5% | 45, 1,493 tok/s | 1,145 tok/s |
+
+q8_0 is within the noise; q4_0 is ~3-9x it, the rotation (a 32-block Hadamard transform of keys, values and queries,
+QuaRot's) taking a third off. q4_0 on the 5070 is the fast and long-context choice: five more layers there.
+
+Also done: prompts with pictures are pipelined too (their positions and rows through pinned slots); a layer's
+tensors are one allocation (one each had lost ~260 MB on the 5070 to 2 MiB rounding); a shared input is quantized
+once for the products that read it; four drafts a step load at 80K.
 
 ### Nemotron 3.5 Super
 
