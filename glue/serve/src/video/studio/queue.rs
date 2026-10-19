@@ -221,7 +221,9 @@ pub fn engine_name(e: Option<&str>) -> String {
     match e.map(|e| e.trim().to_uppercase()).filter(|e| !e.is_empty()).as_deref() {
         // none named: INT8 when the daemon has it (or nothing is known yet), else the first it has (nextcuda: Q4_K_M)
         None => default_engine(),
-        Some("Q8_0") | Some("INT8") => "INT8".into(),
+        // asked for by name but not on this box (nextcuda: a front end defaults to INT8, the box has Q4_K_M only): the
+        // denoiser it has, rather than a job the daemon fails with "no model INT8"
+        Some("Q8_0") | Some("INT8") => default_engine(),
         Some(e) => e.to_string(),
     }
 }

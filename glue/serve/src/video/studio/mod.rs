@@ -380,6 +380,18 @@ impl Studio {
             }
             "queue.remove" => {
                 let label = ps("label");
+                // by position (0 first): a clip queued without a label is told apart from the others only by where it
+                // is; the label, when given too, has to match, so a queue that moved since the page drew it is caught
+                if let Some(i) = p.get("index").and_then(Value::as_u64) {
+                    let mut st = self.st.lock().unwrap();
+                    let i = i as usize;
+                    if st.q.items.get(i).is_none_or(|it| p.get("label").is_some() && s(it, "label") != label) {
+                        return Err(RpcError::not_found(&format!("no queued clip {} at position {i} (the queue changed?)", if label.is_empty() { "" } else { label.as_str() })));
+                    }
+                    st.q.items.remove(i);
+                    st.q.save(&self.dir);
+                    return Ok(json!({"removed": 1, "index": i, "label": label}));
+                }
                 let removed = self.remove(&mut self.st.lock().unwrap(), &label);
                 if removed == 0 {
                     return Err(RpcError::not_found(&format!("no queued clip labelled {label:?}")));

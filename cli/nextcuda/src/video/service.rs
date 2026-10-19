@@ -378,6 +378,10 @@ pub fn serve(cfg: &Config, raw: &[String]) -> Result<(), String> {
     for (q, id) in engine_names(cfg) {
         c.args(["--engine-name", &format!("{q}={id}")]);
     }
+    // the engine's settings, as the daemon gets them: the canvas table reads NSD_MEM_FRACTION for the card's cap
+    for (k, v) in cfg.with_prefix("NSD_") {
+        c.env(k, v);
+    }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&logf).map_err(|e| format!("{}: {e}", logf.display()))?;
     let child = c.stdin(Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?).stderr(log).spawn().map_err(|e| e.to_string())?;
     std::fs::write(&pidf, format!("{}\n", child.id())).map_err(|e| e.to_string())?;

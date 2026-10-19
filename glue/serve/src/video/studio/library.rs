@@ -361,9 +361,15 @@ impl Studio {
         // the single curve older front ends read: the fastest GPU's, with the default denoiser
         let fastest = gpus.iter().filter(|g| g["engine"].as_str().unwrap_or("INT8") == "INT8").min_by(|a, b| a["step_a"].as_f64().unwrap_or(1.0).total_cmp(&b["step_a"].as_f64().unwrap_or(1.0)));
         let (a, b) = fastest.map(|g| (g["step_a"].as_f64().unwrap_or(1.829e-8), g["step_b"].as_f64().unwrap_or(3.4634e-4))).unwrap_or((1.829e-8, 3.4634e-4));
+        // what the engine may hold of this card: its kernels' share (NSD_MEM_FRACTION, 0.94) of the memory CUDA reports,
+        // which is the card's less the ~465 MiB the driver keeps - a 16 GB card's 14.5 GiB, where the engine refused
+        // 768x576 x 10 s. The 30.3 GiB the table had was the 12 GB pair's together; no telemetry, that as before
+        let frac = std::env::var("NSD_MEM_FRACTION").ok().and_then(|v| v.parse::<f64>().ok()).map(|f| f.clamp(0.05, 0.97)).unwrap_or(0.94); // the engine's own clamp
+        let cap_gib = self.gpu()["vram_total_mb"].as_f64().filter(|mb| *mb > 1024.0)
+            .map_or(30.3, |mb| (((mb - 465.0) * frac / 1024.0) * 10.0).floor() / 10.0);
         json!({"engines": self.engines(), "canvases": self.canvases(),
                "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": super::queue::default_engine()},
-               "cap_gib": 30.3, "gib_per_token": 1.64e-4, "margin_gib": 0.8, "step_a": a, "step_b": b, "gpus": gpus,
+               "cap_gib": cap_gib, "gib_per_token": 1.64e-4, "margin_gib": 0.8, "step_a": a, "step_b": b, "gpus": gpus,
                "chain_modes": super::queue::CHAIN_MODES.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<Map<String, Value>>(),
                "measured": {},
                "samplers": nextcuda_diffusion::samplers::NAMES,
