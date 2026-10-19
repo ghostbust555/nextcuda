@@ -368,6 +368,18 @@ nextcuda audio check <reference dump dir> --model breeze-tts-2        # referenc
   "Q dot K to the T, divided by square root of d sub k"), markdown's marks go, dashes and brackets are pauses
   (`NS_SPEECH_NORMALIZE=0` or `normalize: false` for the text as sent) - one such line had a voice loop for 18 s.
 
+## Listening: Whisper large-v3-turbo
+
+`audio.transcribe` (and `/v1/audio/transcriptions`, `nextcuda audio transcribe FILE`): openai's large-v3-turbo on
+the shared kernels (`audio/whisper`; no kernel of its own) - the log-mel, the 32-layer encoder and 4-layer decoder,
+openai's greedy decoding rules and long-form 30 s loop, words timed by the alignment heads, the language detected.
+
+- **Checked** (2026-10-19) against openai-whisper itself on the same weights (`reference/whisper/ref.py`): on an
+  18.6 s clip, a 76 s voice sample and a 48 s song, the segments are openai's word for word and every word is in step
+  with its times off by 0.000 s (the stages within 2e-2, f16).
+- **Speed** (RTX 5070): a 148 s song heard in 1.8 s, 2.5 GB at the peak; the platform's songs listen here now (its
+  local word pass took 28.5 s for the same take).
+
 ## What runs where
 
 | kind | engines | on the two cards |
@@ -378,9 +390,9 @@ nextcuda audio check <reference dump dir> --model breeze-tts-2        # referenc
 | songs | `minimax-music3` (int8) | the language model on the 5070, the flow stage and decoder on the 3060 |
 | video | `minimax-h3` (the native daemon, `--span`) and the video studio (scenes, plans, a film's clips joined) | the denoiser over both cards, nothing streamed: a clip in ~62 s from the SSD |
 | 3D | TRELLIS.2, Hunyuan3D-2mini, UniRig, RigNet, AnimateAnyMesh | one card each |
+| listening | `whisper` (large-v3-turbo) | one card |
 
-Not here yet: `audio.transcribe` (Whisper - the platform's music and audio makers still listen locally), ACE-Step,
-VibeVoice, HunyuanImage 2.1, the video upscalers; the bigger cards' forms above. The answers' `nextsycl` result key keeps
+Not here yet: ACE-Step, VibeVoice, HunyuanImage 2.1, the video upscalers; the bigger cards' forms above. The answers' `nextsycl` result key keeps
 its name (the platform reads it).
 
 ## Clocking it
