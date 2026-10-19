@@ -99,6 +99,18 @@ impl PromptCache {
         let now = std::time::SystemTime::now();
         let stale = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).map_or(true, |t| now.duration_since(t).unwrap_or_default() > ttl);
         std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+        // a subdirectory of the same model file (its path and size: a fingerprint's first two words) under another
+        // fingerprint can never be read again (an engine's checkpoint form or cache type changed): out whole - each of
+        // a long prompt's checkpoints is ~1 GB, and a day of such changes filled this disk (2026-10-18: 28 GB)
+        let model_of = |fp: &str| fp.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let mine = model_of(fingerprint);
+        for d in std::fs::read_dir(&root).map_err(|e| e.to_string())?.flatten().filter(|d| d.path().is_dir()) {
+            let fp = std::fs::read_to_string(d.path().join("fingerprint.txt")).unwrap_or_default();
+            if !fp.trim().is_empty() && fp.trim() != fingerprint && model_of(fp.trim()) == mine {
+                eprintln!("[prompt cache: {} held another form of this model's checkpoints ({}); removed]", d.path().display(), fp.trim());
+                let _ = std::fs::remove_dir_all(d.path());
+            }
+        }
         // every fingerprint's stale files out (a model or a cache form no longer served leaves its files to this)
         for d in std::fs::read_dir(&root).map_err(|e| e.to_string())?.flatten().filter(|d| d.path().is_dir()) {
             for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
@@ -275,6 +287,19 @@ impl PromptCache {
             return false;
         }
         d.prune(e.ck.bytes());
+        // the drive kept DISK_KEEP free whatever the budget: the oldest more go first, else this one is not written
+        if let Some(avail) = avail_bytes(&d.dir) {
+            let mut avail = avail as i64;
+            while avail - (e.ck.bytes() as i64) < DISK_KEEP as i64 {
+                let Some((i, _)) = d.entries.iter().enumerate().min_by_key(|(_, x)| x.used) else { break };
+                let x = d.entries.swap_remove(i);
+                remove(&x.path);
+                avail += x.bytes as i64;
+            }
+            if avail - (e.ck.bytes() as i64) < DISK_KEEP as i64 {
+                return false;
+            }
+        }
         d.next += 1;
         let path = d.dir.join(format!("{}.nsck", d.next));
         // the tokens' file last: a checkpoint without it is a half-written one
@@ -295,6 +320,42 @@ impl PromptCache {
             }
         }
     }
+}
+
+/// What the disk tier leaves free on its drive, whatever its budget
+const DISK_KEEP: u64 = 8 << 30;
+
+/// Bytes free to an unprivileged writer on the drive of `p` (statvfs; None when it cannot tell)
+fn avail_bytes(p: &std::path::Path) -> Option<u64> {
+    // glibc's struct statvfs on 64-bit Linux
+    #[repr(C)]
+    struct StatVfs {
+        f_bsize: u64,
+        f_frsize: u64,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_favail: u64,
+        f_fsid: u64,
+        f_flag: u64,
+        f_namemax: u64,
+        spare: [i32; 6],
+    }
+    extern "C" {
+        fn statvfs(path: *const std::ffi::c_char, buf: *mut StatVfs) -> i32;
+    }
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+    let mut v = std::mem::MaybeUninit::<StatVfs>::uninit();
+    // SAFETY: a NUL-terminated path and a buffer of statvfs's size.
+    let rc = unsafe { statvfs(c.as_ptr(), v.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: filled by a successful statvfs.
+    let v = unsafe { v.assume_init() };
+    Some(v.f_bavail.saturating_mul(v.f_frsize))
 }
 
 impl Disk {

@@ -17,6 +17,9 @@ tools: true
 tasks: true
 env:
   NS_PARALLEL: '1'               # one session: all of the cache to it
+  NS_Q35_KV: 'q8'                # the cache q8_0 on both cards (measured within the noise of half): the 3060 keeps ~5.9 GB
+                                 # free beside it, room for a speech model (voxcpm2-int8) so reading a reply aloud does not
+                                 # swap the chat model out
 files:
   model:
     key: qwen3.8-27b-gsq-rco-iq3s-mtp

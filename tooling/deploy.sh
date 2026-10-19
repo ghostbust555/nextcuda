@@ -17,6 +17,13 @@ echo "==> $HOST: files"
 "${SSH[@]}" 'mkdir -p ~/nextcuda/dist ~/nextcuda/src ~/.config/systemd/user' 2>&1 | quiet
 # the libraries in dist/ on the host are built there (nvcc): a copy of dist/ must not remove them
 "${RSYNC[@]}" --exclude 'lib*.so' dist/ "$HOST":nextcuda/dist/ 2>&1 | quiet
+# the program there is this one (a copy that failed - a full drive - once left the old one running, said nothing)
+want=$(md5sum dist/nextcuda | cut -d' ' -f1)
+have=$("${SSH[@]}" 'md5sum ~/nextcuda/dist/nextcuda 2>/dev/null | cut -d" " -f1; df -h ~ | tail -1' 2>&1 | quiet)
+if [ "$(echo "$have" | head -1)" != "$want" ]; then
+  echo "==> $HOST: the copy of dist/nextcuda did not arrive (the drive there: $(echo "$have" | tail -1)); nothing restarted" >&2
+  exit 1
+fi
 "${RSYNC[@]}" --delete kernels/ "$HOST":nextcuda/src/kernels/ 2>&1 | quiet
 if [ -z "${SKIP_KERNELS:-}" ]; then
   echo "==> $HOST: kernels"

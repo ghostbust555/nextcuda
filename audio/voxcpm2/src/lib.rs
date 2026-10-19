@@ -169,9 +169,11 @@ impl VoxCpm2 {
             return Err(Error(format!("{}: architecture {}, not voxcpm2", cp.display(), conf["architecture"])));
         }
         let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        // the bf16 file less its token embedding (left on disk); the VAE in float32 and its work; 1.5 GiB free
+        // the bf16 file less its token embedding (left on disk); the VAE in float32 and its work; 1.5 GiB free (measured
+        // with int8 on the 3060: 3.3 GiB in all at its peak - the 3 GiB this asked for had it refuse a card it fits,
+        // beside the chat model)
         let lm = size(&mp).saturating_sub(73_448 * 2048 * 2);
-        let need = lm / if int8 { 2 } else { 1 } + size(&vp) + (3u64 << 30);
+        let need = lm / if int8 { 2 } else { 1 } + size(&vp) + (3u64 << 29);
         let (total, free) = gpu.memory()?;
         let free = free.unwrap_or(total);
         if need > free {
