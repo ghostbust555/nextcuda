@@ -555,6 +555,7 @@ dependencies = [
  "nextcuda-core",
  "nextcuda-gguf",
  "nextcuda-image",
+ "nextcuda-image-mingimage",
  "nextcuda-image-olmocr2",
  "nextcuda-image-paddleocrvl",
  "nextcuda-image-qwenimage21",
@@ -690,6 +691,17 @@ version = "0.0.0"
 dependencies = [
  "nextcuda-core",
  "nextcuda-diffusion",
+]
+
+[[package]]
+name = "nextcuda-image-mingimage"
+version = "0.0.0"
+dependencies = [
+ "nextcuda-core",
+ "nextcuda-diffusion",
+ "nextcuda-gguf",
+ "nextcuda-image",
+ "nextcuda-tok",
 ]
 
 [[package]]

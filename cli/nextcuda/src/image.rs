@@ -22,7 +22,7 @@ nextcuda image engines | selftest [--gpu N]";
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextcuda_image::ImageKind> {
     vec![nextcuda_image_qwenimage21::kind(), nextcuda_image_qwenimage21::kind_2512(), nextcuda_image_unlimitedocr::kind(), nextcuda_image_paddleocrvl::kind(),
-         nextcuda_image_olmocr2::kind()]
+         nextcuda_image_olmocr2::kind(), nextcuda_image_mingimage::kind()]
 }
 
 /// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too: olmOCR 2's vision tower)
@@ -343,8 +343,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         println!("worst relative error {worst:.2e}");
         return Ok(());
     }
+    if m["arch"].as_str() == Some(nextcuda_image_mingimage::ARCH) {
+        let gs = gpus(args)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextcuda_image_mingimage::MingImage::load(&files, &gs, &mut log).map_err(|e| e.0)?;
+        let st = opt(args, "--stages").unwrap_or("tokens,te,dit,steps,vae");
+        let worst = nextcuda_image_mingimage::check::run(&e, dir, &st.split(',').collect::<Vec<_>>(), &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
     let _ = cfg;
-    Err(format!("check knows the OCR engines here ({}, {}, {}); Qwen-Image's stage checks are nextsycl's (docs/PHASES.md)",
+    Err(format!("check knows the OCR engines and Ming-Image here ({}, {}, {}); Qwen-Image's stage checks are nextsycl's (docs/PHASES.md)",
                 nextcuda_image_unlimitedocr::ARCHS.join("/"), nextcuda_image_paddleocrvl::ARCHS.join("/"), nextcuda_image_olmocr2::ARCHS.join("/")))
 }
 

@@ -1,0 +1,13 @@
+[package]
+name = "nextcuda-image-mingimage"
+description = "Ming-Image-0.1-Design (inclusionAI): text to image for UI, posters and infographics, transparent output; Rust and CUDA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextcuda-core.workspace = true
+nextcuda-image.workspace = true
+nextcuda-diffusion.workspace = true
+nextcuda-gguf.workspace = true
+nextcuda-tok.workspace = true
