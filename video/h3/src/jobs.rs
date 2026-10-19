@@ -1464,8 +1464,14 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let sample_secs = t0.elapsed().as_secs_f64();
     drop(d);
     // split over the cards, the blocks make way for the decoders (5 GiB for the video's): the next clip loads them
-    // again (nextcuda: each stage holds a model that fits)
-    if e.devs.len() > 1 {
+    // again (nextcuda: each stage holds a model that fits). On one card too when the decoder and its work would not
+    // fit beside them (a 16 GB card holding Q4_K_M's 10.6 GiB)
+    let decoder_room = std::fs::metadata(c.vaes.video).map_or(0, |m| m.len()) + (4u64 << 30);
+    if e.devs.len() > 1 || e.dev.mem_cap().saturating_sub(e.dev.mem_used()) < decoder_room {
+        if e.devs.len() == 1 {
+            ctl.say(format!("blocks : released for the decoders ({:.1} GiB free of the card's {:.1}, they want {:.1})",
+                            gib(e.dev.mem_cap().saturating_sub(e.dev.mem_used())), gib(e.dev.mem_cap()), gib(decoder_room)));
+        }
         drop(model);
         e.release();
     }
