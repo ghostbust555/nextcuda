@@ -91,6 +91,8 @@ Where the program, its libraries, its models and its sockets are.
 | `OWUI_IMAGE` | ghcr.io/open-webui/open-webui:main | the Open WebUI image tooling/open-webui.sh runs | tooling (open-webui.sh) |
 | `NS_AUDIO_PORT` | 8087 | the audio server's port, as the front door reaches it | serve |
 | `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
+| `NS_SPEECH_NORMALIZE` | 1 | 0: speech's text as sent (by default math and code symbols are said as words - √ "square root of", = "equals", d_k "d sub k" - and markdown's marks dropped; a request's `normalize: false` too) | serve (audio) |
+| `NS_VCP_CONTINUE` | 0 | 1: VoxCPM2 continues a saved voice's recording (its transcript the prompt's) instead of taking its timbre alone - continuing led the recording's last words into each sentence | audio voxcpm2 |
 | `NS_CHAT_UI_PORT` | 3000 | Open WebUI's port (the page's link; tooling/open-webui.sh's OWUI_PORT) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_AUTO_PULL` | 0 | 1: a request naming a model a card offers that is not downloaded starts its download (`system.models.pull`) and waits for it, a job saying `downloading <model>: N%`; 0: it is refused 409 `model_not_downloaded` (error.model, bytes, fits, pull). Read on every request, so the page's checkbox needs no restart | serve |

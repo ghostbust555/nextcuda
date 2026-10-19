@@ -327,35 +327,7 @@ const DISK_KEEP: u64 = 8 << 30;
 
 /// Bytes free to an unprivileged writer on the drive of `p` (statvfs; None when it cannot tell)
 fn avail_bytes(p: &std::path::Path) -> Option<u64> {
-    // glibc's struct statvfs on 64-bit Linux
-    #[repr(C)]
-    struct StatVfs {
-        f_bsize: u64,
-        f_frsize: u64,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_favail: u64,
-        f_fsid: u64,
-        f_flag: u64,
-        f_namemax: u64,
-        spare: [i32; 6],
-    }
-    extern "C" {
-        fn statvfs(path: *const std::ffi::c_char, buf: *mut StatVfs) -> i32;
-    }
-    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
-    let mut v = std::mem::MaybeUninit::<StatVfs>::uninit();
-    // SAFETY: a NUL-terminated path and a buffer of statvfs's size.
-    let rc = unsafe { statvfs(c.as_ptr(), v.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: filled by a successful statvfs.
-    let v = unsafe { v.assume_init() };
-    Some(v.f_bavail.saturating_mul(v.f_frsize))
+    crate::drives::space(p).map(|(_, avail)| avail)
 }
 
 impl Disk {
