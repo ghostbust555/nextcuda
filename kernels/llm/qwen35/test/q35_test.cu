@@ -224,8 +224,10 @@ static void test_quants() {
 // ---- attention: kv_store + attn against a double-precision softmax (the cache's halves as the reference's keys)
 // q8: the q8_0 cache (ns_q35_kv_store_q8 / ns_q35_attn_q8): the store against ggml's quantize_f32_q8_0_block, the
 // reference over the cache as stored
-static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv, bool q8 = false) {
-    const int64_t D = 256, cap = p0 + T + 3, all = p0 + T, RB = q8 ? D + 16 : D * 2;
+// kt 0 half, 1 q8_0, 2 q4_0 (ggml's quantize_row_q4_0)
+static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv, int kt = 0) {
+    const bool q8 = kt != 0;
+    const int64_t D = 256, cap = p0 + T + 3, all = p0 + T, RB = kt == 1 ? D + 16 : kt == 2 ? D / 2 + 16 : D * 2;
     auto k = rnd((size_t) (all * Hkv * D)), v = rnd((size_t) (all * Hkv * D));
     // q rows strided: qs = Hq * D + 64 (as the engine's fused projections leave them)
     const int64_t qs = Hq * D + 64;
@@ -235,8 +237,8 @@ static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv, bool q8 = 
     float* Q = up(q);
     void* KC = dev((size_t) (Hkv * cap * RB));
     void* VC = dev((size_t) (Hkv * cap * RB));
-    auto store = q8 ? ns_q35_kv_store_q8 : ns_q35_kv_store;
-    auto attn = q8 ? ns_q35_attn_q8 : ns_q35_attn;
+    auto store = kt == 1 ? ns_q35_kv_store_q8 : kt == 2 ? ns_q35_kv_store_q4 : ns_q35_kv_store;
+    auto attn = kt == 1 ? ns_q35_attn_q8 : kt == 2 ? ns_q35_attn_q4 : ns_q35_attn;
     // the cache in two stores: the earlier keys, then the rows' own (as decode does)
     if (p0 > 0) ok(store(G, K, Hkv * D, V, Hkv * D, p0, Hkv, D, cap, 0, KC, VC), "kv_store");
     ok(store(G, K + p0 * Hkv * D, Hkv * D, V + p0 * Hkv * D, Hkv * D, T, Hkv, D, cap, p0, KC, VC), "kv_store");
@@ -261,21 +263,37 @@ static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv, bool q8 = 
                 for (int64_t h = 0; h < Hkv; ++h) {
                     const uint8_t* row = pr->data() + (h * cap + t) * RB;
                     for (int64_t d = 0; d < D; ++d) {
-                        uint16_t sh;
-                        std::memcpy(&sh, row + D + (d / 32) * 2, 2);
-                        const float x = (float) (int8_t) row[d] * h2f(sh);
-                        out[(h * cap + t) * D + d] = f2h(x);
-                        // ggml's block: d = amax / 127, q = round(x / d), the scale kept as half
                         const float* blk = &src[(t * Hkv + h) * D + d / 32 * 32];
-                        float amax = 0;
-                        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(blk[i]));
-                        const float sd = amax / 127.0f, id = sd != 0 ? 1.0f / sd : 0.0f;
+                        const float xs = src[(t * Hkv + h) * D + d];
+                        uint16_t sh;
+                        float x, w;
+                        if (kt == 1) {
+                            std::memcpy(&sh, row + D + (d / 32) * 2, 2);
+                            x = (float) (int8_t) row[d] * h2f(sh);
+                            // ggml's block: d = amax / 127, q = round(x / d), the scale kept as half
+                            float amax = 0;
+                            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(blk[i]));
+                            const float sd = amax / 127.0f, id = sd != 0 ? 1.0f / sd : 0.0f;
+                            w = std::round(xs * id) * hround(sd);
+                        } else {
+                            std::memcpy(&sh, row + D / 2 + (d / 32) * 2, 2);
+                            const int j = (int) (d % 32), byte = (int) (d / 32) * 16 + (j & 15);
+                            x = (float) (((row[byte] >> (j >= 16 ? 4 : 0)) & 15) - 8) * h2f(sh);
+                            // ggml's quantize_row_q4_0: m the first value of the largest magnitude, d = m / -8
+                            float amax = 0, m = 0;
+                            for (int i = 0; i < 32; ++i)
+                                if (std::fabs(blk[i]) > amax) amax = std::fabs(blk[i]), m = blk[i];
+                            const float sd = m / -8.0f, id = sd != 0 ? 1.0f / sd : 0.0f;
+                            const int q = std::min(15, (int) (int8_t) (xs * id + 8.5f));
+                            w = (float) (q - 8) * hround(sd);
+                        }
+                        out[(h * cap + t) * D + d] = f2h(x);
                         got.push_back(x);
-                        want.push_back(std::round(src[(t * Hkv + h) * D + d] * id) * hround(sd));
+                        want.push_back(w);
                     }
                 }
         }
-        if (T == 1 && p0 == 1000) check("kv_store_q8 (ggml's q8_0 blocks)", got, want, 0);
+        if (T == 1 && p0 == 1000) check(kt == 1 ? "kv_store_q8 (ggml's q8_0 blocks)" : "kv_store_q4 (ggml's q4_0 blocks)", got, want, 0);
     }
     if (!q8) {
         std::vector<float> got, want;
@@ -314,7 +332,7 @@ static void test_attn(int64_t T, int64_t p0, int64_t Hq, int64_t Hkv, bool q8 = 
         }
     const bool mma = T > 2 && Hq / Hkv <= 6;
     char name[96];
-    std::snprintf(name, sizeof name, "attn%s T=%lld p0=%lld Hq/Hkv=%lld (%s)", q8 ? " q8" : "", (long long) T, (long long) p0, (long long) (Hq / Hkv),
+    std::snprintf(name, sizeof name, "attn%s T=%lld p0=%lld Hq/Hkv=%lld (%s)", kt == 1 ? " q8" : kt == 2 ? " q4" : "", (long long) T, (long long) p0, (long long) (Hq / Hkv),
                   mma ? (sc > 0 ? "tensor cores, splits" : "tensor cores") : T > 16 ? "float tiles" : sc > 0 ? "splits" : "one split");
     // the tensor cores' and the float tiles' queries are halves: a looser bound
     // (q8: the reference's values are the widened products rounded to half; the decode kernel's are float32)
@@ -554,20 +572,21 @@ static double ms_of(int reps, const std::function<void()>& f) {
     ok(ns_sync(G), "sync");
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
 }
-static void bench_attn(int64_t T, int64_t keys, bool q8 = false) {
-    const int64_t Hq = 24, Hkv = 4, D = 256, p0 = keys - T, cap = keys, RB = q8 ? D + 16 : D * 2;
+static void bench_attn(int64_t T, int64_t keys, int kt = 0) {
+    const bool q8 = kt != 0;
+    const int64_t Hq = 24, Hkv = 4, D = 256, p0 = keys - T, cap = keys, RB = kt == 1 ? D + 16 : kt == 2 ? D / 2 + 16 : D * 2;
     void* KC = dev((size_t) (Hkv * cap * RB));
     void* VC = dev((size_t) (Hkv * cap * RB));
     ok(cudaMemset(KC, 0, (size_t) (Hkv * cap * RB)) == cudaSuccess ? 0 : -1, "memset");
     ok(cudaMemset(VC, 0, (size_t) (Hkv * cap * RB)) == cudaSuccess ? 0 : -1, "memset");
-    auto attn = q8 ? ns_q35_attn_q8 : ns_q35_attn;
+    auto attn = kt == 1 ? ns_q35_attn_q8 : kt == 2 ? ns_q35_attn_q4 : ns_q35_attn;
     float* Q = up(rnd((size_t) (T * Hq * D)));
     const int64_t sc = ns_q35_attn_scratch(T, Hq, Hkv, D, p0);
     float* S = sc > 0 ? (float*) dev((size_t) sc * 4) : nullptr;
     float* O = (float*) dev((size_t) (T * Hq * D) * 4);
     const double ms = ms_of(T == 1 ? 50 : 3, [&] { ok(attn(G, Q, Hq * D, KC, VC, T, Hq, Hkv, D, cap, p0, O, S), "attn"); });
     const double gb = (double) Hkv * keys * RB * 2 / 1e9;
-    std::printf("attn%s T=%-4lld keys=%-7lld  %8.3f ms  (cache %.2f GB: %.0f GB/s)\n", q8 ? " q8" : "   ", (long long) T, (long long) keys, ms, gb, gb / ms * 1e3);
+    std::printf("attn%s T=%-4lld keys=%-7lld  %8.3f ms  (cache %.2f GB: %.0f GB/s)\n", kt == 1 ? " q8" : kt == 2 ? " q4" : "   ", (long long) T, (long long) keys, ms, gb, gb / ms * 1e3);
     ns_free(G, KC); ns_free(G, VC); ns_free(G, Q); ns_free(G, O);
     if (S) ns_free(G, S);
 }
@@ -605,7 +624,34 @@ int main(int argc, char** argv) {
     test_attn(33, 900, 4, 4);
     for (auto [T, p0, Hq, Hkv] : {std::array<int64_t, 4>{1, 0, 24, 4}, {1, 1000, 24, 4}, {1, 5000, 24, 4}, {2, 70, 24, 4}, {4, 300, 24, 4},
                                   {16, 777, 24, 4}, {37, 100, 24, 4}, {300, 2000, 24, 4}, {9, 50, 8, 8}, {40, 33, 16, 2}})
-        test_attn(T, p0, Hq, Hkv, true);
+        test_attn(T, p0, Hq, Hkv, 1);
+    for (auto [T, p0, Hq, Hkv] : {std::array<int64_t, 4>{1, 0, 24, 4}, {1, 1000, 24, 4}, {2, 70, 24, 4}, {4, 300, 24, 4}, {37, 100, 24, 4},
+                                  {300, 2000, 24, 4}, {9, 50, 8, 8}, {40, 33, 16, 2}})
+        test_attn(T, p0, Hq, Hkv, 2);
+    {
+        // the Hadamard transform: orthonormal (norms kept) and its own inverse
+        const int64_t rows = 5, n = 256, stride = 300;
+        auto x = rnd((size_t) (rows * stride));
+        float* X = up(x);
+        ok(ns_q35_fwht32(G, X, rows, n, stride), "fwht32");
+        auto y = down<float>(X, x.size());
+        std::vector<float> got, want;
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t b = 0; b < n / 32; ++b) {
+                double nx = 0, ny = 0;
+                for (int i = 0; i < 32; ++i) nx += x[r * stride + b * 32 + i] * x[r * stride + b * 32 + i], ny += y[r * stride + b * 32 + i] * y[r * stride + b * 32 + i];
+                got.push_back((float) std::sqrt(ny));
+                want.push_back((float) std::sqrt(nx));
+            }
+        check("fwht32 (norms kept)", got, want, 1e-5);
+        ok(ns_q35_fwht32(G, X, rows, n, stride), "fwht32");
+        auto z = down<float>(X, x.size());
+        std::vector<float> zg, zw;
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t i = 0; i < n; ++i) zg.push_back(z[r * stride + i]), zw.push_back(x[r * stride + i]);
+        check("fwht32 twice (the identity)", zg, zw, 1e-5);
+        ns_free(G, X);
+    }
     std::printf("== times\n");
     bench_attn(1, 32768);
     bench_attn(1, 131072);
@@ -616,10 +662,14 @@ int main(int argc, char** argv) {
     bench_attn(512, 32768);
     bench_attn(512, 131072);
     bench_attn(64, 131072);
-    bench_attn(1, 131072, true);
-    bench_attn(4, 131072, true);
-    bench_attn(512, 32768, true);
-    bench_attn(512, 131072, true);
+    bench_attn(1, 131072, 1);
+    bench_attn(4, 131072, 1);
+    bench_attn(512, 32768, 1);
+    bench_attn(512, 131072, 1);
+    bench_attn(1, 131072, 2);
+    bench_attn(4, 131072, 2);
+    bench_attn(512, 32768, 2);
+    bench_attn(512, 131072, 2);
     bench_kda(1);
     bench_kda(512);
     std::printf("== %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);

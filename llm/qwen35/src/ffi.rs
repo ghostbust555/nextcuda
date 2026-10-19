@@ -34,6 +34,7 @@ pub struct Api {
     // q35.h: its own
     pub qk_norm_rope: unsafe extern "C" fn(G, F, i64, i64, FM, i64, i64, i64, i64, F, f32, i64, f32, i64) -> c_int,
     pub mmq_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub mmq_reserve: unsafe extern "C" fn(G) -> c_int,
     /// ggml-cuda's MMVQ (nh's mmvq's arguments)
     pub q35_mmvq_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub q35_mmvq: unsafe extern "C" fn(G, c_int, P, P, FM, i64, i64, i64) -> c_int,
@@ -44,9 +45,13 @@ pub struct Api {
     pub kv_store: unsafe extern "C" fn(G, F, i64, F, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
     /// the q8_0 cache's (rows of 256 int8 and 8 half scales)
     pub kv_store_q8: unsafe extern "C" fn(G, F, i64, F, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
+    pub kv_store_q4: unsafe extern "C" fn(G, F, i64, F, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
+    /// the 32-block Hadamard transform in place (a rotated cache)
+    pub fwht32: unsafe extern "C" fn(G, FM, i64, i64, i64) -> c_int,
     pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64,
     pub attn: unsafe extern "C" fn(G, F, i64, P, P, i64, i64, i64, i64, i64, i64, FM, FM) -> c_int,
     pub attn_q8: unsafe extern "C" fn(G, F, i64, P, P, i64, i64, i64, i64, i64, i64, FM, FM) -> c_int,
+    pub attn_q4: unsafe extern "C" fn(G, F, i64, P, P, i64, i64, i64, i64, i64, i64, FM, FM) -> c_int,
     pub gate_mul: unsafe extern "C" fn(G, FM, F, i64, i64, i64, i64) -> c_int,
     pub gdn_gates: unsafe extern "C" fn(G, F, FM, F, F, FM, i64, i64, i64) -> c_int,
     pub expand: unsafe extern "C" fn(G, F, i64, FM, i64, i64, i64, i64) -> c_int,
@@ -95,6 +100,7 @@ pub fn api() -> nextcuda_core::Result<&'static Api> {
             qk_norm_rope: sym!("ns_q35_qk_norm_rope"),
             qk_norm_mrope: sym!("ns_q35_qk_norm_mrope"),
             mmq_supported: sym!("ns_q35_mmq_supported"),
+            mmq_reserve: sym!("ns_q35_mmq_reserve"),
             q35_mmvq_supported: sym!("ns_q35_mmvq_supported"),
             q35_mmvq: sym!("ns_q35_mmvq"),
             mmq_q8_bytes: sym!("ns_q35_mmq_q8_bytes"),
@@ -102,9 +108,12 @@ pub fn api() -> nextcuda_core::Result<&'static Api> {
             mmq: sym!("ns_q35_mmq"),
             kv_store: sym!("ns_q35_kv_store"),
             kv_store_q8: sym!("ns_q35_kv_store_q8"),
+            kv_store_q4: sym!("ns_q35_kv_store_q4"),
+            fwht32: sym!("ns_q35_fwht32"),
             attn_scratch: sym!("ns_q35_attn_scratch"),
             attn: sym!("ns_q35_attn"),
             attn_q8: sym!("ns_q35_attn_q8"),
+            attn_q4: sym!("ns_q35_attn_q4"),
             gate_mul: sym!("ns_q35_gate_mul"),
             gdn_gates: sym!("ns_q35_gdn_gates"),
             expand: sym!("ns_q35_expand"),

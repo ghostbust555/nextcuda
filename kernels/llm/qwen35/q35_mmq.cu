@@ -212,6 +212,21 @@ int ns_q35_mmq(ns_gpu* g, int type, const void* w, int64_t n_out, int64_t K, con
     NS_CATCH
 }
 
+// the GPU's stream-k fixup buffer at its largest (a block per SM, a tile of at most 128 x 128 floats), so no product
+// allocates it later - inside a CUDA graph's capture an allocation fails (a chunk's last, shorter pass is the first
+// to need the fixup when the full ones tile the SMs evenly)
+int ns_q35_mmq_reserve(ns_gpu* g) {
+    NS_TRY
+    NS_CU(cudaSetDevice(g->dev));
+    ns_mmq_ctx ctx;
+    ggml_cuda_pool& pool = ctx.pool(g->dev);
+    size_t got = 0;
+    void* p = pool.alloc((size_t) ggml_cuda_info().devices[g->dev].nsm * 128 * 128 * sizeof(float), &got);
+    pool.free(p, got);
+    return 0;
+    NS_CATCH
+}
+
 int ns_q35_mmvq_supported(int type) { return mmvq_block(type) > 0 ? 1 : 0; }
 
 // y [ncols][n_out] = W [n_out][n_in] . xq [ncols] - nh's ns_nh_mmvq's arguments (xq: its Q8_1 rows, ggml's block_q8_1),

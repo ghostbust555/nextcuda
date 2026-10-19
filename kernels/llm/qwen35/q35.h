@@ -34,6 +34,13 @@ int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64
  * as int8 then the 8 half scales of its blocks of 32 (272 bytes; d = amax / 127, q = round(x / d)) */
 int ns_q35_kv_store_q8(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                        void* kc, void* vc);
+/* As ns_q35_kv_store into a q4_0 cache (ggml's blocks of 32 as nibbles: byte j of a block value j low, j + 16 high;
+ * the row's 128 bytes then its 8 half scales - 144 bytes; m the block's value of largest magnitude, d = m / -8) */
+int ns_q35_kv_store_q4(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                       void* kc, void* vc);
+/* A normalized 32-value Walsh-Hadamard transform (its own inverse) on each block of 32 of x [rows][n], rows stride floats
+ * apart, in place: a rotated cache (keys and queries alike keep their products; the values' output turned back) */
+int ns_q35_fwht32(ns_gpu* g, float* x, int64_t rows, int64_t n, int64_t stride);
 /* Floats of scratch ns_q35_attn needs for T rows of Hq heads (Hkv key heads) x D at positions p0.. (0: none; only
  * T <= 16 needs any) */
 int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
@@ -46,6 +53,9 @@ int ns_q35_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const voi
                 int64_t cap, int64_t p0, float* out, float* scratch);
 /* As ns_q35_attn against a q8_0 cache (ns_q35_kv_store_q8's rows; each key and value widened to half as it is read) */
 int ns_q35_attn_q8(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                   int64_t cap, int64_t p0, float* out, float* scratch);
+/* As ns_q35_attn against a q4_0 cache (ns_q35_kv_store_q4's rows) */
+int ns_q35_attn_q4(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
                    int64_t cap, int64_t p0, float* out, float* scratch);
 /* The attention's output gate: out [T, H x D] *= sigmoid(gate), the gate at q_full[t * gs + h * 2D + D + d] */
 int ns_q35_gate_mul(ns_gpu* g, float* out, const float* q_full, int64_t gs, int64_t T, int64_t H, int64_t D);
@@ -80,6 +90,8 @@ int ns_q35_swiglu(ns_gpu* g, const float* gate, const float* up, float* out, int
 /* ---- the prompt products, ggml-cuda's MMQ (q35_mmq.cu, third_party/ggml-cuda): x as q8_1 in MMQ's tiles, the
  * matrix's blocks on the int8 tensor cores. Types: Q2_K Q4_K Q6_K IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS */
 int ns_q35_mmq_supported(int type);
+/* the GPU's MMQ fixup buffer allocated at its largest (none later: a CUDA graph's capture cannot allocate) */
+int ns_q35_mmq_reserve(ns_gpu* g);
 /* bytes of x [T][K] quantized for ns_q35_mmq */
 size_t ns_q35_mmq_q8_bytes(int64_t K, int64_t T);
 /* x [T][K] float32 -> xq, in the layout a matrix of `type` reads */

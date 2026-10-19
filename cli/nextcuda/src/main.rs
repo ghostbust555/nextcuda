@@ -489,6 +489,56 @@ fn generate(args: &[String]) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let logits = eng.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
+    // --score FILE: the text teacher-forced after the prompt, each next token's distribution kept: --dump OUT writes
+    // them (float32 rows), --ref OUT compares with ones written before (a cache type against another: KL, top-1, perplexity)
+    if let Some(sf) = opt("--score") {
+        let text = std::fs::read_to_string(&sf).map_err(|x| format!("{sf}: {x}"))?;
+        let sc = tok.encode(&text);
+        let n = sc.len().min(opt("--score-max").and_then(|v| v.parse().ok()).unwrap_or(256));
+        let mut rows: Vec<Vec<f32>> = vec![logits];
+        let mut at = 0;
+        while at + 1 < n {
+            let end = (at + 64).min(n - 1);
+            rows.extend(eng.forward_rows(&mut sess, &sc[at..end], end - at, &mut none).map_err(e)?);
+            at = end;
+        }
+        // rows[i] predicts sc[i]
+        let lsm = |l: &[f32]| -> Vec<f64> {
+            let m = l.iter().cloned().fold(f32::MIN, f32::max) as f64;
+            let z: f64 = l.iter().map(|v| (*v as f64 - m).exp()).sum::<f64>().ln() + m;
+            l.iter().map(|v| *v as f64 - z).collect()
+        };
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, v)| if *v > b.1 { (i, *v) } else { b }).0;
+        let nll: f64 = rows.iter().zip(&sc).map(|(r, y)| -lsm(r)[*y as usize]).sum::<f64>() / n as f64;
+        eprintln!("[score: {n} tokens, perplexity {:.4}]", nll.exp());
+        if let Some(out) = opt("--dump") {
+            let mut b = Vec::with_capacity(rows.len() * rows[0].len() * 4);
+            for r in &rows {
+                for v in r {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            std::fs::write(&out, b).map_err(|x| format!("{out}: {x}"))?;
+        }
+        if let Some(rf) = opt("--ref") {
+            let raw = std::fs::read(&rf).map_err(|x| format!("{rf}: {x}"))?;
+            let v = rows[0].len();
+            let (mut kl, mut top1, mut rnll, mut kmax) = (0f64, 0usize, 0f64, 0f64);
+            for (i, r) in rows.iter().enumerate() {
+                let refr: Vec<f32> = raw[i * v * 4..(i + 1) * v * 4].chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                let (p, q) = (lsm(&refr), lsm(r));
+                let k: f64 = p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum();
+                kl += k;
+                kmax = kmax.max(k);
+                top1 += (argmax(&refr) == argmax(r)) as usize;
+                rnll -= p[sc[i] as usize];
+            }
+            let m = rows.len() as f64;
+            eprintln!("[against {rf}: KL mean {:.5} max {:.4}, top-1 the same {:.1}%, perplexity {:.4} (the reference's {:.4})]", kl / m, kmax,
+                      100.0 * top1 as f64 / m, nll.exp(), (rnll / m).exp());
+        }
+        return Ok(());
+    }
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
     let top: usize = opt("--top").and_then(|v| v.parse().ok()).unwrap_or(0);
