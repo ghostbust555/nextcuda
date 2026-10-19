@@ -299,6 +299,34 @@ pub mod tests {
         Some(Vocab::open(Path::new(&t), Path::new(&g), 4, 20, 51866).unwrap())
     }
 
+    /// openai-whisper's greedy decoding of a window (NS_TEST_WHISPER_REF: a dump of reference/whisper/ref.py) is
+    /// these rules over its own logits, token for token: logits.npy row r is the decoder after token r of tokens.npy
+    #[test]
+    fn greedy_under_the_rules_is_openais() {
+        let (Some(v), Ok(dir)) = (vocab(), std::env::var("NS_TEST_WHISPER_REF")) else { return };
+        let mut checked = 0;
+        for clip in ["short", "long", "song"] {
+            let d = Path::new(&dir).join(clip);
+            let Ok((_, toks)) = crate::check::read_npy(&d.join("tokens.npy")) else { continue };
+            let toks: Vec<u32> = toks.iter().map(|x| *x as u32).collect();
+            let (_, l) = crate::check::read_npy(&d.join("logits.npy")).unwrap();
+            let vs = v.vocab_size;
+            let begin = 3;
+            for i in 0..=toks.len() - begin {
+                let mut row: Vec<f32> = l[(begin - 1 + i) * vs..(begin + i) * vs].iter().map(|x| *x as f32).collect();
+                apply_rules(&mut row, &toks[begin..begin + i], &v, Some(v.max_initial_timestamp));
+                let want = toks.get(begin + i).copied().unwrap_or(v.eot);
+                assert_eq!(pick(&row).0, want, "{clip}: step {i}");
+            }
+            // and the window's segments: openai's first window cut, its seek
+            let sampled = &toks[begin..];
+            let (cuts, _) = cut(sampled, &v, 3000);
+            assert!(!cuts.is_empty() && cuts.iter().all(|c| c.end >= c.start), "{clip}");
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "the three clips");
+    }
+
     #[test]
     fn the_vocabulary_of_large_v3() {
         let Some(v) = vocab() else { return };

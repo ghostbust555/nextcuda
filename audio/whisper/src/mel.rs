@@ -216,10 +216,12 @@ pub fn log_mel(x: &[f32], n_mels: usize) -> (Vec<f32>, usize) {
     (mel, content)
 }
 
-/// Frames [at, at + CHUNK_FRAMES) of a spectrogram [n_mels, frames], zero past its end (pad_or_trim): [n_mels, 3000]
-pub fn window(mel: &[f32], n_mels: usize, frames: usize, at: usize) -> Vec<f32> {
+/// `count` frames from `at` of a spectrogram [n_mels, frames], zeros after them (transcribe's pad_or_trim of
+/// `mel[:, seek:seek + segment_size]`: a window past the recording's end is padded with zeros, not with the silence's
+/// spectrogram): [n_mels, 3000]
+pub fn window(mel: &[f32], n_mels: usize, frames: usize, at: usize, count: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_mels * CHUNK_FRAMES];
-    let n = frames.saturating_sub(at).min(CHUNK_FRAMES);
+    let n = frames.saturating_sub(at).min(CHUNK_FRAMES).min(count);
     for b in 0..n_mels {
         out[b * CHUNK_FRAMES..b * CHUNK_FRAMES + n].copy_from_slice(&mel[b * frames + at..b * frames + at + n]);
     }
@@ -268,6 +270,22 @@ mod tests {
         }
         let max = mel.iter().copied().fold(f32::MIN, f32::max);
         assert!((max - 1.374_432_4).abs() < 1e-4, "{max}");
+    }
+
+    /// The first window of real recordings against openai-whisper's (NS_TEST_WHISPER_REF: reference/whisper/ref.py's
+    /// audio16k.npy and mel.npy)
+    #[test]
+    fn real_recordings_mel_is_openais() {
+        let Ok(dir) = std::env::var("NS_TEST_WHISPER_REF") else { return };
+        for clip in ["short", "long", "song"] {
+            let d = std::path::Path::new(&dir).join(clip);
+            let a: Vec<f32> = crate::check::read_npy(&d.join("audio16k.npy")).unwrap().1.iter().map(|x| *x as f32).collect();
+            let want: Vec<f32> = crate::check::read_npy(&d.join("mel.npy")).unwrap().1.iter().map(|x| *x as f32).collect();
+            let (spec, content) = log_mel(&a, 128);
+            let w = window(&spec, 128, spec.len() / 128, 0, content.min(CHUNK_FRAMES));
+            let (rel, mx, _) = crate::check::compare(&w, &want);
+            assert!(rel < 1e-5 && mx < 1e-3, "{clip}: rel {rel:.2e} max {mx:.2e}");
+        }
     }
 
     #[test]

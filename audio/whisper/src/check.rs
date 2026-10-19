@@ -3,7 +3,7 @@
 //! input.
 //!
 //! ```text
-//!   mel         audio16k.npy                         -> mel.npy [n_mels, 3000] (the first window)
+//!   mel         audio16k.npy                         -> mel.npy [n_mels, 3000] (the first window, as transcribe pads it)
 //!   encoder     mel.npy                              -> enc.npy [1500, d]
 //!   logits      tokens.npy forced (teacher forcing)  -> logits.npy [T, vocab] (and the greedy choice at each row)
 //!   transcribe  audio16k.npy                         -> result.json (openai-whisper's transcribe, word_timestamps,
@@ -100,9 +100,9 @@ pub fn run(e: &Whisper, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
     let audio = want("audio16k.npy")?;
     if stages.contains(&"mel") {
         let t = Instant::now();
-        let (spec, _) = mel::log_mel(&audio, c.n_mels);
+        let (spec, content) = mel::log_mel(&audio, c.n_mels);
         let frames = spec.len() / c.n_mels;
-        let w0 = mel::window(&spec, c.n_mels, frames, 0);
+        let w0 = mel::window(&spec, c.n_mels, frames, 0, content.min(mel::CHUNK_FRAMES));
         log(format!("mel: {:.2} s of recording in {:.2} s", audio.len() as f64 / 16000.0, t.elapsed().as_secs_f64()));
         report(log, &mut worst, "mel (first window)", &w0, &want("mel.npy")?);
     }
@@ -139,7 +139,9 @@ pub fn run(e: &Whisper, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
     if stages.contains(&"transcribe") {
         let r: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("result.json")).map_err(|e| Error(e.to_string()))?)
             .map_err(|e| Error(e.to_string()))?;
-        let req = TranscribeRequest { samples: audio.clone(), rate: 16000, language: r["asked_language"].as_str().map(str::to_string), words: true,
+        // temperature 0 only, as the reference ran
+        let extra = [("fallback".to_string(), "0".to_string())].into_iter().collect();
+        let req = TranscribeRequest { samples: audio.clone(), rate: 16000, language: r["asked_language"].as_str().map(str::to_string), words: true, extra,
                                       ..Default::default() };
         let t = Instant::now();
         let got = e.run(&req, &mut |_| Ok(()))?;

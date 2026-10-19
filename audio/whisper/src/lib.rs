@@ -264,7 +264,7 @@ impl Whisper {
             let seg_frames = CHUNK_FRAMES.min(content - seek);
             let time_offset = seek as f64 / FRAMES_PER_SECOND;
             progress(Step { phase: "listen", at: seek as u32, of: content as u32, seconds: secs(t0) })?;
-            self.model.encode(&mel::window(&spec, c.n_mels, frames, seek))?;
+            self.model.encode(&mel::window(&spec, c.n_mels, frames, seek, seg_frames))?;
             let lang = match &language {
                 Some(l) => l.clone(),
                 None => {

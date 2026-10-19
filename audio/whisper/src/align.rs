@@ -316,6 +316,76 @@ pub fn place_words(segments: &mut [Placed], mut a: Vec<Word>, offset: f64, mut l
 mod tests {
     use super::*;
 
+    /// find_alignment on openai's own attention of a window (NS_TEST_WHISPER_REF: reference/whisper/ref.py's
+    /// align_qk.npy, align_tokens.npy, align.json) gives openai's words and times
+    #[test]
+    fn the_alignment_is_openais() {
+        let (Some(v), Ok(dir)) = (crate::text::tests::vocab(), std::env::var("NS_TEST_WHISPER_REF")) else { return };
+        let mut checked = 0;
+        for clip in ["short", "long", "song"] {
+            let d = std::path::Path::new(&dir).join(clip);
+            let Ok((shape, qk)) = crate::check::read_npy(&d.join("align_qk.npy")) else { continue };
+            let (h, rows, m_full) = (shape[0], shape[1], shape[2]);
+            let qk: Vec<Vec<f32>> = qk.chunks(rows * m_full).map(|c| c.iter().map(|x| *x as f32).collect()).collect();
+            assert_eq!(qk.len(), h);
+            let fed: Vec<u32> = crate::check::read_npy(&d.join("align_tokens.npy")).unwrap().1.iter().map(|x| *x as u32).collect();
+            let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("align.json")).unwrap()).unwrap();
+            let sot = r["sot_len"].as_u64().unwrap() as usize;
+            let text = &fed[sot + 1..fed.len() - 1];
+            let probs = vec![0f32; text.len()];
+            let got = find_alignment(&qk, rows, m_full, r["num_frames"].as_u64().unwrap() as usize, sot, text, &probs, &v,
+                                     r["language"].as_str().unwrap(), 7);
+            let want = r["words"].as_array().unwrap();
+            assert_eq!(got.len(), want.len(), "{clip}: words");
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(g.word, w["word"].as_str().unwrap(), "{clip}");
+                let wt: Vec<u32> = w["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+                assert_eq!(g.tokens, wt, "{clip}: {}", g.word);
+                assert!((g.start - w["start"].as_f64().unwrap()).abs() < 1e-6 && (g.end - w["end"].as_f64().unwrap()).abs() < 1e-6,
+                        "{clip}: {:?} {}..{}, openai {}..{}", g.word, g.start, g.end, w["start"], w["end"]);
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "the three clips");
+    }
+
+    /// A one-window recording end to end on the host: openai's tokens cut into segments, its alignment's words placed,
+    /// give its transcribe's segments and words (NS_TEST_WHISPER_REF's short clip)
+    #[test]
+    fn a_window_placed_is_openais_transcript() {
+        let (Some(v), Ok(dir)) = (crate::text::tests::vocab(), std::env::var("NS_TEST_WHISPER_REF")) else { return };
+        let d = std::path::Path::new(&dir).join("short");
+        let toks: Vec<u32> = crate::check::read_npy(&d.join("tokens.npy")).unwrap().1.iter().map(|x| *x as u32).collect();
+        let a: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("align.json")).unwrap()).unwrap();
+        let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("result.json")).unwrap()).unwrap();
+        let frames = a["num_frames"].as_u64().unwrap() as usize;
+        let (cuts, _) = crate::text::cut(&toks[3..], &v, frames);
+        let mut placed: Vec<Placed> = cuts.into_iter().map(|c| {
+            let text: Vec<u32> = c.tokens.iter().copied().filter(|t| *t < v.eot).collect();
+            let empty = c.start == c.end || v.text(&text).trim().is_empty();
+            Placed { start: c.start, end: c.end, text_tokens: if empty { Vec::new() } else { text }, words: Vec::new() }
+        }).collect();
+        let words: Vec<Word> = a["words"].as_array().unwrap().iter().map(|w| Word {
+            word: w["word"].as_str().unwrap().into(), tokens: w["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect(),
+            start: w["start"].as_f64().unwrap(), end: w["end"].as_f64().unwrap(), probability: w["probability"].as_f64().unwrap() as f32 }).collect();
+        place_words(&mut placed, words, 0.0, 0.0);
+        let placed: Vec<&Placed> = placed.iter().filter(|p| !p.text_tokens.is_empty()).collect();
+        let want = r["segments"].as_array().unwrap();
+        assert_eq!(placed.len(), want.len(), "segments");
+        for (g, w) in placed.iter().zip(want) {
+            assert_eq!(v.text(&g.text_tokens), w["text"].as_str().unwrap());
+            assert!((g.start - w["start"].as_f64().unwrap()).abs() < 1e-6 && (g.end - w["end"].as_f64().unwrap()).abs() < 1e-6,
+                    "segment {}..{}, openai {}..{}", g.start, g.end, w["start"], w["end"]);
+            let ww = w["words"].as_array().unwrap();
+            assert_eq!(g.words.len(), ww.len(), "{:?}", w["text"]);
+            for (x, y) in g.words.iter().zip(ww) {
+                assert_eq!(x.word, y["word"].as_str().unwrap());
+                assert!((x.start - y["start"].as_f64().unwrap()).abs() < 1e-6 && (x.end - y["end"].as_f64().unwrap()).abs() < 1e-6,
+                        "{:?} {}..{}, openai {}..{}", x.word, x.start, x.end, y["start"], y["end"]);
+            }
+        }
+    }
+
     #[test]
     fn dtw_follows_the_cheap_diagonal() {
         // 3 tokens over 6 frames: each token cheap on two frames in turn
