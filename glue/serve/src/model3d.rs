@@ -36,6 +36,15 @@ use crate::http::{self, Conn};
 use crate::serve::cors_headers;
 use crate::telemetry::Telemetry;
 
+/// Sets the progress back to not busy when dropped
+struct Idle<'a>(&'a Mutex<Value>);
+
+impl Drop for Idle<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = json!({"busy": false});
+    }
+}
+
 pub struct Model3dServer {
     /// the model id clients name
     pub model: String,
@@ -336,6 +345,9 @@ impl Model3dServer {
         let what = if rig { b["prompt"].as_str().unwrap_or("rig").to_string() } else { format!("{} picture(s)", views.len()) };
         let p = &self.progress;
         *p.lock().unwrap() = json!({"busy": true, "prompt": what, "phase": "start", "at": 0, "of": 1, "seconds": 0});
+        // not busy again however this ends: a request refused below (texture on a shape-only model) left the server
+        // busy for good and the front door counted it working (2026-10-19)
+        let _idle = Idle(p);
         let mut report = |st: nextcuda_model3d::Step| {
             *p.lock().unwrap() = json!({"busy": true, "prompt": what, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds});
             if self.cancel.stopping() {
