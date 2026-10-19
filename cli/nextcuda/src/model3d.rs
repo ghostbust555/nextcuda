@@ -352,6 +352,29 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     if args.iter().any(|a| a == "--here") {
         return serve_here(&m, files, args, out, cfg);
     }
+    // no container program asked for: the server is this program, as a process (as the image and audio servers) -
+    // without it the front door's model3d.generate asked for the build image and failed (2026-10-19)
+    if crate::native::native(cfg) {
+        options(&m, args)?;
+        if args.iter().any(|a| a == "--wfe") && !cfg.dist.join("wfe/model3d/index.html").exists() {
+            return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
+        }
+        std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        let name = SERVED.name_for(args)?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut a = vec!["model3d".to_string(), "serve".into(), model_id.clone()];
+        let mut it = args.iter().skip(if id.is_some() { 1 } else { 0 });
+        while let Some(x) = it.next() {
+            if x == "--out" || x == "--model" || x == "--slot" {
+                it.next();
+                continue;
+            }
+            a.push(x.clone());
+        }
+        a.extend(["--out".into(), out.to_string_lossy().into_owned(), "--here".into()]);
+        let port = opt(args, "--port").unwrap_or(SERVED.port).to_string();
+        return crate::native::launch(cfg, &name, &port, &exe, &a, !detach);
+    }
     use crate::container::{mount, Ce};
     options(&m, args)?;
     let ce = Ce::new(cfg)?;
