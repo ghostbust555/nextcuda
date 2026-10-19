@@ -8,9 +8,11 @@ We stand on the shoulders of giants.
   jobs, queue and model registry; what runs the models under it is CUDA
 - **No Python** - Rust on the control side, CUDA ([stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s
   ggml-cuda kernels) on the GPU side; the model stays loaded between pictures
-- **Made for the cards people have** - Qwen-Image 2.1 and 2512 run from GGUF on a 12 GB card, weights streamed from
-  host memory per graph; Nemotron 3.5 Super (120B, 43 GiB) chats on one 12 GB card, its experts streamed from
-  pinned host memory and the disk
+- **Made for the cards people have** - two 12 GB cards (an RTX 5070 and an RTX 3060) run chat, pictures, OCR, speech,
+  songs, video with sound and 3D: Qwen3.8-27B reads prompts at ~1,200 tok/s over both cards (llama.cpp: 925),
+  MiniMax H3 makes video with sound across both, Nemotron 3.5 Super (120B) chats on one, its experts streamed
+- **Every kind behind one door** - 20 models served here, 12 more a click away (`Not downloaded` on the page), each
+  started on the card with room when a request names it and let go when idle
 - **A single API control plane** - one service, `nextcuda.service`, answers on :8000 and starts a model server when a
   request names its model
 - **A Docker-style CLI** - `nextcuda <kind> start | stop | ps | logs | ...`, as a process, not a container
@@ -20,6 +22,27 @@ We stand on the shoulders of giants.
 
 It is the same program as [nextsycl](https://github.com/) with the SYCL runtime taken out and CUDA put in, so what
 you know of one is what you know of the other. This page is only what runs here today.
+
+## The control plane
+
+`http://<host>:8000/` - every card, what each holds and what the enabled models are vouched for there; every model
+by kind with its cards (tick which may hold it), enable / disable, start / stop and its own page; the models a card
+offers that are not downloaded yet; the front ends (Open WebUI on :3000, the video studio). The API and Config tabs
+are the OpenAPI document and `nextcuda.conf`.
+
+<p align="center"><img src="docs/screenshots/control-plane-gpus.png" alt="the GPUs: memory in use by process, and what each enabled model is vouched for" width="900"></p>
+
+<p align="center"><img src="docs/screenshots/control-plane-models.png" alt="the models by kind: chat, images and OCR, audio, video - their cards, enable, start and their pages" width="900"></p>
+
+<p align="center"><img src="docs/screenshots/control-plane-downloads.png" alt="the models not downloaded, a download each, and the front ends" width="900"></p>
+
+- **Downloads on demand:** a request for a model whose files are not here answers `model_not_downloaded` (its size,
+  whether it fits, how to pull it); the page's Download (with progress and cancel) or `system.models.pull` fetches it;
+  the "download automatically" box (`NS_AUTO_PULL`) lets a request wait for it instead.
+- **Cards shared, not fought over:** a model starts on the first of its cards with room; idle picture, sound, video
+  and chat servers are stopped for it (lightest first) only when it does not fit beside them. Qwen3.8 keeps ~5.9 GB of
+  the 3060 free, so a voice (VoxCPM2 int8, 3.3 GiB) reads its replies aloud without the chat model being swapped out.
+- **Maintenance mode** sets the box aside (callers told, queues held) - below.
 
 ## RUN
 
@@ -159,30 +182,59 @@ curl -s http://127.0.0.1:8085/v1/chat/completions -H 'content-type: application/
   `--opt-reserve-mib` (VRAM left free, 700). `NS_NH_CPU_FRAC` gives part of each layer's pinned experts to the CPU
   (ggml-cpu, `libggml-base.so` / `libggml-cpu.so` beside the program) - measured slower here than the copies over
   gen4 x16, so it is off.
-- **Open WebUI:** `tooling/open-webui.sh` (re)makes its container (:3000, the `open-webui` volume kept) with the front
-  door's `/v1` and token as its OpenAI connection, and `tooling/open-webui.service` starts it with the box. The chat
-  model loads on the first message (~25 s) and unloads after `NS_IDLE_MINUTES`; the image models are listed too (they
-  do not chat). Set the connection's header `{"X-Keep-Up-S": "300"}` to keep the model up between messages.
+- **Open WebUI** (`http://<host>:3000`, the page's Chat link): `tooling/open-webui.sh` (re)makes its container (the
+  `open-webui` volume kept) with the front door's `/v1` and token as its OpenAI connection, and
+  `tooling/open-webui.service` starts it with the box. The chat model loads on the first message and unloads after
+  `NS_IDLE_MINUTES`; set the connection's header `{"X-Keep-Up-S": "300"}` to keep it up between messages. Its
+  read-aloud speaks through `/v1/audio/speech` (Admin > Settings > Audio: OpenAI, `http://host.containers.internal:8000/v1`,
+  model `voxcpm2-int8`, a saved voice's name) - sentence by sentence, faster than it plays, beside the chat model.
+  A follow-up on a long pasted document reuses its checkpoint (the prompt cache keeps the start of each reply).
 - **`nh`** (`llm/nemotronh/src/bin/nh.rs`): the engine without the server - `nh MODEL --prompt TEXT --n N`, or
   `--bench 20,2000,8000 --new 128` for the numbers.
 
 ## Supported models
 
-| id | model | engine | on disk | status |
-|---|---|---|---|---|
-| `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0 with Qwen3-VL 8B Q4_K_M, its vision projector and the RGBA VAE | `qwen-image-2.1` | 13.6 GiB | served, checked |
-| `qwen-image-2.1-q6k` | the same with a Q6_K transformer | `qwen-image-2.1` | 12.0 GiB | listed |
-| `qwen-image-2.1-rrq4` | [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs): a Q8_0 / Q6_K / Q5_K mix | `qwen-image-2.1` | 11.9 GiB | served, checked |
-| `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B Q4_K_M, its VAE and the Lightning 4-step LoRA | `qwen-image-2512` | 17.7 GiB | served, checked |
-| `qwen3.8-27b-gsq-iq3s` | Qwen3.8-27B, ISTA-DASLab's GSQ-RCO IQ3_S with its MTP head, and the BF16 vision projector: text and pictures, thinking switch | `qwen35` | 12.2 GiB | served, checked (two cards, whole) |
-| `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | `nemotron_h_moe` | 43.0 GiB | served (one 12 GB card, experts streamed) |
-| `breeze-tts-2` | Breeze TTS 2 (~3B, CrispASR's Q8_0 GGUF) with Qwen3-TTS's 12 Hz codec: English and Chinese speech - voices designed, cloned (recording + transcript) or directed; vocal events; weights and outputs non-commercial | `breeze-tts-2` | 4.0 GiB | served, checked |
-| `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices styled by an instruction, ten languages | `qwen3-tts` | 4.2 GiB | served, checked |
-| `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz, voices designed from a description or cloned | `voxcpm2` | 4.6 GiB | served, checked |
+32 model cards in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256);
+`nextcuda models pull <id> [--from DIR]` downloads what is missing or hard-links a file already on the machine,
+checks it and registers the model. **Served** - running on this box today; **download** - its card is here and it
+runs once pulled; **too big** - more than these 12 GB cards hold (bigger cards).
 
-The model cards are in `model-cards/` (one YAML a model, every file a pinned link with its size and SHA-256).
-`nextcuda models pull <id> [--from DIR]...` downloads what is missing or hard-links a file already on the machine,
-checks it and registers the model.
+| kind | id | model | on disk | here |
+|---|---|---|---|---|
+| chat | `qwen3.8-27b-gsq-iq3s` | Qwen3.8-27B, ISTA-DASLab's GSQ-RCO IQ3_S with its MTP head and the BF16 vision projector: text and pictures, thinking switch, 80K context (192K with q4_0) | 12.2 GiB | served, both cards whole |
+| chat | `nemotron-3.5-super-iq1m` | NVIDIA Nemotron 3.5 Super 120B-A12B, unsloth's UD-IQ1_M (text) | 43.0 GiB | served (one card, experts streamed; off by default) |
+| image | `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0 with Qwen3-VL 8B: text to image, RGBA, edits from up to 8 pictures | 13.6 GiB | served |
+| image | `qwen-image-2.1-rrq4` | Qwen-Image 2.1, [realrebelai's Q4](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs) | 5.5 GiB | served |
+| image | `qwen-image-2512-q4km` | Qwen-Image 2512 Q4_K_M with Qwen2.5-VL 7B and the Lightning 4-step LoRA | 17.7 GiB | served |
+| image | `qwen-image-2.1-q6k` | Qwen-Image 2.1 with a Q6_K transformer | 12.0 GiB | download |
+| OCR | `unlimited-ocr-q8` | Unlimited-OCR Q8_0: pages to Markdown | 3.7 GiB | served |
+| OCR | `unlimited-ocr-q4` | Unlimited-OCR Q4_K_M | 2.6 GiB | served |
+| OCR | `paddleocr-vl-1.6` | PaddleOCR-VL 1.6: pages, tables, formulas, charts, seals | 1.7 GiB | served |
+| OCR | `olmocr-2-7b-q8` | olmOCR-2 7B Q8_0: pages to Markdown | 8.8 GiB | served |
+| speech | `breeze-tts-2` | Breeze TTS 2 Q8_0 with Qwen3-TTS's 12 Hz codec: English and Chinese, voices designed, cloned or directed, vocal events (non-commercial) | 4.0 GiB | served |
+| speech | `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices styled by an instruction, ten languages | 4.2 GiB | served |
+| speech | `voxcpm2` | VoxCPM2 2B: 30 languages at 48 kHz, voices designed or cloned | 4.6 GiB | served |
+| speech | `voxcpm2-int8` | VoxCPM2, its language models in int8: 3.3 GiB on a card, beside the chat model | (voxcpm2's) | served (Open WebUI's voice) |
+| speech | `breeze-tts-2-q4` | Breeze TTS 2 Q4_K, a smaller download | 2.7 GiB | download |
+| speech | `qwen3-tts-base` | Qwen3-TTS Base: a voice cloned from a recording | 4.2 GiB | download |
+| speech | `qwen3-tts-design` | Qwen3-TTS VoiceDesign: a voice made up from a description | 4.2 GiB | download |
+| songs | `minimax-music3-int8` | MiniMax Music 3, its language model in int8: songs from lyrics and a description, up to 6 minutes, 44.1 kHz stereo | (music3's) | served, both cards |
+| songs | `minimax-music3` | MiniMax Music 3 in half | 26.6 GiB | too big (23 GB a card) |
+| video | `minimax-h3-q4km` | MiniMax H3 Q4_K_M: text, pictures and a voice to video with sound; the denoiser in 10.6 GiB | 10.6 GiB | served, both cards |
+| video | `minimax-h3-q6k` | MiniMax H3 Q6_K: the denoiser in 15.4 GiB | 15.4 GiB | download |
+| video | `minimax-h3-q8` | MiniMax H3 Q8_0, a reference form | 20.0 GiB | too big |
+| video | `minimax-h3-ref2va` | MiniMax H3 Ref2VA (int8 ConvRot): reference pictures, clips and sounds to video | 19.5 GiB | too big |
+| video | `minimax-h3` | MiniMax H3, int8 ConvRot denoiser: the fastest | 47.9 GiB | too big |
+| 3D | `trellis2-512` | TRELLIS.2 4B Q8_0 at 512: picture to textured mesh, the light path (MIT) | 1.3 GiB | served |
+| 3D | `hunyuan3d-2mini-turbo` | Hunyuan3D-2mini-turbo: a mesh from a picture in seconds (shape) | 3.9 GiB | served |
+| 3D | `unirig` | UniRig: a skeleton and skin weights for any mesh (MIT) | 5.4 GiB | served |
+| 3D | `rignet` | RigNet: a skeleton and skin weights for a character mesh (GPLv3) | 0.2 GiB | served |
+| 3D | `animateanymesh` | AnimateAnyMesh: text-driven mesh animation, 16 frames as morph targets (Apache-2.0) | 0.9 GiB | served |
+| 3D | `trellis2` | TRELLIS.2 4B Q8_0, the 1024 cascade | 8.8 GiB | download |
+| 3D | `pixal3d` | Pixal3D Q8_0: pixel-aligned TRELLIS.2, the 1024 cascade (MIT) | 8.9 GiB | too big |
+| 3D | `hunyuan3d-2.1` | Hunyuan3D 2.1: a detailed mesh with PBR textures | 15.5 GiB | too big |
+
+Each model's guide (how to ask it, what it takes, what it answers) is in `model-cards/guides/`.
 
 ## What it does
 
@@ -306,12 +358,29 @@ nextcuda audio check <reference dump dir> --model breeze-tts-2        # referenc
   4.8 s of VoxCPM2's in 1.0 s; both transcribe word for word.
 - **Speed** (RTX 5070): 5.5 GiB loaded in 4 s; 26 frames a second with guidance (2.1x real time; the B70: 22); through
   the front door, 12.7 s of designed speech in 6.5 s.
+- **Saved voices** (`audio.voices.add`: a recording, its transcript, a description): spoken by name by any model that
+  clones (`voice: "skippy"` on `/v1/audio/speech`). VoxCPM2 takes a saved voice's timbre alone - continuing its
+  recording (`NS_VCP_CONTINUE=1`) led the recording's last words into each sentence (Whisper heard them ahead of 4 of
+  5 lines; the timbre alone said all the plain ones word for word).
+- **Text as it is said:** math and code symbols become words before any speech model sees them (`Q·K^T / √d_k`:
+  "Q dot K to the T, divided by square root of d sub k"), markdown's marks go, dashes and brackets are pauses
+  (`NS_SPEECH_NORMALIZE=0` or `normalize: false` for the text as sent) - one such line had a voice loop for 18 s.
 
-## What is not here yet
+## What runs where
 
-Video (H3), music, OCR and 3D: their contracts are in the tree and the control plane routes them (or answers
-not_implemented), but no engine of ours runs them yet; of the llm engines Qwen3.8 (qwen35, MTP drafts) and Nemotron-H (no MTP drafts yet) are here. The Rust-only runtime nextsycl has (its own kernels, no ggml) comes engine by
-engine behind the same contracts (`docs/PHASES.md`); the python worker of phase 1 stays as a fallback until then.
+| kind | engines | on the two cards |
+|---|---|---|
+| chat | `qwen35` (Qwen3.8: DeltaNet + attention, MTP drafts, vision), `nemotron_h_moe` | Qwen3.8 over both, pipelined; Nemotron on the 5070 |
+| image, OCR | stable-diffusion.cpp's ggml-cuda (Qwen-Image), our Rust + CUDA engines (Qwen-Image 2.1 `rust`, Unlimited-OCR, PaddleOCR-VL, olmOCR-2) | one card each; olmOCR-2 the decoder on one, the vision tower on the other |
+| speech | `breeze-tts-2`, `qwen3-tts`, `voxcpm2` | one card each; VoxCPM2 int8 fits beside the chat model |
+| songs | `minimax-music3` (int8) | the language model on the 5070, the flow stage and decoder on the 3060 |
+| video | `minimax-h3` (the native daemon, `--span`) and the video studio (scenes, plans, a film's clips joined) | the denoiser over both cards, nothing streamed: a clip in ~62 s from the SSD |
+| 3D | TRELLIS.2, Hunyuan3D-2mini, UniRig, RigNet, AnimateAnyMesh | one card each |
+
+Not here yet: `audio.transcribe` (Whisper - the platform's music and audio makers still listen locally), ACE-Step,
+VibeVoice, HunyuanImage 2.1, the video upscalers; the bigger cards' forms above. Known rough edges: the video
+studio's page still titles itself "nextsycl video" and shows its GPU line as NaN; `system.version` answers nextsycl's
+driver name (the platform reads it).
 
 ## Clocking it
 
@@ -349,6 +418,13 @@ nextcuda image selftest --gpu 0   # the CUDA kernels against host arithmetic
   (nsys showed 0.17 ms a launch); graphs, one a stage, fixed it.
 - **Measure the other runtime, kernel by kernel.** nsys on llama.cpp showed its per-card kernels were not much faster -
   the cards overlapped - and, for decode, that its matrix-vector products were.
+
+- **A read-aloud that repeats is a queue that ran dry.** Open WebUI ends playback when its next sentence is late; the
+  speech model was being swapped out for the chat model's title and tag requests. Fit them side by side.
+- **Score a voice with ears you trust.** Whisper against the text, the port against its reference package on the
+  same lines: the same error rate - the trouble was the mode (continuing a recording) and the symbols, not the port.
+- **A cache needs a floor, not just a budget.** Checkpoints of forms the engine no longer makes filled the drive; the
+  cache now drops them at start and keeps 8 GiB of its drive free.
 
 ## Standing on
 
